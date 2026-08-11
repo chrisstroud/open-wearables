@@ -4,19 +4,34 @@ from celery import shared_task
 
 from app.config import settings
 from app.database import SessionLocal
+from app.models import UserConnection
 from app.repositories.user_connection_repository import UserConnectionRepository
+from app.services.providers.factory import ProviderFactory
 from app.services.user_connection_service import user_connection_service
 from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
 
 logger = getLogger(__name__)
 
-STALE_REASON = "stale"
+
+def _is_sdk_fed(connection: UserConnection) -> bool:
+    """True when the SDK upload endpoint is this connection's only way in.
+
+    Only then is revoking safe: the next upload reactivates it. Decided per connection,
+    not per provider - Google has both an SDK and an OAuth integration under one slug,
+    and no tokens is what marks the SDK-provisioned rows.
+    """
+    try:
+        caps = ProviderFactory().get_provider(connection.provider).capabilities
+    except Exception:
+        return False
+
+    return caps.client_sdk and connection.access_token is None and connection.refresh_token is None
 
 
 @shared_task
 def revoke_stale_connections() -> dict:
-    """Revoke active connections that have stopped delivering data.
+    """Revoke SDK connections that have stopped delivering data.
 
     SDK providers cannot report sign-out, HealthKit permission revocation or app
     deletion, so inactivity is the only available signal. Without this an abandoned
@@ -28,27 +43,23 @@ def revoke_stale_connections() -> dict:
 
     with SessionLocal() as db:
         stale = UserConnectionRepository().get_stale_active(db, threshold_days)
+        candidates: list[UserConnection] = [c for c in stale if _is_sdk_fed(c)]
 
         log_structured(
             logger,
             "info",
-            f"Found {len(stale)} stale connection(s)",
+            f"Found {len(candidates)} stale SDK connection(s)",
             action="stale_connection_sweep_start",
             threshold_days=threshold_days,
-            stale_count=len(stale),
+            stale_total=len(stale),
+            stale_sdk=len(candidates),
+            skipped_non_sdk=len(stale) - len(candidates),
         )
 
-        for connection in stale:
+        for connection in candidates:
             try:
-                # No oauth: deregistering at the provider is not our call here, the user
-                # never asked to disconnect. This only records that we stopped receiving.
-                user_connection_service.disconnect(
-                    db,
-                    connection.user_id,
-                    connection.provider,
-                    reason=STALE_REASON,
-                )
-                revoked.append({"user_id": str(connection.user_id), "provider": connection.provider})
+                if user_connection_service.revoke_as_stale(db, connection):
+                    revoked.append({"user_id": str(connection.user_id), "provider": connection.provider})
             except Exception as e:
                 log_and_capture_error(
                     e,

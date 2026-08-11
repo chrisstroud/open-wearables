@@ -6,7 +6,7 @@ from app.database import DbSession
 from app.models import UserConnection
 from app.repositories.data_source_repository import DataSourceRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
-from app.schemas.auth import SdkConnectionOutcome
+from app.schemas.auth import ConnectionStatus, SdkConnectionOutcome
 from app.schemas.enums import ProviderName
 from app.schemas.model_crud.user_management import UserConnectionCreate, UserConnectionUpdate
 from app.schemas.responses.upload import ConnectionsCoverage, ProviderConnectionCount
@@ -16,6 +16,8 @@ from app.services.services import AppService
 from app.utils.exceptions import ResourceNotFoundError, handle_exceptions
 from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
+
+STALE_REASON = "stale"
 
 
 class UserConnectionService(
@@ -94,14 +96,42 @@ class UserConnectionService(
         )
         return connection
 
+    def revoke_as_stale(self, db_session: DbSession, connection: UserConnection) -> bool:
+        """Mark a connection revoked because it stopped delivering data.
+
+        Unlike disconnect() this keeps the tokens: the user never asked to disconnect,
+        so re-authorization must not be forced. Returns False if already revoked, so
+        the sweep does not re-emit on every run.
+        """
+        if connection.status == ConnectionStatus.REVOKED:
+            return False
+
+        self.crud.mark_as_revoked(db_session, connection)
+
+        log_structured(
+            self.logger,
+            "info",
+            "Connection revoked",
+            action="connection_revoked",
+            reason=STALE_REASON,
+            provider=connection.provider,
+            user_id=str(connection.user_id),
+            connection_id=str(connection.id),
+            last_synced_at=connection.last_synced_at.isoformat() if connection.last_synced_at else None,
+        )
+
+        on_connection_revoked(
+            user_id=connection.user_id,
+            provider=connection.provider,
+            connection_id=connection.id,
+            reason=STALE_REASON,
+            revoked_at=connection.updated_at.isoformat(),
+        )
+        return True
+
     @handle_exceptions
     def disconnect(
-        self,
-        db_session: DbSession,
-        user_id: UUID,
-        provider: str,
-        oauth: BaseOAuthTemplate | None = None,
-        reason: str = "user_disconnected",
+        self, db_session: DbSession, user_id: UUID, provider: str, oauth: BaseOAuthTemplate | None = None
     ) -> None:
         """Disconnect a user from a provider. Raises 404 if connection not found.
 
@@ -119,7 +149,7 @@ class UserConnectionService(
                 "info",
                 "Connection revoked",
                 action="connection_revoked",
-                reason=reason,
+                reason="user_disconnected",
                 provider=provider,
                 user_id=str(user_id),
                 connection_id=str(connection.id) if connection else None,
@@ -129,7 +159,7 @@ class UserConnectionService(
                     user_id=user_id,
                     provider=provider,
                     connection_id=connection.id,
-                    reason=reason,
+                    reason="user_disconnected",
                     revoked_at=connection.updated_at.isoformat(),
                 )
             return
