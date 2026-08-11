@@ -10,7 +10,7 @@ from sqlalchemy.orm.exc import MultipleResultsFound
 from app.database import DbSession
 from app.models import UserConnection
 from app.repositories.repositories import CrudRepository
-from app.schemas.auth import ConnectionStatus
+from app.schemas.auth import ConnectionStatus, SdkConnectionOutcome
 from app.schemas.model_crud.user_management import (
     UserConnectionCreate,
     UserConnectionUpdate,
@@ -266,6 +266,24 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
             .all()
         )
 
+    def get_stale_active(self, db_session: DbSession, days_threshold: int) -> list[UserConnection]:
+        """Active connections with no successful sync within the threshold.
+
+        Coalesces to created_at so a connection that never synced at all is caught too.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days_threshold)
+
+        return (
+            db_session.query(self.model)
+            .filter(
+                and_(
+                    self.model.status == ConnectionStatus.ACTIVE,
+                    func.coalesce(self.model.last_synced_at, self.model.created_at) < cutoff,
+                ),
+            )
+            .all()
+        )
+
     def disconnect(self, db_session: DbSession, user_id: UUID, provider: str) -> int:
         """Disconnect a provider in a single UPDATE query. Returns number of rows updated."""
         result = cast(
@@ -396,11 +414,15 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         db_session: DbSession,
         user_id: UUID,
         provider: str,
-    ) -> UserConnection:
+    ) -> tuple[UserConnection, SdkConnectionOutcome]:
         """Ensure an SDK-based connection exists for a user and provider.
 
         SDK-based providers (like Apple Health) don't use OAuth tokens.
         This method creates or returns an existing connection without tokens.
+
+        Returns the connection and which branch was taken, so the caller can emit
+        ``connection.created`` only on a real state change. The upload path calls
+        this on every batch, so EXISTING must stay silent.
         """
         existing = self.get_by_user_and_provider(db_session, user_id, provider)
         if existing:
@@ -411,7 +433,8 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
                 db_session.add(existing)
                 db_session.commit()
                 db_session.refresh(existing)
-            return existing
+                return existing, SdkConnectionOutcome.REACTIVATED
+            return existing, SdkConnectionOutcome.EXISTING
 
         # Create new SDK connection (no tokens needed)
         connection = UserConnection(
@@ -428,4 +451,4 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         db_session.add(connection)
         db_session.commit()
         db_session.refresh(connection)
-        return connection
+        return connection, SdkConnectionOutcome.CREATED

@@ -127,6 +127,10 @@ class Settings(BaseSettings):
         600  # How often to run the fill-missing-resilience-scores task (default: 10 min)
     )
 
+    # STALE CONNECTION SETTINGS
+    stale_connection_days: int = 14  # No successful sync for this long -> revoke as dead
+    stale_connection_interval_seconds: int = 86400  # Sweep once a day
+
     # API SETTINGS
     api_base_url: str = "http://localhost:8000"
 

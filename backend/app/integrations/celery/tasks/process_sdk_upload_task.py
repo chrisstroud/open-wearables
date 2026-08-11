@@ -7,7 +7,6 @@ from celery import shared_task
 
 from app.database import SessionLocal
 from app.models import User
-from app.repositories.user_connection_repository import UserConnectionRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.sync_status import SyncSource, SyncStatus
 from app.services.apple.healthkit.import_service import (
@@ -17,6 +16,7 @@ from app.services.apple.healthkit.import_service import (
     import_service as sdk_import_service,
 )
 from app.services.sync_status_service import completed, failed, started
+from app.services.user_connection_service import user_connection_service
 from app.utils.structured_logging import log_structured
 
 logger = getLogger(__name__)
@@ -104,9 +104,9 @@ def process_sdk_upload(
     )
 
     with SessionLocal() as db:
-        # Ensure SDK connection exists for this user (SDK-based, no OAuth tokens)
-        connection_repo = UserConnectionRepository()
-        connection_repo.ensure_sdk_connection(db, user_uuid, provider)
+        # Ensure SDK connection exists for this user (SDK-based, no OAuth tokens).
+        # Goes through the service so a new/reactivated connection emits connection.created.
+        user_connection_service.ensure_sdk_connection(db, user_uuid, provider)
 
         # Select the appropriate import service based on source
         import_service = _get_import_service(provider)
@@ -134,6 +134,8 @@ def process_sdk_upload(
 
         status_code = result.get("status_code", 200)
         records_saved = int(result.get("records_saved", 0) or 0)
+        records_inserted = int(result.get("records_inserted", 0) or 0)
+        records_updated = int(result.get("records_updated", 0) or 0)
         workouts_saved = int(result.get("workouts_saved", 0) or 0)
         sleep_saved = int(result.get("sleep_saved", 0) or 0)
         dropped_count = int(result.get("dropped_count", 0) or 0)
@@ -141,7 +143,8 @@ def process_sdk_upload(
         items_total = records_saved + workouts_saved + sleep_saved
 
         if isinstance(status_code, int) and 200 <= status_code < 300:
-            message = f"{provider.capitalize()} batch saved"
+            # Same wording as webhook_push_task; records_saved counts samples submitted.
+            message = f"{provider.capitalize()} batch saved: {records_inserted} new, {records_updated} updated"
             if dropped_count:
                 message += f" ({dropped_count} record(s) dropped by validation)"
             completed(
@@ -155,6 +158,8 @@ def process_sdk_upload(
                 metadata={
                     "batch_id": batch_id,
                     "records_saved": records_saved,
+                    "inserted": records_inserted,
+                    "updated": records_updated,
                     "workouts_saved": workouts_saved,
                     "sleep_saved": sleep_saved,
                     "types": types,
