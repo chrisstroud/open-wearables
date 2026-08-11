@@ -267,48 +267,6 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
             .all()
         )
 
-    def revoke_stale_sdk_connections(
-        self,
-        db_session: DbSession,
-        providers: list[str],
-        days_threshold: int,
-        revoked_at: datetime,
-    ) -> list[UserConnection]:
-        """Revoke SDK connections with no successful sync within the threshold.
-
-        Single atomic UPDATE, so an upload landing mid-sweep is not revoked and only rows
-        actually changed come back. Coalesces to created_at to catch connections that never
-        synced. Tokens are left intact - the user never asked to disconnect - and NULL token
-        columns are what identify SDK-provisioned rows, since one provider slug can serve
-        both an SDK and an OAuth integration.
-        """
-        if not providers:
-            return []
-
-        cutoff = revoked_at - timedelta(days=days_threshold)
-
-        revoked = (
-            db_session.scalars(
-                update(UserConnection)
-                .where(
-                    and_(
-                        UserConnection.status == ConnectionStatus.ACTIVE,
-                        UserConnection.provider.in_(providers),
-                        UserConnection.access_token.is_(None),
-                        UserConnection.refresh_token.is_(None),
-                        func.coalesce(UserConnection.last_synced_at, UserConnection.created_at) < cutoff,
-                    ),
-                )
-                .values(status=ConnectionStatus.REVOKED, updated_at=revoked_at)
-                .returning(UserConnection),
-                execution_options={"populate_existing": True},
-            )
-            .unique()
-            .all()
-        )
-        db_session.commit()
-        return list(revoked)
-
     def disconnect(self, db_session: DbSession, user_id: UUID, provider: str) -> int:
         """Disconnect a provider in a single UPDATE query. Returns number of rows updated."""
         result = cast(

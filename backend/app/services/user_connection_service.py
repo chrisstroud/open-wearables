@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime
 from logging import Logger, getLogger
 from uuid import UUID
 
@@ -15,8 +15,6 @@ from app.services.services import AppService
 from app.utils.exceptions import ResourceNotFoundError, handle_exceptions
 from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
-
-STALE_REASON = "stale"
 
 
 class UserConnectionService(
@@ -94,43 +92,6 @@ class UserConnectionService(
             connected_at=connected_at.isoformat(),
         )
         return connection
-
-    def revoke_stale_sdk_connections(
-        self,
-        db_session: DbSession,
-        providers: list[str],
-        days_threshold: int,
-    ) -> list[UserConnection]:
-        """Revoke SDK connections that stopped delivering data, emitting per revoked row.
-
-        The repository re-checks staleness inside the UPDATE, so only connections that
-        actually transitioned are returned and only those emit.
-        """
-        revoked_at = datetime.now(timezone.utc)
-        revoked = self.crud.revoke_stale_sdk_connections(db_session, providers, days_threshold, revoked_at)
-
-        if revoked:
-            log_structured(
-                self.logger,
-                "info",
-                f"Revoked {len(revoked)} stale connection(s)",
-                action="connection_revoked",
-                reason=STALE_REASON,
-                revoked_count=len(revoked),
-                providers=sorted({c.provider for c in revoked}),
-                user_ids=[str(c.user_id) for c in revoked],
-            )
-
-        for connection in revoked:
-            on_connection_revoked(
-                user_id=connection.user_id,
-                provider=connection.provider,
-                connection_id=connection.id,
-                reason=STALE_REASON,
-                revoked_at=revoked_at.isoformat(),
-            )
-
-        return revoked
 
     @handle_exceptions
     def disconnect(

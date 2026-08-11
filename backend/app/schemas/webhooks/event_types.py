@@ -196,7 +196,7 @@ EVENT_TYPE_DESCRIPTIONS: dict[WebhookEventType, str] = {
         "including when a revoked connection resumes uploading."
     ),
     WebhookEventType.CONNECTION_REVOKED: (
-        "A provider connection became invalid or stopped delivering data (see reason). "
+        "A provider connection became invalid or was disconnected (see reason). "
         "OAuth connections need re-authorization; SDK connections resume on the next upload."
     ),
     WebhookEventType.SYNC_STARTED: "A sync run started for a user (live, historical, backfill, SDK or XML).",
