@@ -6,8 +6,8 @@ from app.database import DbSession
 from app.models import UserConnection
 from app.repositories.data_source_repository import DataSourceRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
-from app.schemas.auth import ConnectionStatus, SdkConnectionOutcome
-from app.schemas.enums import ProviderName
+from app.schemas.auth import ConnectionStatus
+from app.schemas.enums import ProviderName, SdkConnectionOutcome
 from app.schemas.model_crud.user_management import UserConnectionCreate, UserConnectionUpdate
 from app.schemas.responses.upload import ConnectionsCoverage, ProviderConnectionCount
 from app.services.outgoing_webhooks.events import on_connection_created, on_connection_revoked
@@ -71,10 +71,10 @@ class UserConnectionService(
         """
         connection, outcome = self.crud.ensure_sdk_connection(db_session, user_id, provider)
 
-        if outcome is SdkConnectionOutcome.EXISTING:
+        if outcome == SdkConnectionOutcome.EXISTING:
             return connection
 
-        connected_at = connection.created_at if outcome is SdkConnectionOutcome.CREATED else connection.updated_at
+        connected_at = connection.created_at if outcome == SdkConnectionOutcome.CREATED else connection.updated_at
 
         log_structured(
             self.logger,

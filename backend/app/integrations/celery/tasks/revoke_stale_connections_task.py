@@ -42,8 +42,8 @@ def revoke_stale_connections() -> dict:
     revoked: list[dict[str, str]] = []
 
     with SessionLocal() as db:
-        stale = UserConnectionRepository().get_stale_active(db, threshold_days)
-        candidates: list[UserConnection] = [c for c in stale if _is_sdk_fed(c)]
+        stale_connections = UserConnectionRepository().get_stale_active(db, threshold_days)
+        candidates: list[UserConnection] = [c for c in stale_connections if _is_sdk_fed(c)]
 
         log_structured(
             logger,
@@ -51,9 +51,9 @@ def revoke_stale_connections() -> dict:
             f"Found {len(candidates)} stale SDK connection(s)",
             action="stale_connection_sweep_start",
             threshold_days=threshold_days,
-            stale_total=len(stale),
+            stale_total=len(stale_connections),
             stale_sdk=len(candidates),
-            skipped_non_sdk=len(stale) - len(candidates),
+            skipped_non_sdk=len(stale_connections) - len(candidates),
         )
 
         for connection in candidates:

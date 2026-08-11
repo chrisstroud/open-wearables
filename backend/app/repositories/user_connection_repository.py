@@ -10,7 +10,8 @@ from sqlalchemy.orm.exc import MultipleResultsFound
 from app.database import DbSession
 from app.models import UserConnection
 from app.repositories.repositories import CrudRepository
-from app.schemas.auth import ConnectionStatus, SdkConnectionOutcome
+from app.schemas.auth import ConnectionStatus
+from app.schemas.enums import SdkConnectionOutcome
 from app.schemas.model_crud.user_management import (
     UserConnectionCreate,
     UserConnectionUpdate,

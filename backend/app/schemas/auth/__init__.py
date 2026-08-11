@@ -11,9 +11,6 @@ from .sdk_auth import (
     SDKAuthContext,
     SDKTokenRequest,
 )
-from .sdk_connection_outcome import (
-    SdkConnectionOutcome,
-)
 from .token import (
     RefreshTokenRequest,
     TokenResponse,
@@ -30,8 +27,6 @@ __all__ = [
     "TokenType",
     # Connection status
     "ConnectionStatus",
-    # SDK connection outcome
-    "SdkConnectionOutcome",
     # Live sync mode
     "LiveSyncMode",
     # Authentication method

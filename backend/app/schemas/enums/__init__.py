@@ -18,6 +18,7 @@ from .provider import (
     DEFAULT_PROVIDER_PRIORITY,
     ProviderName,
 )
+from .sdk_connection_outcome import SdkConnectionOutcome
 from .series_types import (
     SERIES_TYPE_DEFINITIONS,
     SERIES_TYPE_ID_BY_ENUM,
@@ -52,4 +53,5 @@ __all__ = [
     "ProviderName",
     "DEFAULT_PROVIDER_PRIORITY",
     "HealthScoreCategory",
+    "SdkConnectionOutcome",
 ]
