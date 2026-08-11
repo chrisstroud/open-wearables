@@ -531,6 +531,8 @@ class ImportService:
                 user_id=user_id,
                 dropped_count=len(dropped),
                 records_saved=saved_counts["records_saved"],
+                records_inserted=saved_counts["records_inserted"],
+                records_updated=saved_counts["records_updated"],
                 types=saved_counts["types"],
                 workouts_saved=saved_counts["workouts_saved"],
                 sleep_saved=saved_counts["sleep_saved"],

@@ -156,3 +156,86 @@ class TestRevokeStaleConnectionsTask:
         assert connection.status == ConnectionStatus.ACTIVE
         assert result["revoked_count"] == 0
         emit.assert_not_called()
+
+    @patch("app.integrations.celery.tasks.revoke_stale_connections_task.SessionLocal")
+    def test_emits_once_per_revoked_row_only(
+        self, mock_session_local: MagicMock, db: Session, mock_celery_app: MagicMock
+    ) -> None:
+        """A mixed batch emits for the transitioned rows and nothing else."""
+        mock_session_local.return_value.__enter__.return_value = db
+        stale = _ago(settings.stale_connection_days + 3)
+        eligible = [
+            UserConnectionFactory(
+                provider=p,
+                status=ConnectionStatus.ACTIVE,
+                access_token=None,
+                refresh_token=None,
+                last_synced_at=stale,
+            )
+            for p in ("apple", "samsung")
+        ]
+        # fresh SDK, and stale-but-OAuth: neither should transition
+        UserConnectionFactory(
+            provider="apple",
+            status=ConnectionStatus.ACTIVE,
+            access_token=None,
+            refresh_token=None,
+            last_synced_at=_ago(1),
+        )
+        UserConnectionFactory(
+            provider="whoop",
+            status=ConnectionStatus.ACTIVE,
+            access_token="tok",
+            refresh_token="ref",
+            last_synced_at=stale,
+        )
+
+        with patch("app.services.user_connection_service.on_connection_revoked") as emit:
+            result = revoke_stale_connections()
+
+        assert result["revoked_count"] == 2
+        assert emit.call_count == 2
+        emitted = {c.kwargs["connection_id"] for c in emit.call_args_list}
+        assert emitted == {c.id for c in eligible}
+
+    @patch("app.integrations.celery.tasks.revoke_stale_connections_task.SessionLocal")
+    def test_emitted_revoked_at_matches_the_row(
+        self, mock_session_local: MagicMock, db: Session, mock_celery_app: MagicMock
+    ) -> None:
+        """revoked_at must be the timestamp actually written, so it stays a stable key."""
+        mock_session_local.return_value.__enter__.return_value = db
+        connection = UserConnectionFactory(
+            provider="apple",
+            status=ConnectionStatus.ACTIVE,
+            access_token=None,
+            refresh_token=None,
+            last_synced_at=_ago(settings.stale_connection_days + 2),
+        )
+
+        with patch("app.services.user_connection_service.on_connection_revoked") as emit:
+            revoke_stale_connections()
+
+        db.refresh(connection)
+        assert emit.call_args.kwargs["revoked_at"] == connection.updated_at.isoformat()
+
+    @patch("app.integrations.celery.tasks.revoke_stale_connections_task.SessionLocal")
+    def test_second_sweep_is_a_noop(
+        self, mock_session_local: MagicMock, db: Session, mock_celery_app: MagicMock
+    ) -> None:
+        """The UPDATE predicate makes repeated sweeps idempotent."""
+        mock_session_local.return_value.__enter__.return_value = db
+        UserConnectionFactory(
+            provider="apple",
+            status=ConnectionStatus.ACTIVE,
+            access_token=None,
+            refresh_token=None,
+            last_synced_at=_ago(settings.stale_connection_days + 2),
+        )
+
+        with patch("app.services.user_connection_service.on_connection_revoked") as emit:
+            first = revoke_stale_connections()
+            second = revoke_stale_connections()
+
+        assert first["revoked_count"] == 1
+        assert second["revoked_count"] == 0
+        assert emit.call_count == 1

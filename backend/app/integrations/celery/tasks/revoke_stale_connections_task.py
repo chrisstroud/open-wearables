@@ -1,32 +1,35 @@
+from functools import cache
 from logging import getLogger
 
 from celery import shared_task
 
 from app.config import settings
 from app.database import SessionLocal
-from app.models import UserConnection
-from app.repositories.user_connection_repository import UserConnectionRepository
+from app.schemas.enums import ProviderName
 from app.services.providers.factory import ProviderFactory
 from app.services.user_connection_service import user_connection_service
-from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
 
 logger = getLogger(__name__)
 
 
-def _is_sdk_fed(connection: UserConnection) -> bool:
-    """True when the SDK upload endpoint is this connection's only way in.
+@cache
+def _client_sdk_providers() -> list[str]:
+    """Providers that expose an SDK upload path.
 
-    Only then is revoking safe: the next upload reactivates it. Decided per connection,
-    not per provider - Google has both an SDK and an OAuth integration under one slug,
-    and no tokens is what marks the SDK-provisioned rows.
+    Capabilities live in Python, so this narrows the UPDATE to candidate providers.
+    Whether a given connection is actually SDK-fed is decided per row inside the
+    query, by its OAuth tokens being NULL.
     """
-    try:
-        caps = ProviderFactory().get_provider(connection.provider).capabilities
-    except Exception:
-        return False
-
-    return caps.client_sdk and connection.access_token is None and connection.refresh_token is None
+    providers = []
+    for provider in ProviderName:
+        try:
+            caps = ProviderFactory().get_provider(provider.value).capabilities
+        except ValueError:
+            continue
+        if caps.client_sdk:
+            providers.append(provider.value)
+    return providers
 
 
 @shared_task
@@ -39,43 +42,18 @@ def revoke_stale_connections() -> dict:
     and is indistinguishable from a healthy one.
     """
     threshold_days = settings.stale_connection_days
-    revoked: list[dict[str, str]] = []
 
     with SessionLocal() as db:
-        stale_connections = UserConnectionRepository().get_stale_active(db, threshold_days)
-        candidates: list[UserConnection] = [c for c in stale_connections if _is_sdk_fed(c)]
-
-        log_structured(
-            logger,
-            "info",
-            f"Found {len(candidates)} stale SDK connection(s)",
-            action="stale_connection_sweep_start",
-            threshold_days=threshold_days,
-            stale_total=len(stale_connections),
-            stale_sdk=len(candidates),
-            skipped_non_sdk=len(stale_connections) - len(candidates),
-        )
-
-        for connection in candidates:
-            try:
-                if user_connection_service.revoke_as_stale(db, connection):
-                    revoked.append({"user_id": str(connection.user_id), "provider": connection.provider})
-            except Exception as e:
-                log_and_capture_error(
-                    e,
-                    logger,
-                    f"Failed to revoke stale connection for user {connection.user_id}: {e}",
-                    extra={"user_id": str(connection.user_id), "provider": connection.provider},
-                )
+        revoked = user_connection_service.revoke_stale_sdk_connections(db, _client_sdk_providers(), threshold_days)
+        result = [{"user_id": str(c.user_id), "provider": c.provider} for c in revoked]
 
     log_structured(
         logger,
         "info",
-        f"Revoked {len(revoked)} stale connection(s)",
+        f"Stale connection sweep revoked {len(result)} connection(s)",
         action="stale_connection_sweep_complete",
         threshold_days=threshold_days,
-        revoked_count=len(revoked),
-        revoked=revoked,
+        revoked_count=len(result),
     )
 
-    return {"threshold_days": threshold_days, "revoked_count": len(revoked), "revoked": revoked}
+    return {"threshold_days": threshold_days, "revoked_count": len(result), "revoked": result}

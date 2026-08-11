@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from logging import Logger, getLogger
 from uuid import UUID
 
@@ -6,7 +6,6 @@ from app.database import DbSession
 from app.models import UserConnection
 from app.repositories.data_source_repository import DataSourceRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
-from app.schemas.auth import ConnectionStatus
 from app.schemas.enums import ProviderName, SdkConnectionOutcome
 from app.schemas.model_crud.user_management import UserConnectionCreate, UserConnectionUpdate
 from app.schemas.responses.upload import ConnectionsCoverage, ProviderConnectionCount
@@ -96,38 +95,42 @@ class UserConnectionService(
         )
         return connection
 
-    def revoke_as_stale(self, db_session: DbSession, connection: UserConnection) -> bool:
-        """Mark a connection revoked because it stopped delivering data.
+    def revoke_stale_sdk_connections(
+        self,
+        db_session: DbSession,
+        providers: list[str],
+        days_threshold: int,
+    ) -> list[UserConnection]:
+        """Revoke SDK connections that stopped delivering data, emitting per revoked row.
 
-        Unlike disconnect() this keeps the tokens: the user never asked to disconnect,
-        so re-authorization must not be forced. Returns False if already revoked, so
-        the sweep does not re-emit on every run.
+        The repository re-checks staleness inside the UPDATE, so only connections that
+        actually transitioned are returned and only those emit.
         """
-        if connection.status == ConnectionStatus.REVOKED:
-            return False
+        revoked_at = datetime.now(timezone.utc)
+        revoked = self.crud.revoke_stale_sdk_connections(db_session, providers, days_threshold, revoked_at)
 
-        self.crud.mark_as_revoked(db_session, connection)
+        if revoked:
+            log_structured(
+                self.logger,
+                "info",
+                f"Revoked {len(revoked)} stale connection(s)",
+                action="connection_revoked",
+                reason=STALE_REASON,
+                revoked_count=len(revoked),
+                providers=sorted({c.provider for c in revoked}),
+                user_ids=[str(c.user_id) for c in revoked],
+            )
 
-        log_structured(
-            self.logger,
-            "info",
-            "Connection revoked",
-            action="connection_revoked",
-            reason=STALE_REASON,
-            provider=connection.provider,
-            user_id=str(connection.user_id),
-            connection_id=str(connection.id),
-            last_synced_at=connection.last_synced_at.isoformat() if connection.last_synced_at else None,
-        )
+        for connection in revoked:
+            on_connection_revoked(
+                user_id=connection.user_id,
+                provider=connection.provider,
+                connection_id=connection.id,
+                reason=STALE_REASON,
+                revoked_at=revoked_at.isoformat(),
+            )
 
-        on_connection_revoked(
-            user_id=connection.user_id,
-            provider=connection.provider,
-            connection_id=connection.id,
-            reason=STALE_REASON,
-            revoked_at=connection.updated_at.isoformat(),
-        )
-        return True
+        return revoked
 
     @handle_exceptions
     def disconnect(

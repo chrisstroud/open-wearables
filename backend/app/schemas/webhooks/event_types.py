@@ -192,11 +192,12 @@ class WebhookEventType(StrEnum):
 EVENT_TYPE_DESCRIPTIONS: dict[WebhookEventType, str] = {
     # Session events
     WebhookEventType.CONNECTION_CREATED: (
-        "A user successfully connected a wearable provider. SDK providers fire on the first upload."
+        "A user successfully connected a wearable provider. SDK providers fire on the first upload, "
+        "including when a revoked connection resumes uploading."
     ),
     WebhookEventType.CONNECTION_REVOKED: (
         "A provider connection became invalid or stopped delivering data (see reason). "
-        "The user must re-authorize to resume syncing."
+        "OAuth connections need re-authorization; SDK connections resume on the next upload."
     ),
     WebhookEventType.SYNC_STARTED: "A sync run started for a user (live, historical, backfill, SDK or XML).",
     WebhookEventType.SYNC_COMPLETED: "A sync run completed successfully (terminal state).",
