@@ -190,6 +190,7 @@ def process_sdk_upload(
                     DataTypeOutcome(data_type=data_type, kind=DataTypeKind.SERIES, status=SyncStatus.SUCCESS)
                     for data_type in types
                 ],
+                scope=scope,
             )
         else:
             emit_sync_failed(
