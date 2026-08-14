@@ -115,12 +115,19 @@ def sync_sdk_data(
         trace_id=batch_id,
     )
 
+    # Session id and type are read from the raw body: SDK versions that do not send
+    # them yet simply have no session, and the batch is tracked as a live one.
+    sync_session_id = body.get("syncSessionId")
+    sync_type = body.get("syncType")
+
     process_sdk_upload.delay(
         content=content_str,
         content_type="application/json",
         user_id=user_id,
         provider=provider,
         batch_id=batch_id,
+        sync_session_id=sync_session_id if isinstance(sync_session_id, str) else None,
+        sync_type=sync_type if isinstance(sync_type, str) else None,
     )
 
     return UploadDataResponse(status_code=202, response="Import task queued successfully", user_id=user_id)
