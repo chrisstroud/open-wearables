@@ -200,6 +200,7 @@ def process_sdk_upload(
                 items_processed=items_total,
                 metadata={
                     "batch_id": batch_id,
+                    "inserted": items_total,
                     "records_saved": records_saved,
                     "workouts_saved": workouts_saved,
                     "sleep_saved": sleep_saved,
