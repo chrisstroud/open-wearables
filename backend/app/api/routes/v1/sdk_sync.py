@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, status
 from app.integrations.celery.tasks.process_sdk_upload_task import process_sdk_upload
 from app.schemas.providers.mobile_sdk import SyncRequest
 from app.schemas.responses.upload import UploadDataResponse
-from app.services.raw_payload_storage import store_raw_payload
+from app.services.raw_payload_storage import s3_enabled, store_raw_payload
 from app.utils.api_utils import inline_schema_defs
 from app.utils.auth import SDKAuthDep
 from app.utils.structured_logging import log_structured
@@ -107,7 +107,10 @@ def sync_sdk_data(
 
     content_str = json.dumps(body)
 
-    store_raw_payload(
+    # Persist the raw payload and pass only a reference to the worker so the (potentially
+    # multi-MB) body never travels through the Celery/Redis broker - that broker bloat is
+    # what drove Redis to maxmemory. When S3 storage is off (dev), fall back to inline content.
+    payload_ref = store_raw_payload(
         source="sdk",
         provider=provider,
         payload=content_str,
@@ -115,12 +118,31 @@ def sync_sdk_data(
         trace_id=batch_id,
     )
 
+    if s3_enabled() and payload_ref is None:
+        # S3 is the payload channel here; a missing key means the write failed or the payload
+        # exceeded the size limit. Fail loudly rather than silently falling back to inline
+        # content (which would re-introduce the broker bloat for exactly the large payloads).
+        log_structured(
+            logger,
+            "error",
+            "Failed to persist SDK payload to S3; rejecting batch",
+            action="sdk_payload_persist_failed",
+            batch_id=batch_id,
+            user_id=user_id,
+            provider=provider,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Failed to persist payload; please retry.",
+        )
+
     process_sdk_upload.delay(
-        content=content_str,
+        content=None if payload_ref else content_str,
         content_type="application/json",
         user_id=user_id,
         provider=provider,
         batch_id=batch_id,
+        payload_ref=payload_ref,
     )
 
     return UploadDataResponse(status_code=202, response="Import task queued successfully", user_id=user_id)

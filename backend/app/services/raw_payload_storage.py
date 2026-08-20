@@ -84,6 +84,15 @@ def _create_s3_client(endpoint_url: str | None = None) -> Any:
         return None
 
 
+def s3_enabled() -> bool:
+    """True when the S3 backend is active and usable (client + bucket configured).
+
+    Callers that need a retrievable reference (e.g. async task payloads) check this to
+    decide between passing an S3 key or falling back to inline content.
+    """
+    return _storage_backend == "s3" and _s3_client is not None and _s3_bucket is not None
+
+
 def store_raw_payload(
     *,
     source: str,
@@ -91,7 +100,7 @@ def store_raw_payload(
     payload: Any,
     user_id: str | None = None,
     trace_id: str | None = None,
-) -> None:
+) -> str | None:
     """Store a raw payload. No-op when disabled.
 
     Args:
@@ -100,9 +109,12 @@ def store_raw_payload(
         payload: Raw data (dict, list, or pre-serialized string)
         user_id: Optional user identifier for correlation
         trace_id: Optional trace/batch ID for correlation with processed data
+
+    Returns:
+        The S3 object key when stored to S3, else None (disabled/log backend, or skipped).
     """
     if _storage_backend == "disabled":
-        return
+        return None
 
     payload_str = payload if isinstance(payload, str) else json.dumps(payload, default=json_serial)
 
@@ -114,12 +126,27 @@ def store_raw_payload(
             size,
             _max_size_bytes,
         )
-        return
+        return None
 
     if _storage_backend == "log":
         _store_to_log(source, provider, payload_str, size, user_id, trace_id)
+        return None
     elif _storage_backend == "s3":
-        _store_to_s3(source, provider, payload_str, size, user_id, trace_id)
+        return _store_to_s3(source, provider, payload_str, size, user_id, trace_id)
+    return None
+
+
+def load_raw_payload(key: str) -> str:
+    """Read a previously-stored payload back from S3 by key.
+
+    Used by async tasks that receive an S3 reference instead of the inline payload, so the
+    large body never travels through the Celery/Redis broker. Raises on any read failure;
+    the caller decides whether to retry the task.
+    """
+    if _s3_client is None or _s3_bucket is None:
+        raise RuntimeError("Cannot load raw payload: S3 client or bucket not configured")
+    obj = _s3_client.get_object(Bucket=_s3_bucket, Key=key)
+    return obj["Body"].read().decode("utf-8")
 
 
 def _store_to_log(
@@ -153,15 +180,17 @@ def _store_to_s3(
     size: int,
     user_id: str | None,
     trace_id: str | None,
-) -> None:
+) -> str | None:
     """Upload raw payload to S3.
 
     Key format: {prefix}/{provider}/{source}/{YYYY-MM-DD}/{uuid}.json
     Metadata includes user_id, trace_id, and size for easy filtering.
+
+    Returns the object key on success, or None on failure.
     """
     if _s3_client is None or _s3_bucket is None:
         logger.warning("S3 client or bucket not configured - skipping raw payload storage")
-        return
+        return None
 
     now = datetime.now(UTC)
     date_part = now.strftime("%Y-%m-%d")
@@ -194,8 +223,10 @@ def _store_to_s3(
             key,
             size,
         )
+        return key
     except Exception:
         logger.exception("Failed to store raw payload to S3: s3://%s/%s", _s3_bucket, key)
+        return None
 
 
 def store_fit_file(

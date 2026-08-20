@@ -16,6 +16,7 @@ from app.services.apple.healthkit.import_service import (
 from app.services.apple.healthkit.import_service import (
     import_service as sdk_import_service,
 )
+from app.services.raw_payload_storage import load_raw_payload
 from app.services.sync_status_service import completed, failed, started
 from app.utils.structured_logging import log_structured
 
@@ -30,21 +31,25 @@ def _get_import_service(provider: str) -> SDKImportService:
 
 @shared_task(queue="sdk_sync")
 def process_sdk_upload(
-    content: str,
+    content: str | None,
     content_type: str,
     user_id: str,
     provider: str,
     batch_id: str | None = None,
+    payload_ref: str | None = None,
 ) -> dict[str, Any]:
     """
     Process SDK data import asynchronously.
 
     Args:
-        content: The request content as string (JSON or multipart data)
+        content: The request content as string (JSON or multipart data). None when the
+            payload was offloaded to S3 - see ``payload_ref``.
         content_type: The content type header value
         user_id: User ID to associate with the data
         provider: Import provider - "apple", "samsung", "google"
         batch_id: Unique batch identifier for tracking (optional for backwards compatibility)
+        payload_ref: S3 key of the stored payload. When set (and ``content`` is None) the body
+            is loaded from S3 here, so the large payload never travels through the broker.
 
     Returns:
         Dictionary with status_code and response message
@@ -52,6 +57,23 @@ def process_sdk_upload(
     # Generate batch_id if not provided (backwards compatibility)
     if not batch_id:
         batch_id = str(uuid.uuid4())
+
+    # Load the payload from S3 when only a reference was enqueued. A read failure raises,
+    # letting Celery retry (the S3 object persists) rather than losing the batch.
+    if content is None and payload_ref:
+        content = load_raw_payload(payload_ref)
+
+    if content is None:
+        log_structured(
+            logger,
+            "warning",
+            "No payload content or reference provided",
+            provider=provider,
+            action="validate_payload_present",
+            batch_id=batch_id,
+            user_id=user_id,
+        )
+        return {"status": "error", "reason": "missing_payload", "batch_id": batch_id}
 
     # Validate user_id format
     try:
