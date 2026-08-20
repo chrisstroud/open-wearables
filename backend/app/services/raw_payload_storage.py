@@ -131,7 +131,7 @@ def store_raw_payload(
     if _storage_backend == "log":
         _store_to_log(source, provider, payload_str, size, user_id, trace_id)
         return None
-    elif _storage_backend == "s3":
+    if _storage_backend == "s3":
         return _store_to_s3(source, provider, payload_str, size, user_id, trace_id)
     return None
 

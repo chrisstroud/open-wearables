@@ -4,6 +4,7 @@ from logging import getLogger
 
 from fastapi import APIRouter, HTTPException, status
 
+from app.config import settings
 from app.integrations.celery.tasks.process_sdk_upload_task import process_sdk_upload
 from app.schemas.providers.mobile_sdk import SyncRequest
 from app.schemas.responses.upload import UploadDataResponse
@@ -107,9 +108,6 @@ def sync_sdk_data(
 
     content_str = json.dumps(body)
 
-    # Persist the raw payload and pass only a reference to the worker so the (potentially
-    # multi-MB) body never travels through the Celery/Redis broker - that broker bloat is
-    # what drove Redis to maxmemory. When S3 storage is off (dev), fall back to inline content.
     payload_ref = store_raw_payload(
         source="sdk",
         provider=provider,
@@ -118,10 +116,12 @@ def sync_sdk_data(
         trace_id=batch_id,
     )
 
-    if s3_enabled() and payload_ref is None:
+    # Gated by SDK_PAYLOAD_S3_OFFLOAD so instances without S3 keep the legacy inline path.
+    offload_to_s3 = settings.sdk_payload_s3_offload and s3_enabled()
+
+    if offload_to_s3 and payload_ref is None:
         # S3 is the payload channel here; a missing key means the write failed or the payload
-        # exceeded the size limit. Fail loudly rather than silently falling back to inline
-        # content (which would re-introduce the broker bloat for exactly the large payloads).
+        # exceeded the size limit. Fail loudly rather than silently falling back to inline.
         log_structured(
             logger,
             "error",
@@ -137,12 +137,12 @@ def sync_sdk_data(
         )
 
     process_sdk_upload.delay(
-        content=None if payload_ref else content_str,
+        content=None if offload_to_s3 else content_str,
         content_type="application/json",
         user_id=user_id,
         provider=provider,
         batch_id=batch_id,
-        payload_ref=payload_ref,
+        payload_ref=payload_ref if offload_to_s3 else None,
     )
 
     return UploadDataResponse(status_code=202, response="Import task queued successfully", user_id=user_id)

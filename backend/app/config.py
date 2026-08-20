@@ -244,6 +244,11 @@ class Settings(BaseSettings):
     raw_payload_s3_prefix: str = "raw-payloads"
     raw_payload_s3_endpoint_url: str | None = None  # for S3-compatible storage (e.g. Railway Object Storage)
 
+    # When on (and raw_payload_storage=s3), the SDK sync endpoint enqueues an S3 reference to
+    # the payload instead of the inline body, keeping large uploads out of the Celery/Redis
+    # broker. Off by default so instances without S3 keep the legacy inline path (migration).
+    sdk_payload_s3_offload: bool = False
+
     # SVIX WEBHOOK SETTINGS
     # Master switch for outgoing webhooks. Off by default so deployments without Svix
     # (no svix-server container) never build a client, emit, or register event types.
