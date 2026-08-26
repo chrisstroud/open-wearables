@@ -43,6 +43,13 @@ class SDKSyncWindowReceipt(BaseDbModel):
             "jsonb_array_length(batch_ids) > 0 OR jsonb_array_length(empty_or_no_access_types) > 0",
             name="ck_sdk_sync_window_receipt_coverage",
         ),
+        CheckConstraint(
+            "(installation_id IS NULL AND installation_generation IS NULL "
+            "AND health_evidence_generation IS NULL) OR "
+            "(installation_id IS NOT NULL AND installation_generation > 0 "
+            "AND health_evidence_generation >= 0)",
+            name="ck_sdk_sync_window_receipt_installation_scope",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(
@@ -50,6 +57,12 @@ class SDKSyncWindowReceipt(BaseDbModel):
         primary_key=True,
     )
     user_id: Mapped[FKUser]
+    installation_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("sdk_client_installation.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    installation_generation: Mapped[int | None]
+    health_evidence_generation: Mapped[int | None]
     provider: Mapped[str_32]
     manifest_sha256: Mapped[str_64]
     purpose: Mapped[str_32]

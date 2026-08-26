@@ -7,6 +7,8 @@ from app.config import settings
 from app.database import DbSession
 from app.schemas.auth import SDKTokenRequest, TokenResponse
 from app.services import application_service, create_sdk_user_token, refresh_token_service
+from app.services.sdk_client_installation_service import sdk_client_installation_service
+from app.services.user_service import user_service
 from app.utils.auth import DeveloperOptionalDep
 
 router = APIRouter()
@@ -60,6 +62,21 @@ def create_user_token(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Either app credentials (app_id, app_secret) or admin authentication (Bearer token) is required",
+        )
+
+    user = user_service.get(db, user_id, print_log=False)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    if user.health_write_state != "active":
+        raise HTTPException(status_code=status.HTTP_423_LOCKED, detail="Health data changes are temporarily fenced")
+    if (
+        user.health_source_policy != "legacy-mixed"
+        or user.health_evidence_generation != 0
+        or bool(sdk_client_installation_service.crud.list_for_user(db, user_id))
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Legacy SDK token minting is disabled for this account",
         )
 
     # Generate user-scoped SDK token

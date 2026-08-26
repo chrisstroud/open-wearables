@@ -2,11 +2,15 @@
 Unit tests for refresh token service.
 """
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+from uuid import uuid4
+
 import pytest
 from fastapi import HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
-from app.models import RefreshToken
+from app.models import RefreshToken, User
 from app.schemas.auth import TokenType
 from app.services.refresh_token_service import refresh_token_service
 from tests.factories import DeveloperFactory, UserFactory
@@ -163,6 +167,71 @@ class TestRefreshToken:
         new_db_token = db.query(RefreshToken).filter(RefreshToken.id == result.refresh_token).first()
         assert new_db_token is not None
         assert new_db_token.revoked_at is None
+
+    def test_concurrent_sdk_refresh_allows_exactly_one_rotation(
+        self,
+        session_factory: sessionmaker[Session],
+    ) -> None:
+        """Two replays of one SDK refresh credential cannot both mint replacements."""
+        user_id = uuid4()
+        with session_factory() as setup:
+            setup.add(
+                User(
+                    id=user_id,
+                    first_name=None,
+                    last_name=None,
+                    email=None,
+                    external_user_id=f"refresh-race-{user_id}",
+                    health_evidence_generation=0,
+                    health_write_state="active",
+                    health_source_policy="legacy-mixed",
+                )
+            )
+            setup.commit()
+            original = refresh_token_service.create_sdk_refresh_token(
+                setup,
+                user_id,
+                "refresh-race-proof",
+            )
+
+        start = Barrier(2)
+
+        def rotate() -> tuple[int, str | None]:
+            with session_factory() as worker:
+                start.wait(timeout=5)
+                try:
+                    response = refresh_token_service.refresh_token(worker, original)
+                except HTTPException as exc:
+                    worker.rollback()
+                    return exc.status_code, None
+                return 200, response.refresh_token
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(lambda _index: rotate(), range(2)))
+
+            assert sorted(status_code for status_code, _token in results) == [200, 401]
+            replacement_ids = [token for status_code, token in results if status_code == 200]
+            assert len(replacement_ids) == 1
+            assert replacement_ids[0] is not None
+
+            with session_factory() as verify:
+                original_row = verify.query(RefreshToken).filter_by(id=original).one()
+                assert original_row.revoked_at is not None
+                active = (
+                    verify.query(RefreshToken)
+                    .filter(
+                        RefreshToken.user_id == user_id,
+                        RefreshToken.revoked_at.is_(None),
+                    )
+                    .all()
+                )
+                assert [row.id for row in active] == replacement_ids
+        finally:
+            with session_factory() as cleanup:
+                cleanup.query(RefreshToken).filter(RefreshToken.user_id == user_id).delete()
+                cleanup.query(User).filter(User.id == user_id).delete()
+                cleanup.commit()
 
 
 class TestRevokeToken:

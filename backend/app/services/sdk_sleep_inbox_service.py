@@ -5,11 +5,13 @@ from datetime import datetime, timedelta, timezone
 from logging import getLogger
 from uuid import UUID, uuid4
 
+from sqlalchemy.exc import IntegrityError
+
 from app.config import settings
 from app.constants.series_types.sdk import SleepPhase, get_apple_sleep_phase
 from app.database import DbSession
 from app.models import SDKSleepInbox
-from app.repositories import SDKSleepInboxRepository
+from app.repositories import SDKBatchReceiptRepository, SDKSleepInboxRepository
 from app.schemas.providers.mobile_sdk import SleepRecord
 
 logger = getLogger(__name__)
@@ -28,6 +30,7 @@ class SDKSleepInboxService:
 
     def __init__(self) -> None:
         self.crud = SDKSleepInboxRepository()
+        self.batch_receipts = SDKBatchReceiptRepository()
 
     @staticmethod
     def _payload(record: SleepRecord) -> dict:
@@ -50,6 +53,15 @@ class SDKSleepInboxService:
         if not records:
             return SleepInboxStageOutcome(0)
 
+        receipt = self.batch_receipts.get(db_session, batch_id)
+        if (
+            receipt is None
+            or receipt.user_id != user_id
+            or receipt.provider != provider
+            or receipt.status != "processing"
+        ):
+            return SleepInboxStageOutcome(0, error_code="sleep_batch_scope_missing")
+
         prepared: dict[str, tuple[SleepRecord, str, dict]] = {}
         for record in records:
             if not record.id:
@@ -71,6 +83,7 @@ class SDKSleepInboxService:
                 user_id=user_id,
                 provider=provider,
                 external_id=external_id,
+                health_evidence_generation=receipt.health_evidence_generation,
                 for_update=True,
             )
             if existing is not None:
@@ -78,8 +91,18 @@ class SDKSleepInboxService:
                     return SleepInboxStageOutcome(0, error_code="sleep_source_payload_conflict")
                 if batch_id not in existing.batch_ids:
                     existing.batch_ids = [*existing.batch_ids, batch_id]
-                    existing.updated_at = datetime.now(timezone.utc)
-                    self.crud.save(db_session, existing)
+                # A re-pair may legitimately retry an unmaterialized source
+                # sample in the same health generation. Rebind that durable
+                # work to the current installation; materialized evidence is
+                # already account-owned and needs no replay.
+                if existing.status != "materialized":
+                    existing.installation_id = receipt.installation_id
+                    existing.installation_generation = receipt.installation_generation
+                    existing.status = "staged"
+                    existing.next_attempt_at = datetime.now(timezone.utc)
+                    existing.last_error = None
+                existing.updated_at = datetime.now(timezone.utc)
+                self.crud.save(db_session, existing)
                 existing_by_id[external_id] = existing
 
         now = datetime.now(timezone.utc)
@@ -90,6 +113,9 @@ class SDKSleepInboxService:
             row = SDKSleepInbox(
                 id=uuid4(),
                 user_id=user_id,
+                installation_id=receipt.installation_id,
+                installation_generation=receipt.installation_generation,
+                health_evidence_generation=receipt.health_evidence_generation,
                 provider=provider,
                 external_id=external_id,
                 batch_ids=[batch_id],
@@ -103,8 +129,36 @@ class SDKSleepInboxService:
                 last_error=None,
                 updated_at=now,
             )
-            self.crud.add(db_session, row)
-            rows_by_external_id[external_id] = row
+            nested = db_session.begin_nested()
+            try:
+                self.crud.add(db_session, row)
+                nested.commit()
+                rows_by_external_id[external_id] = row
+            except IntegrityError:
+                nested.rollback()
+                concurrent = self.crud.get(
+                    db_session,
+                    user_id=user_id,
+                    provider=provider,
+                    external_id=external_id,
+                    health_evidence_generation=receipt.health_evidence_generation,
+                    for_update=True,
+                )
+                if concurrent is None:
+                    return SleepInboxStageOutcome(0, error_code="sleep_inbox_unavailable")
+                if concurrent.payload_sha256 != payload_hash:
+                    return SleepInboxStageOutcome(0, error_code="sleep_source_payload_conflict")
+                if batch_id not in concurrent.batch_ids:
+                    concurrent.batch_ids = [*concurrent.batch_ids, batch_id]
+                if concurrent.status != "materialized":
+                    concurrent.installation_id = receipt.installation_id
+                    concurrent.installation_generation = receipt.installation_generation
+                    concurrent.status = "staged"
+                    concurrent.next_attempt_at = now
+                    concurrent.last_error = None
+                concurrent.updated_at = now
+                self.crud.save(db_session, concurrent)
+                rows_by_external_id[external_id] = concurrent
 
         return SleepInboxStageOutcome(
             staged_count=len(records),
@@ -143,12 +197,16 @@ class SDKSleepInboxService:
         db_session: DbSession,
         *,
         row_ids: set[UUID],
+        expected_attempts: dict[UUID, int],
         materialized_ids: set[UUID],
         error_code: str | None = None,
+        commit: bool = True,
     ) -> None:
         now = datetime.now(timezone.utc)
         rows = self.crud.list_by_ids(db_session, row_ids, for_update=True)
         for row in rows:
+            if row.status != "projecting" or row.attempt_count != expected_attempts.get(row.id):
+                continue
             if row.id in materialized_ids:
                 row.status = "materialized"
                 row.materialized_at = now
@@ -163,7 +221,29 @@ class SDKSleepInboxService:
                 row.last_error = error_code[:100] if error_code else None
             row.updated_at = now
             self.crud.save(db_session, row)
-        db_session.commit()
+        if commit:
+            db_session.commit()
+
+    def quarantine(
+        self,
+        db_session: DbSession,
+        *,
+        row_ids: set[UUID],
+        expected_attempts: dict[UUID, int],
+        error_code: str,
+        commit: bool = True,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        for row in self.crud.list_by_ids(db_session, row_ids, for_update=True):
+            if row.status != "projecting" or row.attempt_count != expected_attempts.get(row.id):
+                continue
+            row.status = "quarantined"
+            row.last_error = error_code[:100]
+            row.next_attempt_at = now
+            row.updated_at = now
+            self.crud.save(db_session, row)
+        if commit:
+            db_session.commit()
 
     @staticmethod
     def schedule_projection(*, user_id: UUID, provider: str) -> None:

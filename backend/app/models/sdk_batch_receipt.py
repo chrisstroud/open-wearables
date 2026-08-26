@@ -1,8 +1,9 @@
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import CheckConstraint, Index
-from sqlalchemy.orm import Mapped
+from sqlalchemy import CheckConstraint, ForeignKey, Index
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import BaseDbModel
 from app.mappings import FKUser, PrimaryKey, str_32, str_64, str_100
@@ -30,12 +31,34 @@ class SDKBatchReceipt(BaseDbModel):
             "status <> 'succeeded' OR (dropped_count = 0 AND tombstones_unresolved = 0 AND retryable = false)",
             name="ck_sdk_batch_receipt_success_is_accepted",
         ),
+        CheckConstraint(
+            "(installation_id IS NULL AND installation_generation IS NULL "
+            "AND health_evidence_generation IS NULL) OR "
+            "(installation_id IS NOT NULL AND installation_generation > 0 "
+            "AND health_evidence_generation >= 0)",
+            name="ck_sdk_batch_receipt_installation_scope",
+        ),
+        CheckConstraint(
+            "(content_lower_bound_inclusive IS NULL AND content_upper_bound_exclusive IS NULL) OR "
+            "(content_lower_bound_inclusive IS NOT NULL AND content_upper_bound_exclusive IS NOT NULL "
+            "AND content_lower_bound_inclusive <= content_upper_bound_exclusive)",
+            name="ck_sdk_batch_receipt_content_bounds",
+        ),
     )
 
     id: Mapped[PrimaryKey[UUID]]
     user_id: Mapped[FKUser]
+    installation_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("sdk_client_installation.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    installation_generation: Mapped[int | None]
+    health_evidence_generation: Mapped[int | None]
     provider: Mapped[str_32]
     payload_sha256: Mapped[str_64]
+    content_lower_bound_inclusive: Mapped[datetime | None]
+    content_upper_bound_exclusive: Mapped[datetime | None]
+    covered_type_identifiers: Mapped[list[str]] = mapped_column(JSONB, default=list)
     status: Mapped[str_32]
     retryable: Mapped[bool]
     attempt_count: Mapped[int]

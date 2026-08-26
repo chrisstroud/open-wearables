@@ -17,6 +17,13 @@ from .oauth import (
     ProviderCredentials,
     ProviderEndpoints,
 )
+from .sdk_client_installation import (
+    SDKClientInstallationRead,
+    SDKClientInstallationRevokeRequest,
+    SDKClientRegistration,
+    SDKHealthResetStateRead,
+    SDKHealthResetTransitionRequest,
+)
 from .user_invitation_code import (
     InvitationCodeRedeemResponse,
     UserInvitationActivationPolicy,
@@ -50,4 +57,9 @@ __all__ = [
     "UserInvitationCodeRedeem",
     "InvitationCodeRedeemResponse",
     "UserInvitationActivationPolicy",
+    "SDKClientRegistration",
+    "SDKClientInstallationRead",
+    "SDKClientInstallationRevokeRequest",
+    "SDKHealthResetStateRead",
+    "SDKHealthResetTransitionRequest",
 ]

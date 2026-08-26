@@ -139,8 +139,9 @@
           {
             "group": "Deployment",
             "pages": [
-              "deployment/docker",
-              "deployment/railway"
+              "deployment/docker-images",
+              "deployment/railway",
+              "deployment/mobile-v2-reliability-runbook"
             ]
           },
           {

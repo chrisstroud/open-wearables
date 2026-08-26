@@ -113,6 +113,22 @@ class StravaWebhookHandler(BaseWebhookHandler):
         """Store raw payload and enqueue async processing. Returns 200 immediately."""
         trace_id = str(uuid4())[:8]
         raw = payload.model_dump()
+        authority = self.authorize_webhook_ingress(
+            db,
+            provider_user_ids={str(payload.owner_id)},
+        )
+        if str(payload.owner_id) not in authority.provider_user_ids:
+            log_structured(
+                logger,
+                "info",
+                "Acknowledged Strava webhook without dispatch",
+                provider="strava",
+                trace_id=trace_id,
+                object_type=payload.object_type,
+                aspect_type=payload.aspect_type,
+                action="webhook_ingress_fenced",
+            )
+            return {"status": "accepted"}
 
         log_structured(
             logger,

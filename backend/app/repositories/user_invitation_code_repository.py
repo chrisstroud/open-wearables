@@ -14,7 +14,13 @@ class UserInvitationCodeRepository(CrudRepository[UserInvitationCode, UserInvita
     def __init__(self, model: type[UserInvitationCode]) -> None:
         super().__init__(model)
 
-    def get_valid_by_code(self, db_session: DbSession, code: str) -> UserInvitationCode | None:
+    def get_valid_by_code(
+        self,
+        db_session: DbSession,
+        code: str,
+        *,
+        for_update: bool = True,
+    ) -> UserInvitationCode | None:
         """Get an invitation code that is not yet redeemed, not revoked, and not expired."""
         now = datetime.now(timezone.utc)
         stmt = select(self.model).where(
@@ -23,6 +29,8 @@ class UserInvitationCodeRepository(CrudRepository[UserInvitationCode, UserInvita
             self.model.revoked_at.is_(None),
             self.model.expires_at > now,
         )
+        if for_update:
+            stmt = stmt.with_for_update()
         return db_session.execute(stmt).scalar_one_or_none()
 
     def mark_redeemed(self, db_session: DbSession, invitation_code: UserInvitationCode) -> UserInvitationCode:
@@ -32,7 +40,7 @@ class UserInvitationCodeRepository(CrudRepository[UserInvitationCode, UserInvita
         db_session.refresh(invitation_code)
         return invitation_code
 
-    def revoke_active_for_user(self, db_session: DbSession, user_id: UUID) -> None:
+    def revoke_active_for_user(self, db_session: DbSession, user_id: UUID, *, commit: bool = True) -> None:
         """Revoke all active invitation codes for a user."""
         now = datetime.now(timezone.utc)
         stmt = (
@@ -46,4 +54,7 @@ class UserInvitationCodeRepository(CrudRepository[UserInvitationCode, UserInvita
             .values(revoked_at=now)
         )
         db_session.execute(stmt)
-        db_session.commit()
+        if commit:
+            db_session.commit()
+        else:
+            db_session.flush()

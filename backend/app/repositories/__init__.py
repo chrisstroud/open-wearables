@@ -11,8 +11,13 @@ from .provider_priority_repository import ProviderPriorityRepository
 from .refresh_token_repository import RefreshTokenRepository, refresh_token_repository
 from .repositories import CrudRepository
 from .sdk_batch_receipt_repository import SDKBatchReceiptRepository
+from .sdk_client_installation_repository import (
+    SDKClientInstallationRepository,
+    sdk_client_installation_repository,
+)
 from .sdk_sleep_inbox_repository import SDKSleepInboxRepository
 from .sdk_sync_window_receipt_repository import SDKSyncWindowReceiptRepository
+from .sdk_upload_inbox_repository import SDKUploadInboxRepository, sdk_upload_inbox_repository
 from .user_connection_repository import UserConnectionRepository
 from .user_repository import UserRepository
 
@@ -28,8 +33,12 @@ __all__ = [
     "ProviderPriorityRepository",
     "RefreshTokenRepository",
     "SDKBatchReceiptRepository",
+    "SDKClientInstallationRepository",
+    "sdk_client_installation_repository",
     "SDKSleepInboxRepository",
     "SDKSyncWindowReceiptRepository",
+    "SDKUploadInboxRepository",
+    "sdk_upload_inbox_repository",
     "refresh_token_repository",
     "UserConnectionRepository",
     "DeveloperRepository",

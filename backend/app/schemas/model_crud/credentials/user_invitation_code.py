@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from app.schemas.auth import TokenResponse
+from app.schemas.model_crud.credentials.sdk_client_installation import SDKClientRegistration
 
 
 class UserInvitationActivationPolicy(BaseModel):
@@ -53,6 +54,7 @@ class UserInvitationCodeCreate(BaseModel):
     redeemed_at: None = None
     revoked_at: None = None
     activation_policy: dict[str, Any] | None = None
+    health_evidence_generation: int = 0
     created_at: datetime
 
 
@@ -81,6 +83,7 @@ class UserInvitationCodeRedeem(BaseModel):
     """API input for redeeming an invitation code."""
 
     code: str = Field(..., min_length=8, max_length=8, pattern=r"^[A-Z2-9]{8}$")
+    client: SDKClientRegistration | None = None
 
 
 class InvitationCodeRedeemResponse(TokenResponse):
@@ -88,3 +91,4 @@ class InvitationCodeRedeemResponse(TokenResponse):
 
     user_id: UUID
     activation_policy: UserInvitationActivationPolicy | None = None
+    installation_id: UUID | None = None

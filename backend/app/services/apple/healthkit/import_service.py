@@ -100,6 +100,34 @@ class LoadDataResult(TypedDict):
     processing_error_code: str | None
 
 
+def _content_coverage(request: SDKSyncRequest) -> tuple[list[str], str | None, str | None]:
+    """Derive bounded metadata from the validated payload without retaining values."""
+    type_identifiers = {str(record.type) for record in request.data.records if record.type is not None}
+    if request.data.sleep:
+        type_identifiers.add("HKCategoryTypeIdentifierSleepAnalysis")
+    if request.data.workouts:
+        type_identifiers.add("HKWorkoutType")
+
+    records = [*request.data.records, *request.data.sleep, *request.data.workouts]
+    if not records:
+        return sorted(type_identifiers), None, None
+    lower = min(record.startDate for record in records)
+    upper = max(record.endDate for record in records)
+    return sorted(type_identifiers), lower.isoformat(), upper.isoformat()
+
+
+def validated_content_coverage(request_content: str) -> dict[str, list[str] | str | None]:
+    """Return privacy-safe bounds/types from a terminal-success JSON payload."""
+    raw = json.loads(request_content)
+    request = SDKSyncRequest.model_validate(raw)
+    covered_types, content_lower, content_upper = _content_coverage(request)
+    return {
+        "covered_type_identifiers": covered_types,
+        "content_lower_bound_inclusive": content_lower,
+        "content_upper_bound_exclusive": content_upper,
+    }
+
+
 def _parse_sync_request(raw: dict) -> tuple[SDKSyncRequest, list[InvalidRecord]]:
     """Parse a raw payload into a SyncRequest, salvaging valid records when items fail.
 
@@ -488,7 +516,10 @@ class ImportService:
                     "unprocessed_count": 1,
                     "processing_error_code": acceptance.error_code or "window_not_accepted",
                 }
-            db_session.commit()
+            if require_terminal_receipt:
+                db_session.flush()
+            else:
+                db_session.commit()
             return {
                 "workouts_saved": 0,
                 "records_saved": 0,
@@ -652,7 +683,6 @@ class ImportService:
             }
 
         user_uuid = UUID(user_id)
-        sleep_inbox_ids: tuple[UUID, ...] = ()
         if require_terminal_receipt and request.data.sleep:
             if batch_id is None:
                 return {
@@ -712,7 +742,6 @@ class ImportService:
                     "processing_error_code": sleep_stage.error_code,
                 }
             sleep_saved = sleep_stage.staged_count
-            sleep_inbox_ids = sleep_stage.row_ids
 
         # Process workouts in batch
         workout_bundles = list(self._build_workout_bundles(request, user_id))
@@ -770,18 +799,18 @@ class ImportService:
             types.update(sample.series_type.value for sample in samples)
 
         # Commit all workout and timeseries changes in one transaction
-        db_session.commit()
+        if require_terminal_receipt:
+            db_session.flush()
+        else:
+            db_session.commit()
 
         # Process sleep (count sleep segments from input)
         if request.data.sleep and not require_terminal_receipt:
             handle_sleep_data(db_session, request, user_id)
             sleep_saved = len(request.data.sleep)
             db_session.commit()
-        elif sleep_inbox_ids:
-            sdk_sleep_inbox_service.schedule_projection(
-                user_id=user_uuid,
-                provider=request.provider,
-            )
+        # Receipt-backed sleep projection is scheduled by the worker only
+        # after its atomic write + terminal-receipt transaction commits.
 
         return {
             "workouts_saved": workouts_saved,
@@ -878,7 +907,11 @@ class ImportService:
 
             connection = self.user_connection_repo.get_by_user_and_provider(db_session, UUID(user_id), provider)
             if connection:
-                self.user_connection_repo.update_last_synced_at(db_session, connection)
+                self.user_connection_repo.update_last_synced_at(
+                    db_session,
+                    connection,
+                    commit=not require_terminal_receipt,
+                )
 
             # Log detailed processing results
             log_structured(
@@ -1003,16 +1036,23 @@ class ImportService:
 
         except Exception as e:
             db_session.rollback()
+            sanitized_error = RuntimeError(f"SDK import failed ({type(e).__name__})")
             log_and_capture_error(
-                e,
+                sanitized_error,
                 self.log,
                 f"Import failed for user {user_id}",
-                extra={"user_id": user_id, "batch_id": batch_id, "provider": provider},
+                extra={
+                    "user_id": user_id,
+                    "batch_id": batch_id,
+                    "provider": provider,
+                    "error_type": type(e).__name__,
+                },
+                include_exc_info=False,
             )
             log_structured(
                 self.log,
                 "error",
-                f"Import failed for user {user_id}: {e}",
+                f"Import failed for user {user_id}",
                 provider=f"{provider}",
                 action=f"{provider}_sdk_import_failed",
                 batch_id=batch_id,
@@ -1021,7 +1061,7 @@ class ImportService:
             )
             return UploadDataResponse(
                 status_code=400,
-                response=f"Import failed: {str(e)}",
+                response="Import failed",
                 user_id=user_id,
             )
 

@@ -10,6 +10,8 @@ from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
+from tests.factories import UserConnectionFactory
+
 PUSH_ENDPOINT = "/api/v1/providers/garmin/webhooks"
 LEGACY_PUSH_ENDPOINT = "/api/v1/garmin/webhooks/push"
 LEGACY_PING_ENDPOINT = "/api/v1/garmin/webhooks/ping"
@@ -69,6 +71,8 @@ class TestGarminWebhookTaskEnqueue:
             ],
         }
         headers = {"garmin-client-id": "test-client-id"}
+        UserConnectionFactory(provider="garmin", provider_user_id="garmin_user_123", status="active")
+        db.flush()
 
         with patch(f"{WEBHOOK_HANDLER}.celery_app") as mock_celery:
             mock_celery.send_task.return_value = MagicMock(id="test-task-id")
@@ -88,6 +92,8 @@ class TestGarminWebhookTaskEnqueue:
         """The payload passed to send_task matches the incoming webhook body."""
         payload = {"hrv": [{"userId": "u1", "summaryId": "s1"}]}
         headers = {"garmin-client-id": "test-client-id"}
+        UserConnectionFactory(provider="garmin", provider_user_id="u1", status="active")
+        db.flush()
 
         with patch(f"{WEBHOOK_HANDLER}.celery_app") as mock_celery:
             mock_celery.send_task.return_value = MagicMock(id="task-xyz")

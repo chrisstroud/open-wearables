@@ -144,6 +144,12 @@ def create_celery() -> Celery:
             "args": (),
             "kwargs": {},
         },
+        "prune-sdk-upload-inbox-daily": {
+            "task": "app.integrations.celery.tasks.prune_sdk_upload_inbox_task.prune_sdk_upload_inbox",
+            "schedule": crontab(hour=2, minute=30),
+            "args": (),
+            "kwargs": {},
+        },
         "gc-stuck-garmin-backfills": {
             "task": "app.integrations.celery.tasks.garmin.gc_task.gc_stuck_backfills",
             "schedule": 180.0,  # Every 3 minutes

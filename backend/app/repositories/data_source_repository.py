@@ -8,10 +8,17 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from app.database import DbSession
 from app.models import DataSource, HealthScore, ProviderPriority
+from app.repositories.health_write_authority import (
+    HealthWriteAuthorityError,
+    require_health_write_authority,
+    require_user_connection_authority,
+)
 from app.repositories.provider_priority_repository import ProviderPriorityRepository
 from app.repositories.repositories import CrudRepository
 from app.schemas.enums import DeviceType, ProviderName, infer_device_type_from_model, infer_device_type_from_source_name
 from app.schemas.model_crud.data_priority import DataSourceCreate, DataSourceUpdate
+
+__all__ = ["DataSourceProvenanceConflictError", "DataSourceRepository", "HealthWriteAuthorityError"]
 
 
 class DataSourceProvenanceConflictError(RuntimeError):
@@ -23,6 +30,50 @@ class DataSourceRepository(
 ):
     def __init__(self, model: type[DataSource] = DataSource):
         super().__init__(model)
+
+    @staticmethod
+    def _require_health_write_authority(
+        db_session: DbSession,
+        *,
+        user_id: UUID,
+        provider: ProviderName,
+    ) -> None:
+        require_health_write_authority(db_session, user_id=user_id, provider=provider)
+
+    def create(self, db_session: DbSession, creator: DataSourceCreate) -> DataSource:
+        self._require_health_write_authority(db_session, user_id=creator.user_id, provider=creator.provider)
+        if creator.user_connection_id is not None:
+            require_user_connection_authority(
+                db_session,
+                connection_id=creator.user_connection_id,
+                expected_user_id=creator.user_id,
+                expected_provider=creator.provider,
+            )
+        created = super().create(db_session, creator)
+        assert created is not None
+        return created
+
+    def update(self, db_session: DbSession, originator: DataSource, updater: DataSourceUpdate) -> DataSource:
+        target_provider = updater.provider or originator.provider
+        self._require_health_write_authority(db_session, user_id=originator.user_id, provider=originator.provider)
+        if target_provider != originator.provider:
+            self._require_health_write_authority(db_session, user_id=originator.user_id, provider=target_provider)
+        if updater.user_connection_id is not None:
+            require_user_connection_authority(
+                db_session,
+                connection_id=updater.user_connection_id,
+                expected_user_id=originator.user_id,
+                expected_provider=target_provider,
+            )
+        return super().update(db_session, originator, updater)
+
+    def delete(self, db_session: DbSession, originator: DataSource) -> DataSource:
+        self._require_health_write_authority(db_session, user_id=originator.user_id, provider=originator.provider)
+        return super().delete(db_session, originator)
+
+    def delete_flush(self, db_session: DbSession, originator: DataSource) -> None:
+        self._require_health_write_authority(db_session, user_id=originator.user_id, provider=originator.provider)
+        super().delete_flush(db_session, originator)
 
     def _build_identity_filter(
         self,
@@ -131,6 +182,18 @@ class DataSourceRepository(
         source: str | None = None,
         original_source_name: str | None = None,
     ) -> DataSource:
+        self._require_health_write_authority(
+            db_session,
+            user_id=user_id,
+            provider=provider,
+        )
+        if user_connection_id is not None:
+            require_user_connection_authority(
+                db_session,
+                connection_id=user_connection_id,
+                expected_user_id=user_id,
+                expected_provider=provider,
+            )
         existing = self.get_by_identity(db_session, user_id, provider, device_model, source)
         if existing:
             updated = False
@@ -197,6 +260,20 @@ class DataSourceRepository(
     ) -> dict[tuple[UUID, str | None, str | None], UUID]:
         if not identities:
             return {}
+
+        for user_id, _, _ in identities:
+            self._require_health_write_authority(
+                db_session,
+                user_id=user_id,
+                provider=provider,
+            )
+            if user_connection_id is not None:
+                require_user_connection_authority(
+                    db_session,
+                    connection_id=user_connection_id,
+                    expected_user_id=user_id,
+                    expected_provider=provider,
+                )
 
         result: dict[tuple[UUID, str | None, str | None], UUID] = {}
         remaining_identities = set(identities)
@@ -304,6 +381,7 @@ class DataSourceRepository(
         event/sleep/workout/menstrual details and health_scores linked via data_source
         or event_record. Returns the number of data_source rows deleted.
         """
+        self._require_health_write_authority(db_session, user_id=user_id, provider=provider)
         db_session.execute(
             delete(HealthScore).where(
                 and_(HealthScore.user_id == user_id, HealthScore.provider == provider),

@@ -13,6 +13,9 @@ class SDKSyncWindowReceiptResponse(BaseModel):
 
     windowId: UUID
     userId: UUID
+    installationId: UUID | None = None
+    installationGeneration: int | None = None
+    healthEvidenceGeneration: int | None = None
     provider: str
     purpose: str
     windowVersion: int

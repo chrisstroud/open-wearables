@@ -36,12 +36,27 @@ import hashlib
 import hmac
 import logging
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any
 
 from fastapi import HTTPException, Request
+from sqlalchemy import or_
 
 from app.database import DbSession
+from app.models import User, UserConnection
+from app.services.provider_identity_authority import acquire_provider_identity_value_locks
 from app.utils.structured_logging import log_structured
+
+_MAX_WEBHOOK_IDENTITIES = 1_000
+_MAX_WEBHOOK_IDENTITY_LENGTH = 255
+
+
+@dataclass(frozen=True)
+class WebhookIngressAuthority:
+    """Provider identities whose current account authority is locked for dispatch."""
+
+    provider_user_ids: frozenset[str]
+    provider_usernames: frozenset[str]
 
 
 class BaseWebhookHandler(ABC):
@@ -80,6 +95,111 @@ class BaseWebhookHandler(ABC):
             return None
         value = payload.get(self.user_id_field)
         return str(value) if value is not None else None
+
+    @staticmethod
+    def _bounded_webhook_identities(values: set[str]) -> frozenset[str]:
+        """Normalize a bounded set of stable provider identities, dropping unsafe values."""
+        if len(values) > _MAX_WEBHOOK_IDENTITIES:
+            return frozenset()
+        normalized = {
+            value.strip() for value in values if value.strip() and len(value.strip()) <= _MAX_WEBHOOK_IDENTITY_LENGTH
+        }
+        return frozenset(normalized)
+
+    def authorize_webhook_ingress(
+        self,
+        db: DbSession,
+        *,
+        provider_user_ids: set[str] | None = None,
+        provider_usernames: set[str] | None = None,
+    ) -> WebhookIngressAuthority:
+        """Lock and authorize exact active legacy-provider identities before side effects.
+
+        The initial lookup discovers candidate account rows without taking locks. User
+        rows are then locked in deterministic order, followed by a fresh locked
+        connection lookup. This serializes raw storage and enqueueing with source reset:
+        once reset fences an account, a provider callback can only be acknowledged and
+        dropped. ``apple-mobile-v2-only`` remains closed to every cloud-provider ingress
+        even after the paired Apple installation makes the account active again.
+        """
+        requested_user_ids = self._bounded_webhook_identities(provider_user_ids or set())
+        requested_usernames = self._bounded_webhook_identities(provider_usernames or set())
+        if not requested_user_ids and not requested_usernames:
+            return WebhookIngressAuthority(frozenset(), frozenset())
+        acquire_provider_identity_value_locks(
+            db,
+            ((self.provider_name, identity) for identity in sorted(requested_user_ids.union(requested_usernames))),
+        )
+
+        identity_filters = []
+        if requested_user_ids:
+            identity_filters.append(UserConnection.provider_user_id.in_(requested_user_ids))
+        if requested_usernames:
+            identity_filters.append(UserConnection.provider_username.in_(requested_usernames))
+
+        candidate_user_ids = {
+            row[0]
+            for row in db.query(UserConnection.user_id)
+            .filter(
+                UserConnection.provider == self.provider_name,
+                UserConnection.status == "active",
+                or_(*identity_filters),
+            )
+            .distinct()
+            .all()
+        }
+        if not candidate_user_ids:
+            return WebhookIngressAuthority(frozenset(), frozenset())
+
+        locked_users = (
+            db.query(User)
+            .filter(User.id.in_(candidate_user_ids))
+            .order_by(User.id)
+            .populate_existing()
+            .with_for_update()
+            .all()
+        )
+        permitted_user_ids = {
+            user.id
+            for user in locked_users
+            if user.health_write_state == "active" and user.health_source_policy == "legacy-mixed"
+        }
+        if not permitted_user_ids:
+            return WebhookIngressAuthority(frozenset(), frozenset())
+
+        current_connections = (
+            db.query(UserConnection)
+            .filter(
+                UserConnection.user_id.in_(candidate_user_ids),
+                UserConnection.provider == self.provider_name,
+                UserConnection.status == "active",
+                or_(*identity_filters),
+            )
+            .order_by(UserConnection.id)
+            .populate_existing()
+            .with_for_update()
+            .all()
+        )
+
+        def authorized_values(attribute: str, requested: frozenset[str]) -> frozenset[str]:
+            owners_by_value: dict[str, set[Any]] = {}
+            for connection in current_connections:
+                raw_value = getattr(connection, attribute)
+                if raw_value is None:
+                    continue
+                value = str(raw_value)
+                if value in requested:
+                    owners_by_value.setdefault(value, set()).add(connection.user_id)
+            return frozenset(
+                value
+                for value, owner_ids in owners_by_value.items()
+                if bool(owner_ids) and owner_ids.issubset(permitted_user_ids)
+            )
+
+        return WebhookIngressAuthority(
+            provider_user_ids=authorized_values("provider_user_id", requested_user_ids),
+            provider_usernames=authorized_values("provider_username", requested_usernames),
+        )
 
     # ------------------------------------------------------------------
     # Abstract interface

@@ -8,10 +8,14 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.constants.series_types.sdk import SDKMetricType, SleepPhase, WorkoutStatisticType
 from app.constants.workout_types import SDKWorkoutType
+
+SourceText32 = Annotated[str, Field(max_length=32)]
+SourceText50 = Annotated[str, Field(max_length=50)]
+SourceText100 = Annotated[str, Field(max_length=100)]
 
 
 class DeviceType(StrEnum):
@@ -42,9 +46,9 @@ class OSVersion(BaseModel):
 
     model_config = ConfigDict(populate_by_name=True)
 
-    major_version: int = Field(alias="majorVersion")
-    minor_version: int = Field(alias="minorVersion")
-    patch_version: int = Field(alias="patchVersion")
+    major_version: int = Field(alias="majorVersion", ge=0, le=65535)
+    minor_version: int = Field(alias="minorVersion", ge=0, le=65535)
+    patch_version: int = Field(alias="patchVersion", ge=0, le=65535)
 
 
 class SourceInfo(BaseModel):
@@ -52,20 +56,52 @@ class SourceInfo(BaseModel):
 
     model_config = ConfigDict(populate_by_name=True)
 
-    app_id: str | None = Field(default=None, alias="appId")
-    name: str | None = None
-    bundle_identifier: str | None = Field(default=None, alias="bundleIdentifier")
-    version: str | None = None
-    product_type: str | None = Field(default=None, alias="productType")
+    app_id: SourceText100 | None = Field(default=None, alias="appId")
+    name: SourceText100 | None = None
+    bundle_identifier: SourceText100 | None = Field(default=None, alias="bundleIdentifier")
+    version: SourceText50 | None = None
+    product_type: SourceText100 | None = Field(default=None, alias="productType")
     operating_system_version: OSVersion | None = Field(default=None, alias="operatingSystemVersion")
-    device_id: str | None = Field(default=None, alias="deviceId")
-    device_name: str | None = Field(default=None, alias="deviceName")
-    device_manufacturer: str | None = Field(default=None, alias="deviceManufacturer")
-    device_type: DeviceType | str | None = Field(default=None, alias="deviceType")
-    device_model: str | None = Field(default=None, alias="deviceModel")
-    device_hardware_version: str | None = Field(default=None, alias="deviceHardwareVersion")
-    device_software_version: str | None = Field(default=None, alias="deviceSoftwareVersion")
-    recording_method: RecordingMethod | str | None = Field(default=None, alias="recordingMethod")
+    device_id: SourceText100 | None = Field(default=None, alias="deviceId")
+    device_name: SourceText100 | None = Field(default=None, alias="deviceName")
+    device_manufacturer: SourceText100 | None = Field(default=None, alias="deviceManufacturer")
+    device_type: DeviceType | SourceText32 | None = Field(default=None, alias="deviceType")
+    device_model: SourceText100 | None = Field(default=None, alias="deviceModel")
+    device_hardware_version: SourceText50 | None = Field(default=None, alias="deviceHardwareVersion")
+    device_software_version: SourceText50 | None = Field(default=None, alias="deviceSoftwareVersion")
+    recording_method: RecordingMethod | SourceText32 | None = Field(default=None, alias="recordingMethod")
+
+    @field_validator(
+        "app_id",
+        "name",
+        "bundle_identifier",
+        "product_type",
+        "device_id",
+        "device_name",
+        "device_manufacturer",
+        "device_model",
+        mode="before",
+    )
+    @classmethod
+    def bound_source_text_100(cls, value: Any) -> Any:
+        # Source labels are non-essential metadata. Bound them instead of
+        # rejecting an otherwise durable health batch from a noisy writer.
+        return value[:100] if isinstance(value, str) else value
+
+    @field_validator(
+        "version",
+        "device_hardware_version",
+        "device_software_version",
+        mode="before",
+    )
+    @classmethod
+    def bound_source_text_50(cls, value: Any) -> Any:
+        return value[:50] if isinstance(value, str) else value
+
+    @field_validator("device_type", "recording_method", mode="before")
+    @classmethod
+    def bound_source_text_32(cls, value: Any) -> Any:
+        return value[:32] if isinstance(value, str) else value
 
 
 class MetricRecord(BaseModel):
@@ -86,7 +122,7 @@ class MetricRecord(BaseModel):
 class SleepRecord(BaseModel):
     """Sleep analysis record from HealthKit."""
 
-    id: str | None = None
+    id: str | None = Field(default=None, max_length=100)
     parentId: str | None = None
     stage: SleepPhase | str
     startDate: datetime
@@ -108,7 +144,7 @@ class WorkoutStatistic(BaseModel):
 class Workout(BaseModel):
     """Schema for workout/exercise session from HealthKit."""
 
-    id: str | None = None
+    id: str | None = Field(default=None, max_length=100)
     parentId: str | None = None
     type: SDKWorkoutType | str | None = None
     startDate: datetime
@@ -149,8 +185,11 @@ class SyncWindowManifest(BaseModel):
     windowVersion: Literal[2]
     lowerBoundInclusive: datetime
     upperBoundExclusive: datetime
-    batchIds: list[UUID] = Field(default_factory=list)
-    emptyOrNoAccessTypes: list[Annotated[str, Field(min_length=1, max_length=255)]] = Field(default_factory=list)
+    batchIds: list[UUID] = Field(default_factory=list, max_length=4096)
+    emptyOrNoAccessTypes: list[Annotated[str, Field(min_length=1, max_length=255)]] = Field(
+        default_factory=list,
+        max_length=256,
+    )
     reconciliationStartInclusive: datetime | None = None
     reconciliationEndExclusive: datetime | None = None
 

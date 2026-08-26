@@ -5,12 +5,47 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.orm import Session
 
+from app.models import SDKUploadInbox
+from app.schemas.model_crud.credentials.sdk_client_installation import SDKClientRegistration
 from app.schemas.responses.upload import SDKBatchReceiptStatus
 from app.services.sdk_batch_receipt_service import BatchReceiptConflictError, SDKBatchReceiptService
+from app.services.sdk_client_installation_service import sdk_client_installation_service
+from app.services.sdk_upload_inbox_service import sdk_upload_inbox_service
 from tests.factories import UserFactory
 
 
 class TestSDKBatchReceiptService:
+    def test_success_metadata_fails_closed_when_type_provenance_exceeds_bound(self, db: Session) -> None:
+        user = UserFactory()
+        service = SDKBatchReceiptService()
+        batch_id = uuid4()
+        service.prepare_submission(
+            db,
+            batch_id=batch_id,
+            user_id=user.id,
+            provider="apple",
+            payload_sha256=sha256(b"bounded-provenance").hexdigest(),
+        )
+        claim = service.claim_for_processing(db, batch_id)
+        assert claim.attempt_count is not None
+
+        service.mark_succeeded(
+            db,
+            batch_id=batch_id,
+            attempt_count=claim.attempt_count,
+            result={
+                "status_code": 200,
+                "covered_type_identifiers": [f"HKQuantityTypeIdentifierSynthetic{index}" for index in range(257)],
+                "content_lower_bound_inclusive": "2026-08-24T00:00:00+00:00",
+                "content_upper_bound_exclusive": "2026-08-25T00:00:00+00:00",
+            },
+        )
+
+        receipt = service.crud.get(db, batch_id)
+        assert receipt is not None
+        assert receipt.status == SDKBatchReceiptStatus.SUCCEEDED
+        assert receipt.covered_type_identifiers == []
+
     def test_queued_is_not_terminal_and_zero_drop_success_is_terminal(self, db: Session) -> None:
         user = UserFactory()
         service = SDKBatchReceiptService()
@@ -217,3 +252,67 @@ class TestSDKBatchReceiptService:
         assert terminal is not None
         assert terminal.status == SDKBatchReceiptStatus.FAILED
         assert terminal.error_code == "newer_attempt_failed"
+
+    def test_success_publication_rechecks_exact_installation_generation(self, db: Session) -> None:
+        user = UserFactory()
+        service = SDKBatchReceiptService()
+        registration = SDKClientRegistration(
+            installation_id=uuid4(),
+            bundle_id="fitness.dashboard.app",
+            app_version="1.0.0",
+            build_number="1",
+            protocol_version=2,
+        )
+        installation = sdk_client_installation_service.activate(
+            db,
+            user_id=user.id,
+            registration=registration,
+        )
+        generation = installation.generation
+        batch_id = uuid4()
+        digest = sha256(b"payload").hexdigest()
+        service.prepare_submission(
+            db,
+            batch_id=batch_id,
+            user_id=user.id,
+            installation_id=installation.id,
+            installation_generation=generation,
+            health_evidence_generation=0,
+            provider="apple",
+            payload_sha256=digest,
+        )
+        sdk_upload_inbox_service.put(
+            db,
+            batch_id=batch_id,
+            user_id=user.id,
+            installation_id=installation.id,
+            installation_generation=generation,
+            health_evidence_generation=0,
+            provider="apple",
+            payload_sha256=digest,
+            content_type="application/json",
+            content="payload",
+        )
+        claim = service.claim_for_processing(db, batch_id)
+        assert claim.attempt_count is not None
+
+        repaired = sdk_client_installation_service.activate(
+            db,
+            user_id=user.id,
+            registration=registration,
+        )
+        assert repaired.generation == generation + 1
+        db.commit()
+
+        service.mark_succeeded(
+            db,
+            batch_id=batch_id,
+            attempt_count=claim.attempt_count,
+            result={"status_code": 200, "records_saved": 1},
+        )
+
+        receipt = service.crud.get(db, batch_id)
+        assert receipt is not None
+        assert receipt.status == SDKBatchReceiptStatus.FAILED
+        assert receipt.error_code == "installation_generation_mismatch"
+        assert db.query(SDKUploadInbox).filter_by(id=batch_id).one_or_none() is not None

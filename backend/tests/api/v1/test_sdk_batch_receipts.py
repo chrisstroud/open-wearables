@@ -1,3 +1,4 @@
+import json
 from collections.abc import Generator
 from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
@@ -6,6 +7,7 @@ import pytest
 from sqlalchemy.orm import Session
 from starlette.testclient import TestClient
 
+from app.config import settings
 from app.models import SDKBatchReceipt
 from app.schemas.providers.mobile_sdk import SyncWindowManifest
 from app.services.sdk_batch_receipt_service import sdk_batch_receipt_service
@@ -64,7 +66,14 @@ def succeed_batch(db: Session, *, batch_id: UUID, user_id: UUID, payload_digest:
         db,
         batch_id=batch_id,
         attempt_count=claim.attempt_count,
-        result={"status_code": 200, "records_saved": 1, "dropped_count": 0},
+        result={
+            "status_code": 200,
+            "records_saved": 1,
+            "dropped_count": 0,
+            "covered_type_identifiers": ["HKQuantityTypeIdentifierStepCount"],
+            "content_lower_bound_inclusive": "2026-08-24T10:00:00+00:00",
+            "content_upper_bound_exclusive": "2026-08-24T10:01:00+00:00",
+        },
     )
 
 
@@ -89,6 +98,30 @@ def window_payload(window_id: UUID, batch_ids: list[UUID]) -> dict:
 
 
 class TestSDKBatchReceiptRoutes:
+    def test_wire_body_limit_rejects_oversized_json_before_canonicalization(
+        self,
+        client: TestClient,
+        db: Session,
+        api_v1_prefix: str,
+        mock_sdk_worker: MagicMock,
+    ) -> None:
+        user = UserFactory()
+        batch_id = uuid4()
+        canonical = json.dumps(payload(), separators=(",", ":"), sort_keys=True).encode()
+        wire_body = canonical + (b" " * 256)
+
+        with patch.object(settings, "sdk_upload_max_size_bytes", len(canonical) + 1):
+            response = client.post(
+                f"{api_v1_prefix}/sdk/users/{user.id}/sync",
+                headers={**auth_headers(user.id, batch_id), "Content-Type": "application/json"},
+                content=wire_body,
+            )
+
+        assert response.status_code == 413
+        assert response.json()["detail"] == {"error_code": "sdk_upload_too_large", "retryable": False}
+        mock_sdk_worker.delay.assert_not_called()
+        assert db.get(SDKBatchReceipt, batch_id) is None
+
     def test_headerless_legacy_client_gets_retryable_non_2xx_without_dispatch_or_receipt(
         self,
         client: TestClient,

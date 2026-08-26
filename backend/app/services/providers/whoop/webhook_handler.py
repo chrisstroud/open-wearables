@@ -134,6 +134,21 @@ class WhoopWebhookHandler(BaseWebhookHandler):
         request_trace_id = str(uuid4())[:8]
         event_type = payload.get("type", "unknown")
         whoop_user_id = payload.get("user_id", "unknown")
+        authority = self.authorize_webhook_ingress(
+            db,
+            provider_user_ids={str(whoop_user_id)},
+        )
+        if str(whoop_user_id) not in authority.provider_user_ids:
+            log_structured(
+                logger,
+                "info",
+                "Acknowledged Whoop webhook without dispatch",
+                provider="whoop",
+                trace_id=request_trace_id,
+                event_type=event_type,
+                action="webhook_ingress_fenced",
+            )
+            return {"status": "accepted"}
 
         log_structured(
             logger,

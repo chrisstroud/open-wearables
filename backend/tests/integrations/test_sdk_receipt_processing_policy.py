@@ -1,5 +1,7 @@
 import json
 import logging
+from datetime import timezone
+from hashlib import sha256
 from typing import Any
 from unittest.mock import patch
 from uuid import UUID
@@ -9,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.models import DataPointSeries, EventRecord, SDKSleepInbox
 from app.services.apple.healthkit.import_service import ImportService
+from app.services.sdk_batch_receipt_service import SDKBatchReceiptService
 from app.services.sdk_sleep_inbox_service import sdk_sleep_inbox_service
 from tests.factories import UserFactory
 
@@ -35,6 +38,19 @@ def metric_record(external_id: str) -> dict[str, Any]:
         "endDate": "2026-08-24T10:01:00Z",
         "source": {"name": "iPhone", "bundleIdentifier": "com.apple.health"},
     }
+
+
+def claim_terminal_receipt(db: Session, *, batch_id: UUID, user_id: UUID) -> None:
+    service = SDKBatchReceiptService()
+    service.prepare_submission(
+        db,
+        batch_id=batch_id,
+        user_id=user_id,
+        provider="apple",
+        payload_sha256=sha256(b"direct-test-payload").hexdigest(),
+    )
+    claim = service.claim_for_processing(db, batch_id)
+    assert claim.attempt_count is not None
 
 
 def test_envelope_validation_never_logs_or_captures_health_input_value(
@@ -195,6 +211,8 @@ def test_terminal_receipt_durably_stages_supported_sleep(
         "schedule_projection",
         lambda **kwargs: scheduled.append(kwargs),
     )
+    batch_id = UUID("99999999-9999-9999-9999-999999999999")
+    claim_terminal_receipt(db, batch_id=batch_id, user_id=user.id)
     response = import_service.import_data_from_request(
         db,
         json.dumps(
@@ -214,7 +232,7 @@ def test_terminal_receipt_durably_stages_supported_sleep(
         ),
         "application/json",
         str(user.id),
-        batch_id="99999999-9999-9999-9999-999999999999",
+        batch_id=str(batch_id),
         require_terminal_receipt=True,
     )
 
@@ -226,7 +244,9 @@ def test_terminal_receipt_durably_stages_supported_sleep(
     assert inbox.batch_ids == [UUID("99999999-9999-9999-9999-999999999999")]
     assert inbox.payload["stage"] == "light"
     assert db.query(EventRecord).filter(EventRecord.external_id == sleep_id).count() == 0
-    assert scheduled == [{"user_id": user.id, "provider": "apple"}]
+    # Receipt-backed workers schedule only after the enclosing normalized-write
+    # transaction commits, so this direct service call must not publish early.
+    assert scheduled == []
 
 
 @pytest.mark.parametrize(
@@ -250,12 +270,14 @@ def test_sleep_without_durable_projection_identity_is_quarantined(
         "endDate": "2026-08-24T23:00:00Z",
         **record_patch,
     }
+    batch_id = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+    claim_terminal_receipt(db, batch_id=batch_id, user_id=user.id)
     response = import_service.import_data_from_request(
         db,
         json.dumps({**ENVELOPE, "data": {"sleep": [sleep]}}),
         "application/json",
         str(user.id),
-        batch_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        batch_id=str(batch_id),
         require_terminal_receipt=True,
     )
 
@@ -364,7 +386,7 @@ def test_exact_uuid_replay_and_later_correction_update_one_retained_sample(
     assert replay.records_saved == corrected.records_saved == 1
     assert retained.id == stored_id
     assert retained.value == 84
-    assert retained.recorded_at.isoformat().startswith("2026-08-24T10:02:00")
+    assert retained.recorded_at.astimezone(timezone.utc).isoformat().startswith("2026-08-24T10:02:00")
 
 
 def test_contradictory_same_uuid_payloads_in_one_batch_fail_closed(

@@ -28,7 +28,7 @@ def refresh_token(
     Raises:
         401: If the refresh token is invalid or revoked
     """
-    return refresh_token_service.refresh_token(db, payload.refresh_token)
+    return refresh_token_service.refresh_token(db, payload.refresh_token, client=payload.client)
 
 
 @router.post("/token/revoke", status_code=status.HTTP_204_NO_CONTENT)
