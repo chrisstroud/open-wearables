@@ -1,3 +1,5 @@
+from .sdk_batch_receipt import SDKBatchReceiptResponse, SDKBatchReceiptStatus
+from .sdk_sync_window_receipt import SDKSyncWindowReceiptResponse
 from .sync_results import (
     ProviderSyncResult,
     SyncAllUsersResult,
@@ -22,6 +24,9 @@ __all__ = [
     "ProviderSyncResult",
     # Upload response
     "UploadDataResponse",
+    "SDKBatchReceiptResponse",
+    "SDKBatchReceiptStatus",
+    "SDKSyncWindowReceiptResponse",
     # System info
     "ConnectionsCoverage",
     "DataPointsInfo",

@@ -10,6 +10,9 @@ from .invitation_repository import InvitationRepository
 from .provider_priority_repository import ProviderPriorityRepository
 from .refresh_token_repository import RefreshTokenRepository, refresh_token_repository
 from .repositories import CrudRepository
+from .sdk_batch_receipt_repository import SDKBatchReceiptRepository
+from .sdk_sleep_inbox_repository import SDKSleepInboxRepository
+from .sdk_sync_window_receipt_repository import SDKSyncWindowReceiptRepository
 from .user_connection_repository import UserConnectionRepository
 from .user_repository import UserRepository
 
@@ -24,6 +27,9 @@ __all__ = [
     "DataSourceRepository",
     "ProviderPriorityRepository",
     "RefreshTokenRepository",
+    "SDKBatchReceiptRepository",
+    "SDKSleepInboxRepository",
+    "SDKSyncWindowReceiptRepository",
     "refresh_token_repository",
     "UserConnectionRepository",
     "DeveloperRepository",

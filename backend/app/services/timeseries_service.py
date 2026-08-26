@@ -194,12 +194,14 @@ class TimeSeriesService(
             if data_source:
                 source = SourceMetadata(
                     provider=data_source.provider or "unknown",
-                    source=data_source.source,
+                    source=data_source.original_source_name or data_source.source,
+                    source_identifier=data_source.source,
                     device=data_source.device_model,
                     device_type=data_source.device_type,
                 )
 
             item = TimeSeriesSample(
+                external_id=sample.external_id,
                 timestamp=sample.recorded_at,
                 zone_offset=sample.zone_offset,
                 type=series_type,

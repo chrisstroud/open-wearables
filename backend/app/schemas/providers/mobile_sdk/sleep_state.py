@@ -10,6 +10,10 @@ class SleepStateStage(BaseModel):
     stage: SleepStageType
     start_time: datetime
     end_time: datetime
+    # Kept only in the transient Redis projection state so the durable inbox
+    # worker can prove which exact source payloads reached a committed sleep
+    # record. Older serialized states omit this field and remain valid.
+    source_id: str | None = None
 
 
 class SleepState(BaseModel):

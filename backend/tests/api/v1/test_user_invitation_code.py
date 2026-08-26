@@ -12,6 +12,15 @@ from app.models.user_invitation_code import UserInvitationCode
 from tests.factories import DeveloperFactory, UserFactory
 from tests.utils import developer_auth_headers
 
+ACTIVATION_POLICY = {
+    "purpose": "activation",
+    "window_version": 2,
+    "lower_bound_inclusive": "2026-07-26T04:00:00Z",
+    "upper_bound_exclusive": "2026-08-25T04:00:00Z",
+    "timezone": "America/Toronto",
+    "completed_day_count": 30,
+}
+
 
 class TestGenerateInvitationCode:
     """Tests for POST /api/v1/users/{user_id}/invitation-code"""
@@ -32,6 +41,47 @@ class TestGenerateInvitationCode:
         assert data["user_id"] == str(user.id)
         assert "expires_at" in data
         assert "id" in data
+        assert data["activation_policy"] is None
+
+    def test_generate_binds_activation_policy(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
+        developer = DeveloperFactory()
+        user = UserFactory()
+        headers = developer_auth_headers(developer.id)
+
+        response = client.post(
+            f"{api_v1_prefix}/users/{user.id}/invitation-code",
+            headers=headers,
+            json={"activation_policy": ACTIVATION_POLICY},
+        )
+
+        assert response.status_code == 201
+        assert response.json()["activation_policy"] == ACTIVATION_POLICY
+        stored = db.query(UserInvitationCode).filter(UserInvitationCode.id == response.json()["id"]).one()
+        assert stored.activation_policy == ACTIVATION_POLICY
+
+    def test_generate_rejects_malformed_activation_policy(
+        self,
+        client: TestClient,
+        db: Session,
+        api_v1_prefix: str,
+    ) -> None:
+        developer = DeveloperFactory()
+        user = UserFactory()
+        headers = developer_auth_headers(developer.id)
+
+        response = client.post(
+            f"{api_v1_prefix}/users/{user.id}/invitation-code",
+            headers=headers,
+            json={
+                "activation_policy": {
+                    **ACTIVATION_POLICY,
+                    "upper_bound_exclusive": "2026-08-25T00:00:00Z",
+                },
+            },
+        )
+
+        assert response.status_code in {400, 422}
+        assert db.query(UserInvitationCode).filter(UserInvitationCode.user_id == user.id).count() == 0
 
     def test_generate_requires_auth(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
         # Arrange
@@ -98,13 +148,41 @@ class TestRedeemInvitationCode:
         assert data["token_type"] == "bearer"
         assert data["expires_in"] == settings.access_token_expire_minutes * 60
         assert data["refresh_token"].startswith("rt-")
+        assert data["activation_policy"] is None
+
+    def test_redeem_returns_exact_bound_activation_policy(
+        self,
+        client: TestClient,
+        db: Session,
+        api_v1_prefix: str,
+    ) -> None:
+        developer = DeveloperFactory()
+        user = UserFactory()
+        headers = developer_auth_headers(developer.id)
+        generated = client.post(
+            f"{api_v1_prefix}/users/{user.id}/invitation-code",
+            headers=headers,
+            json={"activation_policy": ACTIVATION_POLICY},
+        )
+
+        response = client.post(
+            f"{api_v1_prefix}/invitation-code/redeem",
+            json={"code": generated.json()["code"]},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["activation_policy"] == ACTIVATION_POLICY
 
     def test_redeem_returns_sdk_token(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
         # Arrange
         developer = DeveloperFactory()
         user = UserFactory()
         headers = developer_auth_headers(developer.id)
-        gen_response = client.post(f"{api_v1_prefix}/users/{user.id}/invitation-code", headers=headers)
+        gen_response = client.post(
+            f"{api_v1_prefix}/users/{user.id}/invitation-code",
+            headers=headers,
+            json={"activation_policy": ACTIVATION_POLICY},
+        )
         code = gen_response.json()["code"]
 
         # Act
@@ -122,7 +200,11 @@ class TestRedeemInvitationCode:
         developer = DeveloperFactory()
         user = UserFactory()
         headers = developer_auth_headers(developer.id)
-        gen_response = client.post(f"{api_v1_prefix}/users/{user.id}/invitation-code", headers=headers)
+        gen_response = client.post(
+            f"{api_v1_prefix}/users/{user.id}/invitation-code",
+            headers=headers,
+            json={"activation_policy": ACTIVATION_POLICY},
+        )
         code = gen_response.json()["code"]
 
         # Act
@@ -131,6 +213,7 @@ class TestRedeemInvitationCode:
 
         # Assert
         assert first_redeem.status_code == 200
+        assert first_redeem.json()["activation_policy"] == ACTIVATION_POLICY
         assert second_redeem.status_code == 404
 
     def test_redeem_invalid_code(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:

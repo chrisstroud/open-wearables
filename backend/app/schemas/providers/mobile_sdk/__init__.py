@@ -10,11 +10,13 @@ from .sleep_state import (
     SleepStateStage,
 )
 from .sync_request import (
+    DeletedObject,
     OSVersion,
     SleepRecord,
     SourceInfo,
     SyncRequest,
     SyncRequestData,
+    SyncWindowManifest,
     WorkoutStatistic,
 )
 
@@ -31,6 +33,8 @@ __all__ = [
     # SyncRequest
     "SyncRequest",
     "SyncRequestData",
+    "SyncWindowManifest",
+    "DeletedObject",
     "SleepRecord",
     "WorkoutStatistic",
     "SourceInfo",

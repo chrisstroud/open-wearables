@@ -14,6 +14,12 @@ class SourceMetadata(BaseModel):
     # itself for native API integrations.
     provider: str = Field(..., example="apple")
     source: str | None = Field(None, example="Connect")
+    source_identifier: str | None = Field(
+        None,
+        max_length=100,
+        description="Originating app ID or bundle identifier when supplied by the device API.",
+        example="com.dexcom.stelo",
+    )
     device: str | None = Field(None, example="iPhone15,2")
     device_type: DeviceType | None = Field(None, example="phone")
 

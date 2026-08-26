@@ -123,7 +123,9 @@ Raw payloads storage is currently enabled at two ingestion points:
 | Endpoint | Source | Provider | Trace ID |
 |----------|--------|----------|----------|
 | `POST /api/v1/garmin/push` | `webhook` | `garmin` | 8-char request trace ID |
-| `POST /api/v1/sdk/users/{user_id}/sync` | `sdk` | `apple`, `samsung`, `google` | UUID4 batch ID |
+| `POST /api/v1/sdk/users/{user_id}/sync` | `sdk` | `apple`, `samsung`, `google` | Required client `X-Open-Wearables-Batch-ID` UUID |
+
+Headerless SDK uploads receive retryable HTTP `425` before payload storage or worker dispatch. This prevents legacy clients that mistake any `2xx` for delivery from losing their local checkpoint during a backend-first rollout.
 
 ## Error Handling
 
