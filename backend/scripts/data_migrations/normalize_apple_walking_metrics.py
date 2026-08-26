@@ -49,20 +49,6 @@ def _count_query(value_filter: str) -> TextClause:
     """)  # noqa: S608
 
 
-def _sample_query(value_filter: str) -> TextClause:
-    return text(f"""
-        SELECT dps.id, dps.value, dps.value * 100 AS corrected, ds.provider, dps.recorded_at
-        FROM data_point_series dps
-        JOIN series_type_definition std ON std.id = dps.series_type_definition_id
-        JOIN data_source ds ON ds.id = dps.data_source_id
-        WHERE std.code = :code
-          AND ds.provider = 'apple'
-          AND {value_filter}
-        ORDER BY dps.recorded_at DESC
-        LIMIT 10
-    """)  # noqa: S608
-
-
 def _update_query(value_filter: str) -> TextClause:
     return text(f"""
         UPDATE data_point_series dps
@@ -88,16 +74,6 @@ def main(dry_run: bool) -> None:
 
             any_affected = True
             print(f"\n{code} ({description}): {count} row(s) to fix")
-
-            rows = db.execute(_sample_query(value_filter), {"code": code}).fetchall()
-            print(f"  {'ID':<38} {'Provider':<12} {'Current':>10} {'Corrected':>10}  Recorded at")
-            print("  " + "-" * 90)
-            for row in rows:
-                print(
-                    f"  {row.id!s:<38} {row.provider:<12} {row.value:>10.4f} {row.corrected:>10.4f}  {row.recorded_at}"
-                )
-            if count > 10:
-                print(f"  ... and {count - 10} more")
 
             if not dry_run:
                 result = db.execute(_update_query(value_filter), {"code": code})
