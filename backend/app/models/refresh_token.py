@@ -22,6 +22,7 @@ class RefreshToken(BaseDbModel):
     # For SDK tokens
     user_id: Mapped[Indexed[FKUser] | None]
     app_id: Mapped[str_64 | None]
+    health_evidence_generation: Mapped[int | None]
 
     # For Developer tokens
     developer_id: Mapped[Indexed[FKDeveloper] | None]

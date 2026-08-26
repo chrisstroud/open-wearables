@@ -9,8 +9,13 @@ from sqlalchemy import Date, case, cast, func, text
 from sqlalchemy.dialects.postgresql import insert
 
 from app.database import DbSession
-from app.models import DataPointSeries, DataPointSeriesArchive, DataSource
+from app.models import DataPointSeries, DataPointSeriesArchive, DataSource, User
 from app.models.archival_setting import ArchivalSetting
+from app.repositories.health_write_authority import (
+    HealthWriteAuthorityError,
+    acquire_health_maintenance_authority,
+    clear_health_maintenance_authority,
+)
 from app.schemas.enums import (
     AGGREGATION_METHOD_BY_TYPE,
     AggregationMethod,
@@ -53,6 +58,37 @@ MAX_SECONDS_PER_RUN = 120  # Stop after this many seconds per invocation
 
 class DataPointSeriesArchiveRepository:
     """Handles aggregation, insertion, and deletion for the archive table."""
+
+    @staticmethod
+    def _next_live_user(db: DbSession, cutoff_date: date) -> UUID | None:
+        return (
+            db.query(DataSource.user_id)
+            .join(User, User.id == DataSource.user_id)
+            .join(DataPointSeries, DataPointSeries.data_source_id == DataSource.id)
+            .filter(
+                User.health_write_state.in_(("active", "activating")),
+                cast(DataPointSeries.recorded_at, Date) < cutoff_date,
+            )
+            .order_by(DataSource.user_id)
+            .limit(1)
+            .scalar()
+        )
+
+    @staticmethod
+    def _next_archive_user(db: DbSession, cutoff_date: date) -> UUID | None:
+        cutoff = datetime.combine(cutoff_date, datetime.min.time(), tzinfo=timezone.utc)
+        return (
+            db.query(DataSource.user_id)
+            .join(User, User.id == DataSource.user_id)
+            .join(DataPointSeriesArchive, DataPointSeriesArchive.data_source_id == DataSource.id)
+            .filter(
+                User.health_write_state.in_(("active", "activating")),
+                DataPointSeriesArchive.bucket_start_at < cutoff,
+            )
+            .order_by(DataSource.user_id)
+            .limit(1)
+            .scalar()
+        )
 
     def get_storage_estimate(self, db: DbSession) -> dict:
         """Get storage sizes for ALL user tables from pg_catalog.
@@ -159,17 +195,32 @@ class DataPointSeriesArchiveRepository:
             if elapsed >= MAX_SECONDS_PER_RUN:
                 break
 
-            # Step 1: Find data_source_ids with archivable data (batch by source)
+            user_id = self._next_live_user(db, cutoff_date)
+            if user_id is None:
+                break
+            try:
+                acquire_health_maintenance_authority(db, user_id=user_id)
+            except HealthWriteAuthorityError:
+                db.rollback()
+                clear_health_maintenance_authority(db)
+                continue
+
+            # Step 1: Find data_source_ids with archivable data for one
+            # generation-locked account (batch by source).
             source_ids = (
                 db.query(DataPointSeries.data_source_id)
+                .join(DataSource, DataPointSeries.data_source_id == DataSource.id)
                 .filter(cast(DataPointSeries.recorded_at, Date) < cutoff_date)
+                .filter(DataSource.user_id == user_id)
                 .distinct()
                 .limit(10)
                 .all()
             )
 
             if not source_ids:
-                break
+                db.rollback()
+                clear_health_maintenance_authority(db)
+                continue
 
             source_id_list = [s[0] for s in source_ids]
 
@@ -207,7 +258,9 @@ class DataPointSeriesArchiveRepository:
             )
 
             if not raw_aggregates:
-                break
+                db.rollback()
+                clear_health_maintenance_authority(db)
+                continue
 
             # Step 3: For each group, pick the correct aggregate column based on series type
             values_list = []
@@ -244,7 +297,9 @@ class DataPointSeriesArchiveRepository:
             if not values_list:
                 # All series types in this batch were unknown — skip without
                 # deleting to avoid data loss.
-                continue
+                db.rollback()
+                clear_health_maintenance_authority(db)
+                break
 
             # Step 4: Upsert into archive
             for i in range(0, len(values_list), ARCHIVE_BATCH_SIZE):
@@ -271,6 +326,7 @@ class DataPointSeriesArchiveRepository:
             total_deleted += deleted_count
 
             db.commit()
+            clear_health_maintenance_authority(db)
 
         return total_deleted
 
@@ -279,16 +335,43 @@ class DataPointSeriesArchiveRepository:
 
         Returns the number of rows deleted.
         """
-        deleted = (
-            db.query(DataPointSeriesArchive)
-            .filter(
-                DataPointSeriesArchive.bucket_start_at
-                < datetime.combine(cutoff_date, datetime.min.time(), tzinfo=timezone.utc)
+        total_deleted = 0
+        start_time = time.monotonic()
+        cutoff = datetime.combine(cutoff_date, datetime.min.time(), tzinfo=timezone.utc)
+        while total_deleted < MAX_ROWS_PER_RUN and time.monotonic() - start_time < MAX_SECONDS_PER_RUN:
+            user_id = self._next_archive_user(db, cutoff_date)
+            if user_id is None:
+                break
+            try:
+                acquire_health_maintenance_authority(db, user_id=user_id)
+            except HealthWriteAuthorityError:
+                db.rollback()
+                clear_health_maintenance_authority(db)
+                continue
+
+            ids_to_delete = (
+                db.query(DataPointSeriesArchive.id)
+                .join(DataSource, DataPointSeriesArchive.data_source_id == DataSource.id)
+                .filter(
+                    DataSource.user_id == user_id,
+                    DataPointSeriesArchive.bucket_start_at < cutoff,
+                )
+                .limit(min(ARCHIVE_BATCH_SIZE, MAX_ROWS_PER_RUN - total_deleted))
+                .subquery()
             )
-            .delete(synchronize_session=False)
-        )
-        db.commit()
-        return deleted
+            deleted = (
+                db.query(DataPointSeriesArchive)
+                .filter(DataPointSeriesArchive.id.in_(ids_to_delete))  # ty:ignore[invalid-argument-type]
+                .delete(synchronize_session=False)
+            )
+            if deleted == 0:
+                db.rollback()
+                clear_health_maintenance_authority(db)
+                continue
+            total_deleted += deleted
+            db.commit()
+            clear_health_maintenance_authority(db)
+        return total_deleted
 
     def delete_live_before(self, db: DbSession, cutoff_date: date) -> int:
         """Permanently delete live rows older than *cutoff_date*.
@@ -312,10 +395,24 @@ class DataPointSeriesArchiveRepository:
             if total_deleted >= MAX_ROWS_PER_RUN or elapsed >= MAX_SECONDS_PER_RUN:
                 break
 
+            user_id = self._next_live_user(db, cutoff_date)
+            if user_id is None:
+                break
+            try:
+                acquire_health_maintenance_authority(db, user_id=user_id)
+            except HealthWriteAuthorityError:
+                db.rollback()
+                clear_health_maintenance_authority(db)
+                continue
+
             ids_to_delete = (
                 db.query(DataPointSeries.id)
-                .filter(cast(DataPointSeries.recorded_at, Date) < cutoff_date)
-                .limit(ARCHIVE_BATCH_SIZE)
+                .join(DataSource, DataPointSeries.data_source_id == DataSource.id)
+                .filter(
+                    DataSource.user_id == user_id,
+                    cast(DataPointSeries.recorded_at, Date) < cutoff_date,
+                )
+                .limit(min(ARCHIVE_BATCH_SIZE, MAX_ROWS_PER_RUN - total_deleted))
                 .subquery()
             )
             deleted = (
@@ -325,10 +422,13 @@ class DataPointSeriesArchiveRepository:
             )
 
             if deleted == 0:
-                break
+                db.rollback()
+                clear_health_maintenance_authority(db)
+                continue
 
             total_deleted += deleted
             db.commit()
+            clear_health_maintenance_authority(db)
 
         return total_deleted
 

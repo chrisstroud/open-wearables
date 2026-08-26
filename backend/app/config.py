@@ -5,12 +5,21 @@ from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 if TYPE_CHECKING:
     from app.schemas.enums import ProviderName
 
-from pydantic import AnyHttpUrl, Field, SecretStr, ValidationInfo, field_validator, model_validator
+from pydantic import (
+    AnyHttpUrl,
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.schemas.enums.data_granularity import DataGranularity
@@ -21,6 +30,55 @@ from app.utils.config_utils import (
     FernetDecryptorField,
     parse_duration,
 )
+
+
+class SourceResetS3Target(BaseModel):
+    """One explicitly retained S3 location that a protected reset must scan."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    bucket: str = Field(min_length=1, max_length=255)
+    endpoint_url: str | None = Field(default=None, max_length=2048)
+    raw_prefix: str | None = Field(default="raw-payloads", max_length=1024)
+    fit_prefix: str | None = Field(default="fit-files", max_length=1024)
+    # An empty string means Apple XML objects were stored at ``{user_id}/``.
+    apple_xml_prefix: str | None = Field(default=None, max_length=1024)
+
+    @field_validator("bucket")
+    @classmethod
+    def normalize_bucket(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("source-reset S3 bucket cannot be empty")
+        return normalized
+
+    @field_validator("endpoint_url")
+    @classmethod
+    def validate_endpoint_url(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        normalized = value.strip().rstrip("/")
+        parsed = urlsplit(normalized)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("source-reset S3 endpoint must be an absolute HTTP(S) URL")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("source-reset S3 endpoint must not contain credentials")
+        if parsed.query or parsed.fragment:
+            raise ValueError("source-reset S3 endpoint must not contain a query or fragment")
+        return normalized
+
+    @field_validator("raw_prefix", "fit_prefix", "apple_xml_prefix")
+    @classmethod
+    def normalize_prefix(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip().strip("/")
+
+    @model_validator(mode="after")
+    def require_scanned_prefix(self) -> "SourceResetS3Target":
+        if self.raw_prefix is None and self.fit_prefix is None and self.apple_xml_prefix is None:
+            raise ValueError("source-reset S3 target must declare at least one governed prefix")
+        return self
 
 
 class Settings(BaseSettings):
@@ -226,6 +284,8 @@ class Settings(BaseSettings):
 
     # SDK INVITATION CODE SETTINGS
     user_invitation_code_expire_days: int = 7
+    sdk_upload_max_size_bytes: int = Field(10 * 1024 * 1024, ge=1, le=10 * 1024 * 1024)
+    sdk_upload_inbox_retention_days: int = Field(7, ge=1, le=30)
 
     # AWS SETTINGS
     aws_bucket_name: str | None = None
@@ -243,6 +303,11 @@ class Settings(BaseSettings):
     raw_payload_s3_bucket: str | None = None  # defaults to aws_bucket_name if not set
     raw_payload_s3_prefix: str = "raw-payloads"
     raw_payload_s3_endpoint_url: str | None = None  # for S3-compatible storage (e.g. Railway Object Storage)
+    # Reset is intentionally unavailable until operators attest that this
+    # bounded registry covers every retired bucket, endpoint, and prefix that
+    # may still contain governed objects. Credentials remain in AWS_* settings.
+    source_reset_s3_target_history_complete: bool = False
+    source_reset_retired_s3_targets: list[SourceResetS3Target] = Field(default_factory=list, max_length=32)
 
     # SVIX WEBHOOK SETTINGS
     # Master switch for outgoing webhooks. Off by default so deployments without Svix

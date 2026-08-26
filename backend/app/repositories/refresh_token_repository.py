@@ -21,9 +21,17 @@ class RefreshTokenRepository:
         db_session.refresh(token)
         return token
 
-    def get_valid_token(self, db_session: DbSession, token_id: str) -> RefreshToken | None:
+    def get_valid_token(
+        self,
+        db_session: DbSession,
+        token_id: str,
+        *,
+        for_update: bool = False,
+    ) -> RefreshToken | None:
         """Get a refresh token if it exists and is not revoked."""
         stmt = select(self.model).where(self.model.id == token_id, self.model.revoked_at.is_(None))
+        if for_update:
+            stmt = stmt.with_for_update()
         return db_session.execute(stmt).scalar_one_or_none()
 
     def get_by_user_id(self, db_session: DbSession, user_id: UUID) -> list[RefreshToken]:
@@ -36,11 +44,20 @@ class RefreshTokenRepository:
         stmt = select(self.model).where(self.model.developer_id == developer_id, self.model.revoked_at.is_(None))
         return list(db_session.execute(stmt).scalars().all())
 
-    def revoke_token(self, db_session: DbSession, token: RefreshToken) -> RefreshToken:
+    def revoke_token(
+        self,
+        db_session: DbSession,
+        token: RefreshToken,
+        *,
+        commit: bool = True,
+    ) -> RefreshToken:
         """Revoke a single refresh token."""
         token.revoked_at = datetime.now(timezone.utc)
-        db_session.commit()
-        db_session.refresh(token)
+        if commit:
+            db_session.commit()
+            db_session.refresh(token)
+        else:
+            db_session.flush()
         return token
 
     def revoke_all_for_user(self, db_session: DbSession, user_id: UUID) -> int:

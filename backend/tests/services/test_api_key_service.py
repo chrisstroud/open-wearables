@@ -34,6 +34,22 @@ class TestApiKeyServiceCreateApiKey:
         assert api_key.id.startswith("sk-")
         assert api_key.name == "Test Key"
         assert api_key.created_by == developer.id
+        assert api_key.scopes == []
+
+    def test_create_and_rotate_source_reset_key_preserves_scope(self, db: Session) -> None:
+        developer = DeveloperFactory()
+        api_key = api_key_service.create_api_key(
+            db,
+            developer.id,
+            "Reset operator",
+            scopes=["source-reset"],
+        )
+
+        rotated = api_key_service.rotate_api_key(db, api_key.id, developer.id)
+
+        assert rotated.id != api_key.id
+        assert rotated.name == "Default"
+        assert rotated.scopes == ["source-reset"]
 
     def test_create_api_key_has_correct_length(self, db: Session) -> None:
         """Should generate key with correct format: sk- + 32 hex chars."""

@@ -6,7 +6,12 @@ from sqlalchemy import and_, asc, desc, tuple_
 from sqlalchemy.dialects.postgresql import insert
 
 from app.database import DbSession
-from app.models import DataSource, HealthScore
+from app.models import DataSource, EventRecord, HealthScore
+from app.repositories.health_write_authority import (
+    HealthWriteAuthorityError,
+    require_health_write_authorities,
+    require_health_write_authority,
+)
 from app.repositories.repositories import CrudRepository
 from app.schemas.enums import HealthScoreCategory
 from app.schemas.model_crud.activities import HealthScoreCreate, HealthScoreQueryParams, HealthScoreUpdate
@@ -14,6 +19,74 @@ from app.utils.pagination import decode_cursor
 
 
 class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, HealthScoreUpdate]):
+    @staticmethod
+    def _require_creation_authorities(db_session: DbSession, creators: list[HealthScoreCreate]) -> None:
+        data_source_ids = {creator.data_source_id for creator in creators if creator.data_source_id is not None}
+        data_sources = {
+            row.id: row
+            for row in db_session.query(DataSource).filter(DataSource.id.in_(data_source_ids)).populate_existing().all()
+        }
+        if set(data_sources) != data_source_ids:
+            raise HealthWriteAuthorityError("Health score data source does not exist")
+
+        sleep_record_ids = {creator.sleep_record_id for creator in creators if creator.sleep_record_id is not None}
+        sleep_owners = {
+            record_id: user_id
+            for record_id, user_id in db_session.query(EventRecord.id, DataSource.user_id)
+            .join(DataSource, EventRecord.data_source_id == DataSource.id)
+            .filter(EventRecord.id.in_(sleep_record_ids))
+            .all()
+        }
+        if set(sleep_owners) != sleep_record_ids:
+            raise HealthWriteAuthorityError("Health score sleep record does not exist")
+
+        for creator in creators:
+            if creator.data_source_id is not None:
+                data_source = data_sources[creator.data_source_id]
+                if data_source.user_id != creator.user_id:
+                    raise HealthWriteAuthorityError("Health score data source belongs to another user")
+            if creator.sleep_record_id is not None and sleep_owners[creator.sleep_record_id] != creator.user_id:
+                raise HealthWriteAuthorityError("Health score sleep record belongs to another user")
+
+        require_health_write_authorities(
+            db_session,
+            ((creator.user_id, creator.provider) for creator in creators),
+            allow_internal_maintenance=True,
+        )
+
+    def create(self, db_session: DbSession, creator: HealthScoreCreate) -> HealthScore:
+        self._require_creation_authorities(db_session, [creator])
+        created = super().create(db_session, creator)
+        assert created is not None
+        return created
+
+    def update(self, db_session: DbSession, originator: HealthScore, updater: HealthScoreUpdate) -> HealthScore:
+        require_health_write_authority(
+            db_session,
+            user_id=originator.user_id,
+            provider=originator.provider,
+            allow_internal_maintenance=True,
+        )
+        return super().update(db_session, originator, updater)
+
+    def delete(self, db_session: DbSession, originator: HealthScore) -> HealthScore:
+        require_health_write_authority(
+            db_session,
+            user_id=originator.user_id,
+            provider=originator.provider,
+            allow_internal_maintenance=True,
+        )
+        return super().delete(db_session, originator)
+
+    def delete_flush(self, db_session: DbSession, originator: HealthScore) -> None:
+        require_health_write_authority(
+            db_session,
+            user_id=originator.user_id,
+            provider=originator.provider,
+            allow_internal_maintenance=True,
+        )
+        super().delete_flush(db_session, originator)
+
     def get_by_all_components(self, db_session: DbSession, components: list[str]) -> list[HealthScore]:
         """Return health scores whose components JSONB contains all specified keys (?& operator)."""
         return db_session.query(HealthScore).filter(HealthScore.components.has_all(components)).all()
@@ -52,6 +125,8 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
         if not creators:
             return
 
+        self._require_creation_authorities(db_session, creators)
+
         values = [c.model_dump() for c in creators]
 
         stmt = insert(HealthScore).values(values).on_conflict_do_nothing()
@@ -86,6 +161,12 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
         Sleep scores are stored with recorded_at = midnight UTC of the local sleep date.
         """
         midnight = datetime(score_date.year, score_date.month, score_date.day, tzinfo=timezone.utc)
+        require_health_write_authority(
+            db_session,
+            user_id=user_id,
+            provider=provider,
+            allow_internal_maintenance=True,
+        )
         return (
             db_session.query(HealthScore)
             .filter(

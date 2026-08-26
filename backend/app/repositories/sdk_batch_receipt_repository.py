@@ -20,8 +20,17 @@ class SDKBatchReceiptRepository:
             return []
         return db_session.query(SDKBatchReceipt).filter(SDKBatchReceipt.id.in_(batch_ids)).all()
 
-    def save(self, db_session: DbSession, receipt: SDKBatchReceipt) -> SDKBatchReceipt:
+    def save(
+        self,
+        db_session: DbSession,
+        receipt: SDKBatchReceipt,
+        *,
+        commit: bool = True,
+    ) -> SDKBatchReceipt:
         db_session.add(receipt)
-        db_session.commit()
-        db_session.refresh(receipt)
+        if commit:
+            db_session.commit()
+            db_session.refresh(receipt)
+        else:
+            db_session.flush()
         return receipt

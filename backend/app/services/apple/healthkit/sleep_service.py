@@ -123,6 +123,8 @@ def _apply_transition(
     source_name: str | None = None,
     device_model: str | None = None,
     zone_offset: str | None = None,
+    *,
+    commit: bool = True,
 ) -> tuple[SleepState, set[str]]:
     """Apply a transition to the sleep state."""
 
@@ -144,7 +146,7 @@ def _apply_transition(
         delta_seconds = (start_time - state.end_time).total_seconds()
 
     if delta_seconds > settings.sleep_end_gap_minutes * 60:
-        materialized_source_ids.update(finish_sleep(db_session, user_id, state))
+        materialized_source_ids.update(finish_sleep(db_session, user_id, state, commit=commit))
         state = _create_new_sleep_state(start_time, end_time, uuid, provider, source_name, device_model, zone_offset)
 
     if zone_offset and not state.zone_offset:
@@ -200,6 +202,8 @@ def handle_sleep_data(
     db_session: DbSession,
     request: SDKSyncRequest,
     user_id: str,
+    *,
+    commit: bool = True,
 ) -> set[str]:
     """
     Process SDK sleep data and track sleep sessions using Redis state.
@@ -296,6 +300,7 @@ def handle_sleep_data(
                 original_source_name,
                 device_model,
                 sjson.zoneOffset,
+                commit=commit,
             )
             materialized_source_ids.update(finalized_source_ids)
 
@@ -313,7 +318,7 @@ def handle_sleep_data(
             if session_end.tzinfo is None:
                 session_end = session_end.replace(tzinfo=timezone.utc)
             if datetime.now(timezone.utc) - session_end >= timedelta(minutes=settings.sleep_end_gap_minutes):
-                materialized_source_ids.update(finish_sleep(db_session, user_id, current_state))
+                materialized_source_ids.update(finish_sleep(db_session, user_id, current_state, commit=commit))
 
     finally:
         with contextlib.suppress(Exception):
@@ -428,7 +433,13 @@ def _calculate_final_metrics(stages: list[SleepStateStage]) -> tuple[dict, list[
     return metrics, cleaned_stages
 
 
-def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> set[str]:
+def finish_sleep(
+    db_session: DbSession,
+    user_id: str,
+    state: SleepState,
+    *,
+    commit: bool = True,
+) -> set[str]:
     """Finish a sleep session and save the record to the database.
 
     Before creating a new record the function checks whether an existing adjacent
@@ -486,7 +497,10 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> set[
             end_time = max(end_time, cleaned_stages[-1].end_time)
 
         # Remove the old record before creating the merged one (cascade deletes detail).
-        event_record_service.delete(db_session, adjacent.id)
+        if commit:
+            event_record_service.delete(db_session, adjacent.id)
+        else:
+            event_record_service.crud.delete_flush(db_session, adjacent)
 
     # ---
 
@@ -529,10 +543,21 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> set[
     )
 
     try:
-        created_or_existing_record = event_record_service.create(db_session, sleep_record)
+        created_or_existing_record = (
+            event_record_service.create(db_session, sleep_record)
+            if commit
+            else event_record_service.crud.create_and_flush(db_session, sleep_record)
+        )
         # Always use the returned record's ID (whether newly created or existing)
         detail_for_record = detail.model_copy(update={"record_id": created_or_existing_record.id})
-        event_record_service.create_detail(db_session, detail_for_record, detail_type="sleep")
+        if commit:
+            event_record_service.create_detail(db_session, detail_for_record, detail_type="sleep")
+        else:
+            event_record_service.event_record_detail_repo.create_and_flush(
+                db_session,
+                detail_for_record,
+                detail_type="sleep",
+            )
         # Delete from Redis only after a successful DB write so a transient error
         # keeps the session available for the next periodic finalization attempt.
         delete_sleep_state(user_id)
@@ -541,11 +566,13 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> set[
         log_structured(
             logger,
             "error",
-            f"Error saving sleep record {sleep_record.id} for user {user_id}: {e}",
+            "Error saving sleep record",
             provider=state.provider or "unknown",
             action="sleep_record_save_error",
             user_id=user_id,
             sleep_record_id=sleep_record.id,
-            error=str(e),
+            error_type=type(e).__name__,
         )
+        if not commit:
+            raise
         return set()

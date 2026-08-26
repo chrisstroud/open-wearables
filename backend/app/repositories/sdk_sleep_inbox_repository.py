@@ -13,6 +13,7 @@ class SDKSleepInboxRepository:
         user_id: UUID,
         provider: str,
         external_id: str,
+        health_evidence_generation: int | None,
         for_update: bool = False,
     ) -> SDKSleepInbox | None:
         query = db_session.query(SDKSleepInbox).filter(
@@ -20,6 +21,10 @@ class SDKSleepInboxRepository:
             SDKSleepInbox.provider == provider,
             SDKSleepInbox.external_id == external_id,
         )
+        if health_evidence_generation is None:
+            query = query.filter(SDKSleepInbox.health_evidence_generation.is_(None))
+        else:
+            query = query.filter(SDKSleepInbox.health_evidence_generation == health_evidence_generation)
         if for_update:
             query = query.with_for_update()
         return query.one_or_none()
@@ -42,7 +47,7 @@ class SDKSleepInboxRepository:
         provider: str | None = None,
     ) -> list[SDKSleepInbox]:
         query = db_session.query(SDKSleepInbox).filter(
-            SDKSleepInbox.status != "materialized",
+            SDKSleepInbox.status.in_(("staged", "projecting", "projected")),
             SDKSleepInbox.next_attempt_at <= now,
         )
         if user_id is not None:

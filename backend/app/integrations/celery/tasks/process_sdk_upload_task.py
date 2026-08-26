@@ -1,4 +1,6 @@
+import hashlib
 import uuid
+from datetime import datetime, timezone
 from logging import getLogger
 from typing import Any
 from uuid import UUID
@@ -7,6 +9,7 @@ from celery import shared_task
 
 from app.database import SessionLocal
 from app.models import User
+from app.repositories.sdk_upload_inbox_repository import sdk_upload_inbox_repository
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.sync_status import SyncSource, SyncStatus
@@ -16,7 +19,10 @@ from app.services.apple.healthkit.import_service import (
 from app.services.apple.healthkit.import_service import (
     import_service as sdk_import_service,
 )
+from app.services.apple.healthkit.import_service import validated_content_coverage
 from app.services.sdk_batch_receipt_service import sdk_batch_receipt_service
+from app.services.sdk_client_installation_service import sdk_client_installation_service
+from app.services.sdk_sleep_inbox_service import sdk_sleep_inbox_service
 from app.services.sync_status_service import completed, failed, started
 from app.utils.structured_logging import log_structured
 
@@ -31,10 +37,10 @@ def _get_import_service(provider: str) -> SDKImportService:
 
 @shared_task(queue="sdk_sync")
 def process_sdk_upload(
-    content: str,
-    content_type: str,
-    user_id: str,
-    provider: str,
+    content: str | None = None,
+    content_type: str | None = None,
+    user_id: str | None = None,
+    provider: str | None = None,
     batch_id: str | None = None,
     require_terminal_receipt: bool = False,
 ) -> dict[str, Any]:
@@ -42,10 +48,11 @@ def process_sdk_upload(
     Process SDK data import asynchronously.
 
     Args:
-        content: The request content as string (JSON or multipart data)
-        content_type: The content type header value
-        user_id: User ID to associate with the data
-        provider: Import provider - "apple", "samsung", "google"
+        content: Legacy in-message payload. Receipt-backed calls load the
+            content from the durable database inbox instead.
+        content_type: Legacy in-message content type.
+        user_id: Legacy in-message user ID.
+        provider: Legacy in-message provider.
         batch_id: Unique batch identifier for tracking (optional for backwards compatibility)
         require_terminal_receipt: True only for the new durable-receipt route contract
 
@@ -55,21 +62,6 @@ def process_sdk_upload(
     # Generate batch_id if not provided (backwards compatibility)
     if not batch_id:
         batch_id = str(uuid.uuid4())
-
-    # Validate user_id format
-    try:
-        user_uuid = UUID(user_id)
-    except ValueError:
-        log_structured(
-            logger,
-            "warning",
-            "Invalid user_id format",
-            provider=provider,
-            action="validate_user_id",
-            batch_id=batch_id,
-            user_id=user_id,
-        )
-        return {"status": "error", "reason": "invalid_user_id", "batch_id": batch_id}
 
     batch_uuid: UUID | None = None
     receipt_exists = False
@@ -88,30 +80,43 @@ def process_sdk_upload(
             return {"status": "duplicate", "reason": "receipt_not_queued", "batch_id": batch_id}
         receipt_attempt = claim.attempt_count
 
-    # Validate user exists before processing
-    with SessionLocal() as db:
-        user_repo = UserRepository(User)
-        if not user_repo.get(db, user_uuid):
-            log_structured(
-                logger,
-                "warning",
-                "Skipping import for non-existent user",
-                provider=provider,
-                action="validate_user_exists",
-                batch_id=batch_id,
-                user_id=user_id,
-            )
-            if receipt_exists:
+        if content is None:
+            with SessionLocal() as db:
+                inbox = sdk_upload_inbox_repository.get(db, batch_uuid)
+                if inbox is not None:
+                    content = inbox.content
+                    content_type = inbox.content_type
+                    user_id = str(inbox.user_id)
+                    provider = inbox.provider
+            if content is None:
                 assert receipt_attempt is not None
-                assert batch_uuid is not None
-                sdk_batch_receipt_service.mark_failed(
-                    db,
-                    batch_id=batch_uuid,
-                    attempt_count=receipt_attempt,
-                    error_code="user_not_found",
-                    retryable=False,
-                )
-            return {"status": "skipped", "reason": "user_not_found", "batch_id": batch_id}
+                with SessionLocal() as db:
+                    sdk_batch_receipt_service.mark_failed(
+                        db,
+                        batch_id=batch_uuid,
+                        attempt_count=receipt_attempt,
+                        error_code="upload_inbox_missing",
+                        retryable=False,
+                    )
+                return {"status": "error", "reason": "upload_inbox_missing", "batch_id": batch_id}
+
+    if content is None or content_type is None or user_id is None or provider is None:
+        return {"status": "error", "reason": "task_payload_missing", "batch_id": batch_id}
+
+    # Validate user_id format
+    try:
+        user_uuid = UUID(user_id)
+    except (TypeError, ValueError):
+        log_structured(
+            logger,
+            "warning",
+            "Invalid user_id format",
+            provider=provider,
+            action="validate_user_id",
+            batch_id=batch_id,
+            user_id=user_id,
+        )
+        return {"status": "error", "reason": "invalid_user_id", "batch_id": batch_id}
 
     # Log task start
     log_structured(
@@ -135,9 +140,116 @@ def process_sdk_upload(
 
     try:
         with SessionLocal() as db:
+            # The user row is the account-wide health write lock. Validation
+            # and every normalized write happen in this same transaction, so a
+            # reset fence or replacement cannot interleave after validation.
+            user = UserRepository(User).get(db, user_uuid)
+            if user is None:
+                log_structured(
+                    logger,
+                    "warning",
+                    "Skipping import for non-existent user",
+                    provider=provider,
+                    action="validate_user_exists",
+                    batch_id=batch_id,
+                    user_id=user_id,
+                )
+                if receipt_exists:
+                    assert receipt_attempt is not None
+                    assert batch_uuid is not None
+                    sdk_batch_receipt_service.mark_failed(
+                        db,
+                        batch_id=batch_uuid,
+                        attempt_count=receipt_attempt,
+                        error_code="user_not_found",
+                        retryable=False,
+                    )
+                return {"status": "skipped", "reason": "user_not_found", "batch_id": batch_id}
+
+            # The preliminary repository lookup preserves the task's legacy
+            # user-not-found contract. This query is the authority boundary:
+            # it locks the exact row, then refreshes the instance so a reset or
+            # installation replacement that won the lock is observed before
+            # any normalized write begins.
+            db.query(User.id).filter(User.id == user_uuid).with_for_update().one_or_none()
+            db.refresh(user)
+
+            inbox = sdk_upload_inbox_repository.get(db, batch_uuid) if batch_uuid is not None else None
+            if receipt_exists:
+                assert batch_uuid is not None
+                assert receipt_attempt is not None
+                receipt = sdk_batch_receipt_service.crud.get_for_update(db, batch_uuid)
+                inbox_digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                scope_matches = (
+                    receipt is not None
+                    and inbox is not None
+                    and receipt.status == "processing"
+                    and receipt.attempt_count == receipt_attempt
+                    and inbox.user_id == receipt.user_id == user_uuid
+                    and inbox.provider == receipt.provider == provider
+                    and inbox.payload_sha256 == receipt.payload_sha256 == inbox_digest
+                    and inbox.installation_id == receipt.installation_id
+                    and inbox.installation_generation == receipt.installation_generation
+                    and inbox.health_evidence_generation == receipt.health_evidence_generation
+                    and inbox.content_type == content_type
+                    and inbox.expires_at > datetime.now(timezone.utc)
+                )
+                if not scope_matches:
+                    sdk_batch_receipt_service.mark_failed(
+                        db,
+                        batch_id=batch_uuid,
+                        attempt_count=receipt_attempt,
+                        error_code="upload_inbox_scope_mismatch",
+                        retryable=False,
+                        commit=False,
+                    )
+                    db.commit()
+                    return {
+                        "status": "skipped",
+                        "reason": "upload_inbox_scope_mismatch",
+                        "batch_id": batch_id,
+                    }
+            write_error = sdk_client_installation_service.health_write_error(
+                db,
+                user=user,
+                installation_id=inbox.installation_id if inbox is not None else None,
+                installation_generation=inbox.installation_generation if inbox is not None else None,
+                health_evidence_generation=inbox.health_evidence_generation if inbox is not None else None,
+            )
+            if write_error is not None:
+                log_structured(
+                    logger,
+                    "warning",
+                    "Skipping SDK import because its write generation is no longer active",
+                    provider=provider,
+                    action="validate_health_write_generation",
+                    batch_id=batch_id,
+                    user_id=user_id,
+                    error_code=write_error,
+                )
+                if receipt_exists:
+                    assert receipt_attempt is not None
+                    assert batch_uuid is not None
+                    sdk_batch_receipt_service.mark_failed(
+                        db,
+                        batch_id=batch_uuid,
+                        attempt_count=receipt_attempt,
+                        error_code=write_error,
+                        retryable=False,
+                    )
+                return {"status": "skipped", "reason": write_error, "batch_id": batch_id}
+
+            if inbox is not None and inbox.installation_id is not None:
+                db.info["health_write_authority"] = (
+                    user_uuid,
+                    inbox.health_evidence_generation,
+                    inbox.installation_id,
+                    inbox.installation_generation,
+                )
+
             # Ensure SDK connection exists for this user (SDK-based, no OAuth tokens)
             connection_repo = UserConnectionRepository()
-            connection_repo.ensure_sdk_connection(db, user_uuid, provider)
+            connection_repo.ensure_sdk_connection(db, user_uuid, provider, commit=False)
 
             # Select the appropriate import service based on source
             import_service = _get_import_service(provider)
@@ -187,13 +299,17 @@ def process_sdk_upload(
                 if receipt_exists:
                     assert receipt_attempt is not None
                     assert batch_uuid is not None
-                    with SessionLocal() as receipt_db:
-                        sdk_batch_receipt_service.mark_succeeded(
-                            receipt_db,
-                            batch_id=batch_uuid,
-                            attempt_count=receipt_attempt,
-                            result=result,
-                        )
+                    result.update(validated_content_coverage(content))
+                    sdk_batch_receipt_service.mark_succeeded(
+                        db,
+                        batch_id=batch_uuid,
+                        attempt_count=receipt_attempt,
+                        result=result,
+                        commit=False,
+                    )
+                    db.commit()
+                    if sleep_saved:
+                        sdk_sleep_inbox_service.schedule_projection(user_id=user_uuid, provider=provider)
                 completed(
                     user_uuid,
                     provider,
@@ -234,15 +350,16 @@ def process_sdk_upload(
                 if receipt_exists:
                     assert receipt_attempt is not None
                     assert batch_uuid is not None
-                    with SessionLocal() as receipt_db:
-                        sdk_batch_receipt_service.mark_failed(
-                            receipt_db,
-                            batch_id=batch_uuid,
-                            attempt_count=receipt_attempt,
-                            error_code=error_code,
-                            retryable=retryable,
-                            result=result,
-                        )
+                    sdk_batch_receipt_service.mark_failed(
+                        db,
+                        batch_id=batch_uuid,
+                        attempt_count=receipt_attempt,
+                        error_code=error_code,
+                        retryable=retryable,
+                        result=result,
+                        commit=False,
+                    )
+                    db.commit()
                 failed(
                     user_uuid,
                     provider,

@@ -120,16 +120,43 @@ class GarminWebhookHandler(BaseWebhookHandler):
         """
         request_trace_id = str(uuid4())[:8]
 
-        item_counts = {k: len(v) if isinstance(v, list) else 1 for k, v in payload.items()}
-        garmin_user_ids = list(
-            {
-                item.get("userId")
-                for items in payload.values()
-                if isinstance(items, list)
-                for item in items
-                if isinstance(item, dict) and item.get("userId")
-            }
+        candidate_user_ids = {
+            str(item["userId"])
+            for items in payload.values()
+            if isinstance(items, list)
+            for item in items
+            if isinstance(item, dict) and item.get("userId") is not None
+        }
+        authority = self.authorize_webhook_ingress(
+            db,
+            provider_user_ids=candidate_user_ids,
         )
+        authorized_payload = {
+            data_type: [
+                item
+                for item in items
+                if isinstance(item, dict)
+                and item.get("userId") is not None
+                and str(item["userId"]) in authority.provider_user_ids
+            ]
+            for data_type, items in payload.items()
+            if isinstance(items, list)
+        }
+        authorized_payload = {key: items for key, items in authorized_payload.items() if items}
+        if not authorized_payload:
+            log_structured(
+                logger,
+                "info",
+                "Acknowledged Garmin webhook without dispatch",
+                provider="garmin",
+                trace_id=request_trace_id,
+                candidate_user_count=len(candidate_user_ids),
+                action="webhook_ingress_fenced",
+            )
+            return {"status": "accepted"}
+
+        item_counts = {key: len(items) for key, items in authorized_payload.items()}
+        garmin_user_ids = sorted({str(item["userId"]) for items in authorized_payload.values() for item in items})
         log_structured(
             logger,
             "info",
@@ -140,11 +167,20 @@ class GarminWebhookHandler(BaseWebhookHandler):
             garmin_user_ids=garmin_user_ids,
         )
 
-        store_raw_payload(source="webhook", provider="garmin", payload=payload, trace_id=request_trace_id)
+        store_raw_payload(
+            source="webhook",
+            provider="garmin",
+            payload=authorized_payload,
+            trace_id=request_trace_id,
+        )
 
         # garmin_sync is isolated from the default queue so high-volume live-push
         # events and backfill-chain tasks don't starve each other.
-        task = celery_app.send_task(_PROCESS_PUSH_TASK, args=["garmin", payload, request_trace_id], queue="garmin_sync")
+        task = celery_app.send_task(
+            _PROCESS_PUSH_TASK,
+            args=["garmin", authorized_payload, request_trace_id],
+            queue="garmin_sync",
+        )
         log_structured(
             logger,
             "info",

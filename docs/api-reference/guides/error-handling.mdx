@@ -163,7 +163,7 @@ The server returns **200 OK** from the POST only after the worker durably finish
 
 Reusing a batch ID with a different user, provider, or payload digest returns **409 Conflict** and never dispatches the second payload.
 
-A bounded-window manifest is not accepted until every referenced batch has a successful zero-drop receipt and every durable sleep-inbox row referenced by those batches has been verified in the sleep projection. While sleep projection is pending, the manifest batch reports `error_code: window_sleep_projection_pending` with `retryable: true`; retry the identical manifest and batch ID. `GET /api/v1/sdk/users/{user_id}/sync-windows/{window_id}` returns **404 Not Found** until the immutable window receipt exists.
+A bounded-window manifest is not accepted until every referenced batch has a successful zero-drop receipt, worker-derived type and timestamp coverage inside the manifest bounds, and every durable sleep-inbox row referenced by those batches has been verified in the sleep projection. First-class activation and archive windows must also match the installation's immutable 30-completed-local-day policy and the server's reviewed Apple Health type registry; archive windows must be adjacent to the accepted frontier. While sleep projection is pending, the manifest batch reports `error_code: window_sleep_projection_pending` with `retryable: true`; retry the identical manifest and batch ID. `GET /api/v1/sdk/users/{user_id}/sync-windows/{window_id}` returns **404 Not Found** until the immutable window receipt exists.
 
 ---
 

@@ -1,12 +1,14 @@
 """Tests for SDK authentication utilities."""
 
+from uuid import UUID
+
 import pytest
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.services.sdk_token_service import create_sdk_user_token
 from app.utils.auth import get_current_developer, get_sdk_auth
-from tests.factories import ApiKeyFactory, DeveloperFactory
+from tests.factories import ApiKeyFactory, DeveloperFactory, UserFactory
 
 
 class TestGetSDKAuth:
@@ -16,6 +18,7 @@ class TestGetSDKAuth:
     async def test_sdk_token_returns_context(self, db: Session) -> None:
         """Valid SDK token should return SDKAuthContext."""
         user_id = "123e4567-e89b-12d3-a456-426614174000"
+        UserFactory(id=UUID(user_id))
         token = create_sdk_user_token("app_123", user_id)
 
         result = await get_sdk_auth(db=db, token=token, x_open_wearables_api_key=None)
@@ -55,6 +58,7 @@ class TestGetSDKAuth:
         """SDK token should be used even if API key is also provided."""
         api_key = ApiKeyFactory()
         user_id = "123e4567-e89b-12d3-a456-426614174001"
+        UserFactory(id=UUID(user_id))
         token = create_sdk_user_token("app_123", user_id)
 
         result = await get_sdk_auth(db=db, token=token, x_open_wearables_api_key=api_key.id)

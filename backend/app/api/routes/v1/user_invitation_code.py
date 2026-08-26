@@ -66,4 +66,4 @@ def redeem_invitation_code(
     has its own backend, mint and forward a token with
     `POST /api/v1/users/{user_id}/token` instead of redeeming codes on the client.
     """
-    return user_invitation_code_service.redeem(db, payload.code)
+    return user_invitation_code_service.redeem(db, payload.code, client=payload.client)

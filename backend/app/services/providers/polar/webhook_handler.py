@@ -117,6 +117,22 @@ class PolarWebhookHandler(BaseWebhookHandler):
         """Store raw payload and enqueue async processing. Returns 200 immediately."""
         trace_id = str(uuid4())[:8]
         raw = payload.model_dump()
+        polar_user_id = str(payload.user_id) if payload.user_id is not None else ""
+        authority = self.authorize_webhook_ingress(
+            db,
+            provider_user_ids={polar_user_id},
+        )
+        if polar_user_id not in authority.provider_user_ids:
+            log_structured(
+                logger,
+                "info",
+                "Acknowledged Polar webhook without dispatch",
+                provider="polar",
+                trace_id=trace_id,
+                event=payload.event,
+                action="webhook_ingress_fenced",
+            )
+            return {"status": "accepted"}
 
         log_structured(
             logger,

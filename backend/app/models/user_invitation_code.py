@@ -26,3 +26,4 @@ class UserInvitationCode(BaseDbModel):
     redeemed_at: Mapped[datetime | None]
     revoked_at: Mapped[datetime | None]
     activation_policy: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    health_evidence_generation: Mapped[int] = mapped_column(default=0, server_default="0")

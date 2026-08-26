@@ -6,11 +6,14 @@ from uuid import UUID
 from sqlalchemy.exc import IntegrityError
 
 from app.database import DbSession
-from app.models import SDKBatchReceipt
+from app.models import SDKBatchReceipt, User
 from app.repositories import SDKBatchReceiptRepository
+from app.repositories.sdk_upload_inbox_repository import sdk_upload_inbox_repository
 from app.schemas.responses.upload import SDKBatchReceiptResponse, SDKBatchReceiptStatus
+from app.services.sdk_client_installation_service import sdk_client_installation_service
 
 logger = getLogger(__name__)
+MAX_COVERED_TYPE_IDENTIFIERS = 256
 
 
 @dataclass(frozen=True)
@@ -47,6 +50,9 @@ class SDKBatchReceiptService:
         *,
         batch_id: UUID,
         user_id: UUID,
+        installation_id: UUID | None = None,
+        installation_generation: int | None = None,
+        health_evidence_generation: int | None = None,
         provider: str,
         payload_sha256: str,
     ) -> SubmissionDecision:
@@ -56,8 +62,14 @@ class SDKBatchReceiptService:
             receipt = SDKBatchReceipt(
                 id=batch_id,
                 user_id=user_id,
+                installation_id=installation_id,
+                installation_generation=installation_generation,
+                health_evidence_generation=health_evidence_generation,
                 provider=provider,
                 payload_sha256=payload_sha256,
+                content_lower_bound_inclusive=None,
+                content_upper_bound_exclusive=None,
+                covered_type_identifiers=[],
                 status=SDKBatchReceiptStatus.QUEUED,
                 retryable=False,
                 attempt_count=0,
@@ -83,7 +95,14 @@ class SDKBatchReceiptService:
                 if receipt is None:
                     raise
 
-        if receipt.user_id != user_id or receipt.provider != provider or receipt.payload_sha256 != payload_sha256:
+        if (
+            receipt.user_id != user_id
+            or receipt.installation_id != installation_id
+            or receipt.installation_generation != installation_generation
+            or receipt.health_evidence_generation != health_evidence_generation
+            or receipt.provider != provider
+            or receipt.payload_sha256 != payload_sha256
+        ):
             db_session.rollback()
             raise BatchReceiptConflictError("Batch ID already belongs to a different payload")
 
@@ -141,6 +160,7 @@ class SDKBatchReceiptService:
         batch_id: UUID,
         attempt_count: int,
         result: dict,
+        commit: bool = True,
     ) -> None:
         dropped_count = int(result.get("dropped_count", 0) or 0)
         tombstones_unresolved = int(result.get("tombstones_unresolved", 0) or 0)
@@ -152,6 +172,7 @@ class SDKBatchReceiptService:
                 error_code="dropped_records" if dropped_count else "tombstones_unresolved",
                 retryable=False,
                 result=result,
+                commit=commit,
             )
             return
 
@@ -171,6 +192,7 @@ class SDKBatchReceiptService:
                 error_code=error_code,
                 retryable=status_code == 202 or not isinstance(status_code, int) or status_code >= 500,
                 result=result,
+                commit=commit,
             )
             return
 
@@ -185,14 +207,44 @@ class SDKBatchReceiptService:
             # A stale worker must never publish over a newer attempt's outcome.
             db_session.rollback()
             return
+        user = db_session.query(User).filter(User.id == receipt.user_id).with_for_update().one_or_none()
+        write_error = (
+            "user_not_found"
+            if user is None
+            else sdk_client_installation_service.health_write_error(
+                db_session,
+                user=user,
+                installation_id=receipt.installation_id,
+                installation_generation=receipt.installation_generation,
+                health_evidence_generation=receipt.health_evidence_generation,
+            )
+        )
         now = self._now()
+        if write_error is not None:
+            receipt.status = SDKBatchReceiptStatus.FAILED
+            receipt.retryable = False
+            receipt.error_code = write_error
+            receipt.updated_at = now
+            receipt.completed_at = now
+            self.crud.save(db_session, receipt, commit=commit)
+            return
+
         self._copy_counts(receipt, result)
+        self._copy_content_coverage(receipt, result)
         receipt.status = SDKBatchReceiptStatus.SUCCEEDED
         receipt.retryable = False
         receipt.error_code = None
         receipt.updated_at = now
         receipt.completed_at = now
-        self.crud.save(db_session, receipt)
+        if receipt.installation_id is not None:
+            installation = sdk_client_installation_service.crud.get_for_update(db_session, receipt.installation_id)
+            assert installation is not None
+            installation.last_terminal_receipt_at = now
+            if user is not None and user.health_write_state == "activating":
+                user.health_write_state = "active"
+                user.health_reset_operation_id = None
+        sdk_upload_inbox_repository.delete(db_session, batch_id)
+        self.crud.save(db_session, receipt, commit=commit)
 
     def mark_failed(
         self,
@@ -203,6 +255,7 @@ class SDKBatchReceiptService:
         error_code: str,
         retryable: bool,
         result: dict | None = None,
+        commit: bool = True,
     ) -> None:
         receipt = self.crud.get_for_update(db_session, batch_id)
         if receipt is None or SDKBatchReceiptStatus(receipt.status) == SDKBatchReceiptStatus.SUCCEEDED:
@@ -229,7 +282,7 @@ class SDKBatchReceiptService:
         receipt.error_code = error_code[:100]
         receipt.updated_at = now
         receipt.completed_at = now
-        self.crud.save(db_session, receipt)
+        self.crud.save(db_session, receipt, commit=commit)
 
     @staticmethod
     def _copy_counts(receipt: SDKBatchReceipt, result: dict) -> None:
@@ -244,6 +297,27 @@ class SDKBatchReceiptService:
             "tombstone_rows_deleted",
         ):
             setattr(receipt, field, int(result.get(field, 0) or 0))
+
+    @staticmethod
+    def _copy_content_coverage(receipt: SDKBatchReceipt, result: dict) -> None:
+        """Persist only bounded, worker-validated metadata; never health values."""
+        raw_types = result.get("covered_type_identifiers") or []
+        bounded_types = sorted({value for value in raw_types if isinstance(value, str) and 0 < len(value) <= 255})
+        receipt.covered_type_identifiers = bounded_types if len(bounded_types) <= MAX_COVERED_TYPE_IDENTIFIERS else []
+        lower_raw = result.get("content_lower_bound_inclusive")
+        upper_raw = result.get("content_upper_bound_exclusive")
+        try:
+            lower = datetime.fromisoformat(lower_raw) if isinstance(lower_raw, str) else None
+            upper = datetime.fromisoformat(upper_raw) if isinstance(upper_raw, str) else None
+        except ValueError:
+            lower = None
+            upper = None
+        if lower is None or upper is None or lower.tzinfo is None or upper.tzinfo is None or lower > upper:
+            receipt.content_lower_bound_inclusive = None
+            receipt.content_upper_bound_exclusive = None
+            return
+        receipt.content_lower_bound_inclusive = lower
+        receipt.content_upper_bound_exclusive = upper
 
     def get_for_user(self, db_session: DbSession, batch_id: UUID, user_id: UUID) -> SDKBatchReceipt | None:
         receipt = self.crud.get(db_session, batch_id)

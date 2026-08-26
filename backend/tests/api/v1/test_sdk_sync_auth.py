@@ -2,13 +2,14 @@
 
 from collections.abc import Generator
 from unittest.mock import MagicMock, patch
+from uuid import UUID
 
 import pytest
 from sqlalchemy.orm import Session
 from starlette.testclient import TestClient
 
 from app.services.sdk_token_service import create_sdk_user_token
-from tests.factories import ApiKeyFactory, DeveloperFactory
+from tests.factories import ApiKeyFactory, DeveloperFactory, UserFactory
 from tests.utils import developer_auth_headers
 
 
@@ -28,6 +29,7 @@ class TestSDKSyncWithSDKToken:
     ) -> None:
         """SDK token should be accepted for apple-health-sdk sync."""
         user_id = "123e4567-e89b-12d3-a456-426614174000"
+        UserFactory(id=UUID(user_id))
         token = create_sdk_user_token("app_123", user_id)
 
         response = client.post(

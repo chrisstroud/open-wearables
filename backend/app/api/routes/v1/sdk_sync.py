@@ -4,23 +4,82 @@ from logging import getLogger
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Header, HTTPException, Query, Response, status
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, status
 from pydantic import ValidationError
 
+from app.config import settings
 from app.database import DbSession
 from app.integrations.celery.tasks.process_sdk_upload_task import process_sdk_upload
 from app.schemas.providers.mobile_sdk import SyncRequest, SyncWindowManifest
 from app.schemas.responses.upload import SDKBatchReceiptResponse, SDKSyncWindowReceiptResponse
-from app.services.raw_payload_storage import store_raw_payload
 from app.services.sdk_batch_receipt_service import BatchReceiptConflictError, sdk_batch_receipt_service
+from app.services.sdk_client_installation_service import sdk_client_installation_service
 from app.services.sdk_sync_window_receipt_service import sdk_sync_window_receipt_service
+from app.services.sdk_upload_inbox_service import (
+    SDKUploadInboxConflictError,
+    SDKUploadInboxStorageError,
+    SDKUploadInboxTooLargeError,
+    sdk_upload_inbox_service,
+)
 from app.services.user_service import user_service
 from app.utils.api_utils import inline_schema_defs
 from app.utils.auth import SDKAuthDep
 from app.utils.structured_logging import log_structured
 
 router = APIRouter()
+
+
+def _receipt_belongs_to_sdk_installation(receipt: object, auth: object) -> bool:
+    """Keep one phone generation from observing another generation's receipts."""
+    installation_id = getattr(receipt, "installation_id", None)
+    installation_generation = getattr(receipt, "installation_generation", None)
+    health_evidence_generation = getattr(receipt, "health_evidence_generation", None)
+    auth_installation_id = getattr(auth, "installation_id", None)
+    if auth_installation_id is None:
+        return installation_id is None and installation_generation is None and health_evidence_generation is None
+    return (
+        installation_id == auth_installation_id
+        and installation_generation == getattr(auth, "installation_generation", None)
+        and health_evidence_generation == getattr(auth, "health_evidence_generation", None)
+    )
+
+
 logger = getLogger(__name__)
+
+
+def _payload_too_large() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+        detail={"error_code": "sdk_upload_too_large", "retryable": False},
+    )
+
+
+async def _read_bounded_json_object(request: Request) -> dict:
+    """Enforce the wire-byte limit before decoding or materializing JSON."""
+    maximum = settings.sdk_upload_max_size_bytes
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > maximum:
+                raise _payload_too_large()
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Content-Length") from None
+
+    chunks: list[bytes] = []
+    received = 0
+    async for chunk in request.stream():
+        received += len(chunk)
+        if received > maximum:
+            raise _payload_too_large()
+        chunks.append(chunk)
+
+    try:
+        body = json.loads(b"".join(chunks))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid JSON body") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="JSON body must be an object")
+    return body
 
 
 @router.post(
@@ -34,9 +93,9 @@ logger = getLogger(__name__)
         }
     },
 )
-def sync_sdk_data(
+async def sync_sdk_data(
     user_id: str,
-    body: dict,
+    request: Request,
     auth: SDKAuthDep,
     db: DbSession,
     response: Response,
@@ -94,6 +153,8 @@ def sync_sdk_data(
             },
         )
 
+    body = await _read_bounded_json_object(request)
+
     # Raw dict, not SyncRequest: schema-validating here would 400 the whole batch on one
     # bad record pre-dispatch. The worker validates and reports failures to Sentry.
     provider = str(body.get("provider") or "").lower()
@@ -126,8 +187,17 @@ def sync_sdk_data(
         user_uuid = UUID(user_id)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid user_id") from exc
-    if user_service.get(db, user_uuid, print_log=False) is None:
+    user = user_service.get(db, user_uuid, print_log=False)
+    if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    if auth.auth_type == "api_key" and (
+        user.health_source_policy == "apple-mobile-v2-only"
+        or bool(sdk_client_installation_service.crud.list_for_user(db, user_uuid))
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="API-key upload is disabled for a first-class mobile installation",
+        )
 
     # The UUID already exists in the phone's protected outbox before upload.
     batch_uuid = x_open_wearables_batch_id
@@ -161,6 +231,13 @@ def sync_sdk_data(
     )
 
     content_str = json.dumps(body, separators=(",", ":"), sort_keys=True)
+    try:
+        sdk_upload_inbox_service.validate_content_size(content_str)
+    except SDKUploadInboxTooLargeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail={"error_code": "sdk_upload_too_large", "retryable": False},
+        ) from exc
     payload_sha256 = hashlib.sha256(content_str.encode("utf-8")).hexdigest()
 
     try:
@@ -168,6 +245,9 @@ def sync_sdk_data(
             db,
             batch_id=batch_uuid,
             user_id=user_uuid,
+            installation_id=auth.installation_id,
+            installation_generation=auth.installation_generation,
+            health_evidence_generation=auth.health_evidence_generation,
             provider=provider,
             payload_sha256=payload_sha256,
         )
@@ -178,20 +258,40 @@ def sync_sdk_data(
     if not decision.should_dispatch:
         return sdk_batch_receipt_service.to_response(decision.receipt)
 
-    store_raw_payload(
-        source="sdk",
-        provider=provider,
-        payload=content_str,
-        user_id=user_id,
-        trace_id=str(batch_uuid),
-    )
+    try:
+        sdk_upload_inbox_service.put(
+            db,
+            batch_id=batch_uuid,
+            user_id=user_uuid,
+            installation_id=auth.installation_id,
+            installation_generation=auth.installation_generation,
+            health_evidence_generation=auth.health_evidence_generation,
+            provider=provider,
+            payload_sha256=payload_sha256,
+            content_type="application/json",
+            content=content_str,
+        )
+    except SDKUploadInboxConflictError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except SDKUploadInboxTooLargeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail={"error_code": "sdk_upload_too_large", "retryable": False},
+        ) from exc
+    except SDKUploadInboxStorageError as exc:
+        sdk_batch_receipt_service.mark_failed(
+            db,
+            batch_id=batch_uuid,
+            error_code="upload_inbox_unavailable",
+            retryable=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error_code": "upload_inbox_unavailable", "retryable": True},
+        ) from exc
 
     try:
         process_sdk_upload.delay(
-            content=content_str,
-            content_type="application/json",
-            user_id=user_id,
-            provider=provider,
             batch_id=str(batch_uuid),
             require_terminal_receipt=True,
         )
@@ -229,7 +329,7 @@ def get_sdk_batch_receipt(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid user_id") from exc
     receipt = sdk_batch_receipt_service.get_for_user(db, batch_id, user_uuid)
-    if receipt is None:
+    if receipt is None or (auth.auth_type == "sdk_token" and not _receipt_belongs_to_sdk_installation(receipt, auth)):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Batch receipt not found")
     return sdk_batch_receipt_service.to_response(receipt)
 
@@ -253,7 +353,7 @@ def get_sdk_sync_window_receipt(
         user_id=user_uuid,
         window_id=window_id,
     )
-    if receipt is None:
+    if receipt is None or (auth.auth_type == "sdk_token" and not _receipt_belongs_to_sdk_installation(receipt, auth)):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sync window receipt not found")
     return sdk_sync_window_receipt_service.to_response(receipt)
 
@@ -279,4 +379,6 @@ def list_sdk_sync_window_receipts(
         provider=provider,
         limit=limit,
     )
+    if auth.auth_type == "sdk_token":
+        receipts = [receipt for receipt in receipts if _receipt_belongs_to_sdk_installation(receipt, auth)]
     return [sdk_sync_window_receipt_service.to_response(receipt) for receipt in receipts]

@@ -286,6 +286,7 @@ class ApiKeyFactory(BaseFactory):
 
     id = LazyFunction(lambda: f"sk-{uuid4().hex[:32]}")
     name = Sequence(lambda n: f"Test API Key {n}")
+    scopes = LazyFunction(list)
     created_at = LazyFunction(lambda: datetime.now(timezone.utc))
 
     @classmethod

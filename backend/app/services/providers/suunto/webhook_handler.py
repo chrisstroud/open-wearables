@@ -105,6 +105,21 @@ class SuuntoWebhookHandler(BaseWebhookHandler):
         request_trace_id = str(uuid4())[:8]
         event_type = payload.get("type", "unknown")
         username = payload.get("username", "unknown")
+        authority = self.authorize_webhook_ingress(
+            db,
+            provider_usernames={str(username)},
+        )
+        if str(username) not in authority.provider_usernames:
+            log_structured(
+                logger,
+                "info",
+                "Acknowledged Suunto webhook without dispatch",
+                provider="suunto",
+                trace_id=request_trace_id,
+                event_type=event_type,
+                action="webhook_ingress_fenced",
+            )
+            return {"status": "accepted"}
 
         log_structured(
             logger,

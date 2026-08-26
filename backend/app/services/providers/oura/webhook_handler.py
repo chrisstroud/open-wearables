@@ -132,6 +132,22 @@ class OuraWebhookHandler(BaseWebhookHandler):
         event_type = payload.get("event_type", "unknown")
         data_type = payload.get("data_type", "unknown")
         provider_user_id = payload.get("user_id", "unknown")
+        authority = self.authorize_webhook_ingress(
+            db,
+            provider_user_ids={str(provider_user_id)},
+        )
+        if str(provider_user_id) not in authority.provider_user_ids:
+            log_structured(
+                logger,
+                "info",
+                "Acknowledged Oura webhook without dispatch",
+                provider="oura",
+                trace_id=request_trace_id,
+                event_type=event_type,
+                data_type=data_type,
+                action="webhook_ingress_fenced",
+            )
+            return {"status": "accepted"}
 
         log_structured(
             logger,

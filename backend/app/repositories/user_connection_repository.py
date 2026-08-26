@@ -8,12 +8,21 @@ from sqlalchemy.orm import Query
 from sqlalchemy.orm.exc import MultipleResultsFound
 
 from app.database import DbSession
-from app.models import UserConnection
+from app.models import User, UserConnection
+from app.repositories.health_write_authority import (
+    HealthWriteAuthorityError,
+    require_health_write_authority,
+    require_user_connection_authority,
+)
 from app.repositories.repositories import CrudRepository
 from app.schemas.auth import ConnectionStatus
 from app.schemas.model_crud.user_management import (
     UserConnectionCreate,
     UserConnectionUpdate,
+)
+from app.services.provider_identity_authority import (
+    acquire_provider_identity_locks,
+    provider_identity_fingerprints,
 )
 
 logger = getLogger(__name__)
@@ -24,6 +33,149 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
 
     def __init__(self, model: type[UserConnection] = UserConnection):
         super().__init__(model)
+
+    @staticmethod
+    def _require_write_authority(
+        db_session: DbSession,
+        *,
+        user_id: UUID,
+        provider: str,
+    ) -> None:
+        require_health_write_authority(db_session, user_id=user_id, provider=provider)
+
+    def create(self, db_session: DbSession, creator: UserConnectionCreate) -> UserConnection:
+        acquire_provider_identity_locks(
+            db_session,
+            provider_identity_fingerprints(
+                creator.provider,
+                provider_user_id=creator.provider_user_id,
+                provider_username=creator.provider_username,
+            ),
+        )
+        self._require_write_authority(
+            db_session,
+            user_id=creator.user_id,
+            provider=creator.provider,
+        )
+        created = super().create(db_session, creator)
+        assert created is not None
+        return created
+
+    @staticmethod
+    def _lock_identity_update(
+        db_session: DbSession,
+        *,
+        connection_id: UUID,
+        expected_user_id: UUID,
+        expected_provider: str,
+        change_provider_user_id: bool,
+        provider_user_id: str | None,
+        change_provider_username: bool,
+        provider_username: str | None,
+    ) -> UserConnection:
+        """Lock old/new identities, then acquire and revalidate account authority.
+
+        An identity writer that committed while this transaction waited is
+        detected before the User lock is taken. The transaction restarts so
+        every acquired multi-identity lock set remains globally sorted.
+        """
+        while True:
+            observed = (
+                db_session.query(UserConnection)
+                .filter(UserConnection.id == connection_id)
+                .populate_existing()
+                .one_or_none()
+            )
+            if observed is None or observed.user_id != expected_user_id or observed.provider != expected_provider:
+                raise HealthWriteAuthorityError("Health connection authority changed")
+            # ``populate_existing`` refreshes an identity-mapped instance in
+            # place. Keep immutable scalars: comparing ``observed`` with a
+            # later query result would otherwise compare the same mutated
+            # Python object and miss an identity writer that committed while
+            # the advisory locks were being acquired.
+            observed_provider = observed.provider
+            observed_provider_user_id = observed.provider_user_id
+            observed_provider_username = observed.provider_username
+            next_provider_user_id = provider_user_id if change_provider_user_id else observed_provider_user_id
+            next_provider_username = provider_username if change_provider_username else observed_provider_username
+            identities = {
+                *provider_identity_fingerprints(
+                    observed_provider,
+                    provider_user_id=observed_provider_user_id,
+                    provider_username=observed_provider_username,
+                ),
+                *provider_identity_fingerprints(
+                    observed_provider,
+                    provider_user_id=next_provider_user_id,
+                    provider_username=next_provider_username,
+                ),
+            }
+            acquire_provider_identity_locks(db_session, identities)
+            refreshed = (
+                db_session.query(UserConnection)
+                .filter(UserConnection.id == connection_id)
+                .populate_existing()
+                .one_or_none()
+            )
+            if refreshed is None:
+                raise HealthWriteAuthorityError("Health connection authority changed")
+            if (
+                refreshed.provider != observed_provider
+                or refreshed.provider_user_id != observed_provider_user_id
+                or refreshed.provider_username != observed_provider_username
+            ):
+                db_session.rollback()
+                continue
+            current = require_user_connection_authority(
+                db_session,
+                connection_id=connection_id,
+                expected_user_id=expected_user_id,
+                expected_provider=expected_provider,
+            )
+            if (
+                current.provider == observed_provider
+                and current.provider_user_id == observed_provider_user_id
+                and current.provider_username == observed_provider_username
+            ):
+                return current
+            db_session.rollback()
+
+    def update(
+        self,
+        db_session: DbSession,
+        originator: UserConnection,
+        updater: UserConnectionUpdate,
+    ) -> UserConnection:
+        changes = updater.model_dump(exclude_none=True, exclude_unset=True)
+        current = self._lock_identity_update(
+            db_session,
+            connection_id=originator.id,
+            expected_user_id=originator.user_id,
+            expected_provider=originator.provider,
+            change_provider_user_id="provider_user_id" in changes,
+            provider_user_id=changes.get("provider_user_id"),
+            change_provider_username="provider_username" in changes,
+            provider_username=changes.get("provider_username"),
+        )
+        return super().update(db_session, current, updater)
+
+    def delete(self, db_session: DbSession, originator: UserConnection) -> UserConnection:
+        current = require_user_connection_authority(
+            db_session,
+            connection_id=originator.id,
+            expected_user_id=originator.user_id,
+            expected_provider=originator.provider,
+        )
+        return super().delete(db_session, current)
+
+    def delete_flush(self, db_session: DbSession, originator: UserConnection) -> None:
+        current = require_user_connection_authority(
+            db_session,
+            connection_id=originator.id,
+            expected_user_id=originator.user_id,
+            expected_provider=originator.provider,
+        )
+        super().delete_flush(db_session, current)
 
     def get_active_count(self, db_session: DbSession) -> int:
         """Get total count of active connections."""
@@ -88,6 +240,7 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         """Get connection for specific user and provider."""
         return (
             db_session.query(self.model)
+            .join(User, User.id == self.model.user_id)
             .filter(
                 and_(
                     self.model.user_id == user_id,
@@ -106,11 +259,13 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         """Get active connection for specific user and provider."""
         return (
             db_session.query(self.model)
+            .join(User, User.id == self.model.user_id)
             .filter(
                 and_(
                     self.model.user_id == user_id,
                     self.model.provider == provider,
                     self.model.status == ConnectionStatus.ACTIVE,
+                    User.health_write_state == "active",
                 ),
             )
             .one_or_none()
@@ -127,11 +282,13 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         """
         return (
             db_session.query(self.model)
+            .join(User, User.id == self.model.user_id)
             .filter(
                 and_(
                     self.model.provider == provider,
                     self.model.provider_user_id == provider_user_id,
                     self.model.status == ConnectionStatus.ACTIVE,
+                    User.health_write_state == "active",
                 )
             )
             .order_by(self.model.created_at.asc(), self.model.id.asc())
@@ -184,11 +341,13 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         try:
             return (
                 db_session.query(self.model)
+                .join(User, User.id == self.model.user_id)
                 .filter(
                     and_(
                         self.model.provider == provider,
                         self.model.provider_username == provider_username,
                         self.model.status == ConnectionStatus.ACTIVE,
+                        User.health_write_state == "active",
                     ),
                 )
                 .one_or_none()
@@ -222,9 +381,11 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
             return {}
         rows = (
             db_session.query(self.model.provider, self.model.provider_user_id, self.model.user_id)
+            .join(User, User.id == self.model.user_id)
             .filter(
                 and_(
                     self.model.status == ConnectionStatus.ACTIVE,
+                    User.health_write_state == "active",
                     self.model.user_id != exclude_user_id,
                     tuple_(self.model.provider, self.model.provider_user_id).in_(provider_pairs),
                 )
@@ -257,9 +418,11 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
 
         return (
             db_session.query(self.model)
+            .join(User, User.id == self.model.user_id)
             .filter(
                 and_(
                     self.model.status == ConnectionStatus.ACTIVE,
+                    User.health_write_state == "active",
                     self.model.token_expires_at <= threshold_time,
                 ),
             )
@@ -268,6 +431,7 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
 
     def disconnect(self, db_session: DbSession, user_id: UUID, provider: str) -> int:
         """Disconnect a provider in a single UPDATE query. Returns number of rows updated."""
+        self._require_write_authority(db_session, user_id=user_id, provider=provider)
         result = cast(
             CursorResult[tuple[()]],
             db_session.execute(
@@ -293,6 +457,12 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
 
     def mark_as_revoked(self, db_session: DbSession, connection: UserConnection) -> UserConnection:
         """Mark connection as revoked (when refresh token fails)."""
+        connection = require_user_connection_authority(
+            db_session,
+            connection_id=connection.id,
+            expected_user_id=connection.user_id,
+            expected_provider=connection.provider,
+        )
         connection.status = ConnectionStatus.REVOKED
         connection.updated_at = datetime.now(timezone.utc)
         db_session.add(connection)
@@ -302,6 +472,12 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
 
     def update_scope(self, db_session: DbSession, connection: UserConnection, scope: str | None) -> UserConnection:
         """Update connection scope (e.g. when user changes permissions on Garmin Connect)."""
+        connection = require_user_connection_authority(
+            db_session,
+            connection_id=connection.id,
+            expected_user_id=connection.user_id,
+            expected_provider=connection.provider,
+        )
         connection.scope = scope
         connection.updated_at = datetime.now(timezone.utc)
         db_session.add(connection)
@@ -318,6 +494,13 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         expires_in: int,
     ) -> UserConnection:
         """Update connection with new tokens after refresh."""
+
+        connection = require_user_connection_authority(
+            db_session,
+            connection_id=connection.id,
+            expected_user_id=connection.user_id,
+            expected_provider=connection.provider,
+        )
 
         connection.access_token = access_token
         if refresh_token:
@@ -341,6 +524,16 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         scope: str | None = None,
     ) -> UserConnection:
         """Update connection with new tokens and user info."""
+        connection = self._lock_identity_update(
+            db_session,
+            connection_id=connection.id,
+            expected_user_id=connection.user_id,
+            expected_provider=connection.provider,
+            change_provider_user_id=bool(provider_user_id and not connection.provider_user_id),
+            provider_user_id=provider_user_id,
+            change_provider_username=bool(provider_username and not connection.provider_username),
+            provider_username=provider_username,
+        )
         connection.access_token = access_token
         if refresh_token:
             connection.refresh_token = refresh_token
@@ -360,22 +553,39 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         db_session.refresh(connection)
         return connection
 
-    def update_last_synced_at(self, db_session: DbSession, connection: UserConnection) -> UserConnection:
+    def update_last_synced_at(
+        self,
+        db_session: DbSession,
+        connection: UserConnection,
+        *,
+        commit: bool = True,
+    ) -> UserConnection:
         """Update the last synced timestamp."""
+        connection = require_user_connection_authority(
+            db_session,
+            connection_id=connection.id,
+            expected_user_id=connection.user_id,
+            expected_provider=connection.provider,
+        )
         connection.last_synced_at = datetime.now(timezone.utc)
         db_session.add(connection)
-        db_session.commit()
-        db_session.refresh(connection)
+        if commit:
+            db_session.commit()
+            db_session.refresh(connection)
+        else:
+            db_session.flush()
         return connection
 
     def get_all_active_by_user(self, db_session: DbSession, user_id: UUID) -> list[UserConnection]:
         """Get all active connections for a specific user."""
         return (
             db_session.query(self.model)
+            .join(User, User.id == self.model.user_id)
             .filter(
                 and_(
                     self.model.user_id == user_id,
                     self.model.status == ConnectionStatus.ACTIVE,
+                    User.health_write_state == "active",
                 ),
             )
             .all()
@@ -386,7 +596,11 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         return [
             row.user_id
             for row in db_session.query(self.model.user_id)
-            .filter(self.model.status == ConnectionStatus.ACTIVE)
+            .join(User, User.id == self.model.user_id)
+            .filter(
+                self.model.status == ConnectionStatus.ACTIVE,
+                User.health_write_state == "active",
+            )
             .distinct()
             .all()
         ]
@@ -396,12 +610,19 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         db_session: DbSession,
         user_id: UUID,
         provider: str,
+        *,
+        commit: bool = True,
     ) -> UserConnection:
         """Ensure an SDK-based connection exists for a user and provider.
 
         SDK-based providers (like Apple Health) don't use OAuth tokens.
         This method creates or returns an existing connection without tokens.
         """
+        self._require_write_authority(
+            db_session,
+            user_id=user_id,
+            provider=provider,
+        )
         existing = self.get_by_user_and_provider(db_session, user_id, provider)
         if existing:
             # Reactivate if revoked
@@ -409,8 +630,11 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
                 existing.status = ConnectionStatus.ACTIVE
                 existing.updated_at = datetime.now(timezone.utc)
                 db_session.add(existing)
-                db_session.commit()
-                db_session.refresh(existing)
+                if commit:
+                    db_session.commit()
+                    db_session.refresh(existing)
+                else:
+                    db_session.flush()
             return existing
 
         # Create new SDK connection (no tokens needed)
@@ -426,6 +650,9 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
             updated_at=datetime.now(timezone.utc),
         )
         db_session.add(connection)
-        db_session.commit()
-        db_session.refresh(connection)
+        if commit:
+            db_session.commit()
+            db_session.refresh(connection)
+        else:
+            db_session.flush()
         return connection
