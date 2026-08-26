@@ -11,6 +11,7 @@ from app.models.user_invitation_code import UserInvitationCode
 from app.repositories.user_invitation_code_repository import UserInvitationCodeRepository
 from app.schemas.model_crud.credentials import (
     InvitationCodeRedeemResponse,
+    UserInvitationActivationPolicy,
     UserInvitationCodeCreate,
     UserInvitationCodeRead,
 )
@@ -36,6 +37,7 @@ class UserInvitationCodeService:
         db_session: DbSession,
         user_id: UUID,
         developer_id: UUID,
+        activation_policy: UserInvitationActivationPolicy | None = None,
     ) -> UserInvitationCodeRead:
         """Generate a new invitation code for a user."""
         user_service.get(db_session, user_id, raise_404=True)
@@ -48,6 +50,7 @@ class UserInvitationCodeService:
             user_id=user_id,
             created_by_id=developer_id,
             expires_at=now + timedelta(days=settings.user_invitation_code_expire_days),
+            activation_policy=(activation_policy.storage_value() if activation_policy is not None else None),
             created_at=now,
         )
         row = self.crud.create(db_session, code_data)
@@ -84,6 +87,7 @@ class UserInvitationCodeService:
             refresh_token=refresh_token,
             expires_in=settings.access_token_expire_minutes * 60,
             user_id=invitation_code.user_id,
+            activation_policy=invitation_code.activation_policy,
         )
 
 

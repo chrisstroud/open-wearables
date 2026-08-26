@@ -1,7 +1,7 @@
 from uuid import UUID
 from datetime import datetime
 
-from sqlalchemy import UniqueConstraint
+from sqlalchemy import Index, text
 from sqlalchemy.orm import Mapped
 
 from app.database import BaseDbModel
@@ -20,11 +20,21 @@ class DataPointSeries(BaseDbModel):
 
     __tablename__ = "data_point_series"
     __table_args__ = (
-        UniqueConstraint(
+        Index(
+            "uq_data_point_series_source_type_external_id",
+            "data_source_id",
+            "series_type_definition_id",
+            "external_id",
+            unique=True,
+            postgresql_where=text("external_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_data_point_series_source_type_time_legacy",
             "data_source_id",
             "series_type_definition_id",
             "recorded_at",
-            name="uq_data_point_series_source_type_time",
+            unique=True,
+            postgresql_where=text("external_id IS NULL"),
         ),
     )
 

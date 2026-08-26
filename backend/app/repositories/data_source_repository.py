@@ -1,8 +1,9 @@
 from typing import cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import CursorResult, and_, asc, delete, func
+from sqlalchemy import CursorResult, and_, asc, delete, func, select
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.sql.elements import ColumnElement
 
 from app.database import DbSession
@@ -11,6 +12,10 @@ from app.repositories.provider_priority_repository import ProviderPriorityReposi
 from app.repositories.repositories import CrudRepository
 from app.schemas.enums import DeviceType, ProviderName, infer_device_type_from_model, infer_device_type_from_source_name
 from app.schemas.model_crud.data_priority import DataSourceCreate, DataSourceUpdate
+
+
+class DataSourceProvenanceConflictError(RuntimeError):
+    """A legacy and canonical source identity cannot be merged safely."""
 
 
 class DataSourceRepository(
@@ -41,12 +46,79 @@ class DataSourceRepository(
         provider: ProviderName,
         device_model: str | None = None,
         source: str | None = None,
+        *,
+        for_update: bool = False,
     ) -> DataSource | None:
-        return (
-            db_session.query(self.model)
-            .filter(self._build_identity_filter(user_id, provider, device_model, source))
-            .one_or_none()
+        query = db_session.query(self.model).filter(
+            self._build_identity_filter(user_id, provider, device_model, source)
         )
+        if for_update:
+            query = query.with_for_update()
+        return query.one_or_none()
+
+    def _resolve_canonical_source_identity(
+        self,
+        db_session: DbSession,
+        *,
+        user_id: UUID,
+        provider: ProviderName,
+        device_model: str | None,
+        source: str,
+        software_version: str | None,
+        original_source_name: str,
+    ) -> DataSource | None:
+        """Adopt a legacy display-name identity without changing its row ID.
+
+        The transaction-scoped advisory lock serializes the absent-row check,
+        legacy adoption, and canonical insert across rolling workers. If both
+        identities already exist, choosing either would orphan or duplicate
+        accepted samples, so processing fails closed for explicit repair.
+        """
+        lock_identity = f"data-source-provenance:{user_id}:{provider.value}:{device_model or ''}:{source}"
+        db_session.execute(select(func.pg_advisory_xact_lock(func.hashtextextended(lock_identity, 0))))
+
+        canonical = self.get_by_identity(
+            db_session,
+            user_id,
+            provider,
+            device_model,
+            source,
+            for_update=True,
+        )
+        legacy = self.get_by_identity(
+            db_session,
+            user_id,
+            provider,
+            device_model,
+            original_source_name,
+            for_update=True,
+        )
+        if canonical is not None and legacy is not None and canonical.id != legacy.id:
+            raise DataSourceProvenanceConflictError("Ambiguous legacy and canonical data-source identities")
+
+        resolved = canonical or legacy
+        if resolved is None:
+            return None
+        if resolved is legacy:
+            try:
+                with db_session.begin_nested():
+                    resolved.source = source
+                    if resolved.original_source_name is None:
+                        resolved.original_source_name = original_source_name
+                    if software_version and resolved.software_version is None:
+                        resolved.software_version = software_version
+                    db_session.flush()
+            except IntegrityError as exc:
+                raise DataSourceProvenanceConflictError(
+                    "Canonical data-source identity appeared during legacy adoption"
+                ) from exc
+        else:
+            if resolved.original_source_name is None:
+                resolved.original_source_name = original_source_name
+            if software_version and resolved.software_version is None:
+                resolved.software_version = software_version
+            db_session.flush()
+        return resolved
 
     def ensure_data_source(
         self,
@@ -116,11 +188,41 @@ class DataSourceRepository(
         provider: ProviderName,
         user_connection_id: UUID | None,
         identities: set[tuple[UUID, str | None, str | None]],
+        *,
+        identity_metadata: dict[
+            tuple[UUID, str | None, str | None],
+            tuple[str | None, str | None],
+        ]
+        | None = None,
     ) -> dict[tuple[UUID, str | None, str | None], UUID]:
         if not identities:
             return {}
 
-        identities_list = list(identities)
+        result: dict[tuple[UUID, str | None, str | None], UUID] = {}
+        remaining_identities = set(identities)
+        if identity_metadata:
+            for identity in identities:
+                user_id, device_model, source = identity
+                software_version, original_source_name = identity_metadata.get(identity, (None, None))
+                if not source or not original_source_name or source == original_source_name:
+                    continue
+                resolved = self._resolve_canonical_source_identity(
+                    db_session,
+                    user_id=user_id,
+                    provider=provider,
+                    device_model=device_model,
+                    source=source,
+                    software_version=software_version,
+                    original_source_name=original_source_name,
+                )
+                if resolved is not None:
+                    result[identity] = resolved.id
+                    remaining_identities.remove(identity)
+
+        if not remaining_identities:
+            return result
+
+        identities_list = list(remaining_identities)
 
         from sqlalchemy import or_
 
@@ -130,9 +232,16 @@ class DataSourceRepository(
 
         existing = db_session.query(self.model).filter(or_(*conditions)).all()
 
-        result: dict[tuple[UUID, str | None, str | None], UUID] = {}
         for ds in existing:
-            result[(ds.user_id, ds.device_model, ds.source)] = ds.id
+            identity = (ds.user_id, ds.device_model, ds.source)
+            result[identity] = ds.id
+            metadata = identity_metadata.get(identity) if identity_metadata else None
+            if metadata:
+                software_version, original_source_name = metadata
+                if software_version and ds.software_version is None:
+                    object.__setattr__(ds, "software_version", software_version)
+                if original_source_name and ds.original_source_name is None:
+                    object.__setattr__(ds, "original_source_name", original_source_name)
 
         missing = [i for i in identities_list if i not in result]
 
@@ -140,6 +249,8 @@ class DataSourceRepository(
             values = []
             for user_id, device_model, source in missing:
                 device_type = self._infer_device_type(device_model, None)
+                metadata = identity_metadata.get((user_id, device_model, source)) if identity_metadata else None
+                software_version, original_source_name = metadata or (None, None)
                 values.append(
                     {
                         "id": uuid4(),
@@ -148,6 +259,8 @@ class DataSourceRepository(
                         "user_connection_id": user_connection_id,
                         "device_model": device_model,
                         "source": source,
+                        "software_version": software_version,
+                        "original_source_name": original_source_name,
                         "device_type": device_type.value if device_type != DeviceType.UNKNOWN else None,
                     }
                 )

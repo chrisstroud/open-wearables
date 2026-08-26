@@ -138,6 +138,12 @@ def create_celery() -> Celery:
             "args": (),
             "kwargs": {},
         },
+        "project-sdk-sleep-inbox-periodic": {
+            "task": "app.integrations.celery.tasks.project_sdk_sleep_inbox_task.project_sdk_sleep_inbox",
+            "schedule": float(settings.sleep_sync_interval_seconds),
+            "args": (),
+            "kwargs": {},
+        },
         "gc-stuck-garmin-backfills": {
             "task": "app.integrations.celery.tasks.garmin.gc_task.gc_stuck_backfills",
             "schedule": 180.0,  # Every 3 minutes

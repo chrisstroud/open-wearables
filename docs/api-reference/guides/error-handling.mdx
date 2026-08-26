@@ -153,9 +153,17 @@ GET /api/v1/oauth/garmin/authorize?user_id={user_id}
 
 **Solution:** Ensure UUIDs are in the correct format: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`
 
-### SDK Sync Payloads (Async Validation)
+### SDK Sync Payloads (Terminal Receipts)
 
-`POST /api/v1/sdk/users/{user_id}/sync` returns **202 Accepted** immediately and validates/imports the payload in a background worker. A malformed record does **not** produce a synchronous `400`/`422` — validation failures are surfaced via the batch's sync status (and internal error reporting), not the HTTP response. The endpoint returns `400` only for an unsupported `provider`.
+Send a stable UUID in `X-Open-Wearables-Batch-ID` with every upload and retry. `POST /api/v1/sdk/users/{user_id}/sync` returns **202 Accepted** while the batch is queued or processing; this is not a delivery acknowledgement. Poll `GET /api/v1/sdk/users/{user_id}/sync/{batch_id}` or replay the same POST and batch ID.
+
+A missing batch header returns retryable **425 Too Early** with `error_code: batch_id_required` before storage or dispatch. Upgrade the mobile SDK; do not discard or advance the local checkpoint.
+
+The server returns **200 OK** from the POST only after the worker durably finishes with `dropped_count: 0` and `tombstones_unresolved: 0`. A terminal validation, drop, or unresolved-deletion receipt returns **409 Conflict** and `accepted: false`. A retryable worker/dispatch failure returns **503 Service Unavailable** or a receipt with `retryable: true`; retry the identical payload and batch ID.
+
+Reusing a batch ID with a different user, provider, or payload digest returns **409 Conflict** and never dispatches the second payload.
+
+A bounded-window manifest is not accepted until every referenced batch has a successful zero-drop receipt and every durable sleep-inbox row referenced by those batches has been verified in the sleep projection. While sleep projection is pending, the manifest batch reports `error_code: window_sleep_projection_pending` with `retryable: true`; retry the identical manifest and batch ID. `GET /api/v1/sdk/users/{user_id}/sync-windows/{window_id}` returns **404 Not Found** until the immutable window receipt exists.
 
 ---
 

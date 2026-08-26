@@ -9,6 +9,7 @@ from app.utils.dates import ZoneOffset
 
 
 class TimeSeriesSample(BaseModel):
+    external_id: str | None = None
     timestamp: datetime
     zone_offset: ZoneOffset = None
     type: SeriesType

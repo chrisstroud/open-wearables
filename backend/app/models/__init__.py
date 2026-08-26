@@ -15,6 +15,9 @@ from .personal_record import PersonalRecord
 from .provider_priority import ProviderPriority
 from .provider_setting import ProviderSetting
 from .refresh_token import RefreshToken
+from .sdk_batch_receipt import SDKBatchReceipt
+from .sdk_sleep_inbox import SDKSleepInbox
+from .sdk_sync_window_receipt import SDKSyncWindowReceipt
 from .series_type_definition import SeriesTypeDefinition
 from .sleep_details import SleepDetails
 from .user import User
@@ -52,6 +55,9 @@ __all__ = [
     "PersonalRecord",
     "DataPointSeries",
     "SeriesTypeDefinition",
+    "SDKBatchReceipt",
+    "SDKSleepInbox",
+    "SDKSyncWindowReceipt",
     "HealthScore",
     "DetailType",
     "DETAIL_MODELS",

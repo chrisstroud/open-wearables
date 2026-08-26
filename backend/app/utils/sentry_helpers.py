@@ -13,6 +13,7 @@ def log_and_capture_error(
     *,
     level: str = "error",
     extra: dict | None = None,
+    include_exc_info: bool = True,
 ) -> None:
     """
     Log an error and capture it in Sentry.
@@ -26,6 +27,9 @@ def log_and_capture_error(
         message: Log message (can include format placeholders)
         level: Log level ('error', 'warning', 'info')
         extra: Optional extra context to attach to Sentry event
+        include_exc_info: Whether to attach the currently handled traceback to
+            the log record. Disable this when the original exception contains
+            sensitive input and ``exception`` is a sanitized replacement.
 
     Example:
         try:
@@ -43,12 +47,12 @@ def log_and_capture_error(
     # rejecting a token refresh) — log them but keep them out of Sentry. 5xx and
     # everything else stay alertable.
     if isinstance(exception, HTTPException) and 400 <= exception.status_code < 500:
-        logger.warning(message, exc_info=True)
+        logger.warning(message, exc_info=include_exc_info)
         return
 
     # Log with standard logger
     log_func = getattr(logger, level, logger.error)
-    log_func(message, exc_info=True)
+    log_func(message, exc_info=include_exc_info)
 
     # Capture in Sentry with optional extra context
     if extra:

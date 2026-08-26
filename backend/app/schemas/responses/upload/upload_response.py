@@ -22,3 +22,12 @@ class UploadDataResponse(BaseModel):
     )
     workouts_saved: int = Field(0, description="Workouts saved")
     sleep_saved: int = Field(0, description="Sleep records saved")
+    tombstones_received: int = Field(0, description="HealthKit tombstones received in this batch")
+    tombstones_applied: int = Field(0, description="Tombstones durably applied or already absent")
+    tombstones_unresolved: int = Field(0, description="Tombstones quarantined without advancing the client anchor")
+    tombstone_rows_deleted: int = Field(0, description="Stored rows removed while applying tombstones")
+    tombstone_error_code: str | None = Field(None, description="Typed reason when tombstones cannot be applied safely")
+    processing_error_code: str | None = Field(
+        None,
+        description="Typed terminal reason when an otherwise valid SDK item cannot be durably processed",
+    )

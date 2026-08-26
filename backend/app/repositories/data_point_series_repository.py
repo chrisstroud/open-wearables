@@ -35,6 +35,10 @@ from app.utils.pagination import decode_cursor
 DataSourceIdentity = tuple[UUID, str | None, str | None]
 
 
+class DataPointSourcePayloadConflictError(RuntimeError):
+    """One stable upstream sample ID carried contradictory payloads in a batch."""
+
+
 class WriteCounts(int):
     """Result of a bulk upsert: total rows written, split into new vs updated.
 
@@ -86,6 +90,7 @@ class DataPointSeriesRepository(
         for redundant_key in (
             "user_id",
             "source",
+            "original_source_name",
             "device_model",
             "provider",
             "user_connection_id",
@@ -138,12 +143,19 @@ class DataPointSeriesRepository(
 
         for provider, provider_creators in by_provider.items():
             unique_identities: set[DataSourceIdentity] = set()
+            identity_metadata: dict[DataSourceIdentity, tuple[str | None, str | None]] = {}
             user_connection_id = provider_creators[0].user_connection_id if provider_creators else None
             for c in provider_creators:
-                unique_identities.add((c.user_id, c.device_model, c.source))
+                identity = (c.user_id, c.device_model, c.source)
+                unique_identities.add(identity)
+                identity_metadata.setdefault(identity, (c.software_version, c.original_source_name))
 
             batch_result = self.data_source_repo.batch_ensure_data_sources(
-                db_session, provider, user_connection_id, unique_identities
+                db_session,
+                provider,
+                user_connection_id,
+                unique_identities,
+                identity_metadata=identity_metadata,
             )
             identity_to_source_id.update(batch_result)
 
@@ -188,35 +200,64 @@ class DataPointSeriesRepository(
             )
 
         if values_list:
-            # Deduplicate within the batch: PostgreSQL cannot upsert the same row
-            # twice in one INSERT. Keep the last value for each conflict key.
+            # PostgreSQL cannot upsert one conflict target twice in a statement.
+            # Exact duplicate source UUIDs coalesce, while contradictory payloads
+            # for the same UUID fail closed instead of depending on input order.
             deduped: dict[tuple, dict] = {}
             for v in values_list:
-                key = (v["data_source_id"], v["series_type_definition_id"], v["recorded_at"])
+                external_id = v["external_id"]
+                key = (
+                    ("external", v["data_source_id"], v["series_type_definition_id"], external_id)
+                    if external_id is not None
+                    else ("legacy", v["data_source_id"], v["series_type_definition_id"], v["recorded_at"])
+                )
+                prior = deduped.get(key)
+                if prior is not None and external_id is not None:
+                    comparable_fields = ("recorded_at", "zone_offset", "value", "is_daily_total")
+                    if any(prior[field] != v[field] for field in comparable_fields):
+                        raise DataPointSourcePayloadConflictError(
+                            "Stable external sample ID has contradictory payloads in one batch"
+                        )
                 deduped[key] = v
             values_list = list(deduped.values())
 
             inserted = 0
             updated = 0
-            for i in range(0, len(values_list), self.BATCH_INSERT_CHUNK_SIZE):
-                chunk = values_list[i : i + self.BATCH_INSERT_CHUNK_SIZE]
-                stmt = insert(self.model).values(chunk)
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=["data_source_id", "series_type_definition_id", "recorded_at"],
-                    set_={
-                        "value": stmt.excluded.value,
-                        "external_id": stmt.excluded.external_id,
-                        "zone_offset": stmt.excluded.zone_offset,
-                        "is_daily_total": stmt.excluded.is_daily_total,
-                    },
-                    # RETURNING (xmax = 0): true = row freshly inserted, false = hit a
-                    # conflict and was updated in place. Same statement, no extra round-trip.
-                ).returning(literal_column("(xmax = 0)"))
-                for is_insert in db_session.execute(stmt).scalars():
-                    if is_insert:
-                        inserted += 1
+            external_values = [value for value in values_list if value["external_id"] is not None]
+            legacy_values = [value for value in values_list if value["external_id"] is None]
+            for values, identity_kind in ((external_values, "external"), (legacy_values, "legacy")):
+                for i in range(0, len(values), self.BATCH_INSERT_CHUNK_SIZE):
+                    chunk = values[i : i + self.BATCH_INSERT_CHUNK_SIZE]
+                    stmt = insert(self.model).values(chunk)
+                    if identity_kind == "external":
+                        stmt = stmt.on_conflict_do_update(
+                            index_elements=["data_source_id", "series_type_definition_id", "external_id"],
+                            index_where=self.model.external_id.is_not(None),
+                            set_={
+                                "recorded_at": stmt.excluded.recorded_at,
+                                "value": stmt.excluded.value,
+                                "zone_offset": stmt.excluded.zone_offset,
+                                "is_daily_total": stmt.excluded.is_daily_total,
+                            },
+                        )
                     else:
-                        updated += 1
+                        stmt = stmt.on_conflict_do_update(
+                            index_elements=["data_source_id", "series_type_definition_id", "recorded_at"],
+                            index_where=self.model.external_id.is_(None),
+                            set_={
+                                "value": stmt.excluded.value,
+                                "zone_offset": stmt.excluded.zone_offset,
+                                "is_daily_total": stmt.excluded.is_daily_total,
+                            },
+                        )
+                    # RETURNING (xmax = 0): true = freshly inserted, false =
+                    # the same stable source identity was explicitly corrected.
+                    stmt = stmt.returning(literal_column("(xmax = 0)"))
+                    for is_insert in db_session.execute(stmt).scalars():
+                        if is_insert:
+                            inserted += 1
+                        else:
+                            updated += 1
             # NOTE: Caller should commit - allows batching multiple operations
             return WriteCounts(inserted, updated)
 
@@ -237,7 +278,11 @@ class DataPointSeriesRepository(
                     .filter(
                         self.model.data_source_id == creation.data_source_id,
                         self.model.series_type_definition_id == creation.series_type_definition_id,
-                        self.model.recorded_at == creation.recorded_at,
+                        (
+                            self.model.external_id == creation.external_id
+                            if creation.external_id is not None
+                            else self.model.recorded_at == creation.recorded_at
+                        ),
                     )
                     .first()
                 )
@@ -261,6 +306,7 @@ class DataPointSeriesRepository(
             device_model=creator.device_model,
             software_version=creator.software_version,
             source=creator.source,
+            original_source_name=creator.original_source_name,
         )
 
     def get_samples(

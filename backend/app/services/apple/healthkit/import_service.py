@@ -17,6 +17,8 @@ from app.constants.series_types.sdk import (
 )
 from app.constants.workout_types import get_unified_apple_workout_type_sdk
 from app.database import DbSession
+from app.repositories.data_point_series_repository import DataPointSourcePayloadConflictError
+from app.repositories.data_source_repository import DataSourceProvenanceConflictError
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.enums import SeriesType, daily_total_flag
 from app.schemas.model_crud.activities import (
@@ -34,6 +36,7 @@ from app.schemas.providers.mobile_sdk import (
     WorkoutStatistic,
 )
 from app.schemas.providers.mobile_sdk.sync_request import (
+    DeletedObject,
     MetricRecord,
     SleepRecord,
     SyncRequestData,
@@ -41,24 +44,40 @@ from app.schemas.providers.mobile_sdk.sync_request import (
 )
 from app.schemas.responses.upload import UploadDataResponse
 from app.services.event_record_service import event_record_service
+from app.services.sdk_sleep_inbox_service import sdk_sleep_inbox_service
+from app.services.sdk_sync_window_receipt_service import sdk_sync_window_receipt_service
 from app.services.timeseries_service import timeseries_service
 from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
 
-from .device_resolution import extract_device_info
+from .device_resolution import extract_device_info, extract_source_identifier
 from .sleep_service import handle_sleep_data
 
 # Health Connect's own mg/dL converter uses exactly 18.0, so values written to HC
 # in mg/dL round-trip with a ~0.1% offset under this factor.
 MMOL_L_TO_MG_DL = Decimal("18.0182")
 
-_SDK_ITEM_MODELS = (("records", MetricRecord), ("sleep", SleepRecord), ("workouts", Workout))
+_SDK_ITEM_MODELS = (
+    ("records", MetricRecord),
+    ("sleep", SleepRecord),
+    ("workouts", Workout),
+    ("deletions", DeletedObject),
+)
+
+_SUPPORTED_SCALAR_WORKOUT_STATISTICS = {
+    WorkoutStatisticType.DURATION.value,
+    WorkoutStatisticType.TOTAL_DURATION.value,
+    WorkoutStatisticType.ACTIVE_ENERGY_BURNED.value,
+    WorkoutStatisticType.BASAL_ENERGY_BURNED.value,
+    WorkoutStatisticType.CALORIES.value,
+    WorkoutStatisticType.TOTAL_CALORIES.value,
+}
 
 
 class InvalidRecord(TypedDict):
     """A single record dropped by per-record validation (PII-free — only the location, no values)."""
 
-    collection: str  # "records" | "sleep" | "workouts"
+    collection: str  # "records" | "sleep" | "workouts" | "deletions"
     index: int
     loc: str
     msg: str | None
@@ -72,6 +91,13 @@ class LoadDataResult(TypedDict):
     sleep_saved: int
     dropped: list[InvalidRecord]
     validation_ms: float
+    tombstones_received: int
+    tombstones_applied: int
+    tombstones_unresolved: int
+    tombstone_rows_deleted: int
+    tombstone_error_code: str | None
+    unprocessed_count: int
+    processing_error_code: str | None
 
 
 def _parse_sync_request(raw: dict) -> tuple[SDKSyncRequest, list[InvalidRecord]]:
@@ -115,9 +141,26 @@ def _parse_sync_request(raw: dict) -> tuple[SDKSyncRequest, list[InvalidRecord]]
     # Reconstruct via model_validate so Pydantic still rejects a bad envelope; `data` now
     # carries only the kept records.
     request = SDKSyncRequest.model_validate(
-        {**raw, "data": SyncRequestData(records=kept["records"], sleep=kept["sleep"], workouts=kept["workouts"])}
+        {
+            **raw,
+            "data": SyncRequestData(
+                records=kept["records"],
+                sleep=kept["sleep"],
+                workouts=kept["workouts"],
+                deletions=kept["deletions"],
+            ),
+        }
     )
     return request, dropped
+
+
+def _is_supported_workout_statistic(statistic: WorkoutStatistic) -> bool:
+    statistic_type = str(statistic.type)
+    return (
+        statistic_type in _SUPPORTED_SCALAR_WORKOUT_STATISTICS
+        or get_series_type_from_workout_statistic_type(statistic_type) is not None
+        or get_detail_field_from_workout_statistic_type(statistic_type) is not None
+    )
 
 
 class ImportService:
@@ -236,12 +279,14 @@ class ImportService:
 
             # Extract device info
             device_model, software_version, original_source_name = extract_device_info(rjson.source)
+            source_identifier = extract_source_identifier(rjson.source)
 
             sample = TimeSeriesSampleCreate(
                 id=uuid4(),
                 external_id=rjson.id,
                 user_id=user_uuid,
-                source=original_source_name,
+                source=source_identifier,
+                original_source_name=original_source_name,
                 device_model=device_model,
                 software_version=software_version,
                 provider=provider,
@@ -344,6 +389,7 @@ class ImportService:
         raw: dict,
         user_id: str,
         batch_id: str | None = None,
+        require_terminal_receipt: bool = False,
     ) -> LoadDataResult:
         """
         Load data into database and return counts of saved items plus per-record failures.
@@ -359,6 +405,314 @@ class ImportService:
         records_saved = 0
         sleep_saved = 0
         types: set[str] = set()
+
+        if request.syncWindow is not None:
+            if not require_terminal_receipt or batch_id is None:
+                return {
+                    "workouts_saved": 0,
+                    "records_saved": 0,
+                    "types": [],
+                    "sleep_saved": 0,
+                    "dropped": dropped,
+                    "validation_ms": validation_ms,
+                    "tombstones_received": 0,
+                    "tombstones_applied": 0,
+                    "tombstones_unresolved": 0,
+                    "tombstone_rows_deleted": 0,
+                    "tombstone_error_code": None,
+                    "unprocessed_count": 1,
+                    "processing_error_code": "sync_window_receipt_required",
+                }
+            if any(
+                (
+                    request.data.records,
+                    request.data.sleep,
+                    request.data.workouts,
+                    request.data.deletions,
+                )
+            ):
+                return {
+                    "workouts_saved": 0,
+                    "records_saved": 0,
+                    "types": [],
+                    "sleep_saved": 0,
+                    "dropped": dropped,
+                    "validation_ms": validation_ms,
+                    "tombstones_received": len(request.data.deletions),
+                    "tombstones_applied": 0,
+                    "tombstones_unresolved": len(request.data.deletions),
+                    "tombstone_rows_deleted": 0,
+                    "tombstone_error_code": None,
+                    "unprocessed_count": 1,
+                    "processing_error_code": "window_payload_not_metadata_only",
+                }
+            user_uuid = UUID(user_id)
+            try:
+                terminal_batch_id = UUID(batch_id)
+            except ValueError:
+                return {
+                    "workouts_saved": 0,
+                    "records_saved": 0,
+                    "types": [],
+                    "sleep_saved": 0,
+                    "dropped": dropped,
+                    "validation_ms": validation_ms,
+                    "tombstones_received": 0,
+                    "tombstones_applied": 0,
+                    "tombstones_unresolved": 0,
+                    "tombstone_rows_deleted": 0,
+                    "tombstone_error_code": None,
+                    "unprocessed_count": 1,
+                    "processing_error_code": "window_id_invalid",
+                }
+            acceptance = sdk_sync_window_receipt_service.accept(
+                db_session,
+                user_id=user_uuid,
+                provider=request.provider,
+                terminal_batch_id=terminal_batch_id,
+                manifest=request.syncWindow,
+            )
+            if not acceptance.accepted:
+                return {
+                    "workouts_saved": 0,
+                    "records_saved": 0,
+                    "types": [],
+                    "sleep_saved": 0,
+                    "dropped": dropped,
+                    "validation_ms": validation_ms,
+                    "tombstones_received": 0,
+                    "tombstones_applied": 0,
+                    "tombstones_unresolved": 0,
+                    "tombstone_rows_deleted": 0,
+                    "tombstone_error_code": None,
+                    "unprocessed_count": 1,
+                    "processing_error_code": acceptance.error_code or "window_not_accepted",
+                }
+            db_session.commit()
+            return {
+                "workouts_saved": 0,
+                "records_saved": 0,
+                "types": [],
+                "sleep_saved": 0,
+                "dropped": [],
+                "validation_ms": validation_ms,
+                "tombstones_received": 0,
+                "tombstones_applied": 0,
+                "tombstones_unresolved": 0,
+                "tombstone_rows_deleted": 0,
+                "tombstone_error_code": None,
+                "unprocessed_count": 0,
+                "processing_error_code": None,
+            }
+
+        invalid_tombstones = [item for item in dropped if item["collection"] == "deletions"]
+        if invalid_tombstones:
+            # A malformed deletion cannot be silently salvaged around additions:
+            # the phone must retain the whole page at its last acknowledged anchor.
+            return {
+                "workouts_saved": 0,
+                "records_saved": 0,
+                "types": [],
+                "sleep_saved": 0,
+                "dropped": dropped,
+                "validation_ms": validation_ms,
+                "tombstones_received": len(request.data.deletions) + len(invalid_tombstones),
+                "tombstones_applied": 0,
+                "tombstones_unresolved": len(invalid_tombstones),
+                "tombstone_rows_deleted": 0,
+                "tombstone_error_code": "invalid_tombstone",
+                "unprocessed_count": 0,
+                "processing_error_code": None,
+            }
+
+        if request.data.deletions:
+            # The downstream dashboard currently has no stable-ID retraction
+            # contract for canonical metric assertions or workouts. Accepting a
+            # server-side delete would therefore leave stale canonical facts.
+            # Keep every deletion-bearing batch at the phone checkpoint until an
+            # end-to-end immutable tombstone feed exists.
+            return {
+                "workouts_saved": 0,
+                "records_saved": 0,
+                "types": [],
+                "sleep_saved": 0,
+                "dropped": dropped,
+                "validation_ms": validation_ms,
+                "tombstones_received": len(request.data.deletions),
+                "tombstones_applied": 0,
+                "tombstones_unresolved": len(request.data.deletions),
+                "tombstone_rows_deleted": 0,
+                "tombstone_error_code": "deletion_projection_unsupported",
+                "unprocessed_count": 0,
+                "processing_error_code": None,
+            }
+
+        if require_terminal_receipt and dropped:
+            # Receipt-mode batches are atomic: salvage remains available to
+            # legacy tasks, but a terminal receipt can never follow a partial
+            # write whose invalid siblings remain on the phone.
+            return {
+                "workouts_saved": 0,
+                "records_saved": 0,
+                "types": [],
+                "sleep_saved": 0,
+                "dropped": dropped,
+                "validation_ms": validation_ms,
+                "tombstones_received": 0,
+                "tombstones_applied": 0,
+                "tombstones_unresolved": 0,
+                "tombstone_rows_deleted": 0,
+                "tombstone_error_code": None,
+                "unprocessed_count": 0,
+                "processing_error_code": "validation_failed",
+            }
+
+        records_without_source_id = [record for record in request.data.records if not record.id]
+        if require_terminal_receipt and records_without_source_id:
+            return {
+                "workouts_saved": 0,
+                "records_saved": 0,
+                "types": [],
+                "sleep_saved": 0,
+                "dropped": dropped,
+                "validation_ms": validation_ms,
+                "tombstones_received": 0,
+                "tombstones_applied": 0,
+                "tombstones_unresolved": 0,
+                "tombstone_rows_deleted": 0,
+                "tombstone_error_code": None,
+                "unprocessed_count": len(records_without_source_id),
+                "processing_error_code": "metric_source_id_required",
+            }
+
+        workouts_without_source_id = [workout for workout in request.data.workouts if not workout.id]
+        if require_terminal_receipt and workouts_without_source_id:
+            return {
+                "workouts_saved": 0,
+                "records_saved": 0,
+                "types": [],
+                "sleep_saved": 0,
+                "dropped": dropped,
+                "validation_ms": validation_ms,
+                "tombstones_received": 0,
+                "tombstones_applied": 0,
+                "tombstones_unresolved": 0,
+                "tombstone_rows_deleted": 0,
+                "tombstone_error_code": None,
+                "unprocessed_count": len(workouts_without_source_id),
+                "processing_error_code": "workout_source_id_required",
+            }
+
+        unsupported_metrics = [
+            record
+            for record in request.data.records
+            if record.type is None or get_series_type_from_metric_type(record.type) is None
+        ]
+        if require_terminal_receipt and unsupported_metrics:
+            # A syntactically valid but unmapped metric used to be silently
+            # skipped and then marked lineage-complete. Keep the entire batch
+            # unacknowledged so the phone's checkpoint cannot pass it.
+            return {
+                "workouts_saved": 0,
+                "records_saved": 0,
+                "types": [],
+                "sleep_saved": 0,
+                "dropped": dropped,
+                "validation_ms": validation_ms,
+                "tombstones_received": 0,
+                "tombstones_applied": 0,
+                "tombstones_unresolved": 0,
+                "tombstone_rows_deleted": 0,
+                "tombstone_error_code": None,
+                "unprocessed_count": len(unsupported_metrics),
+                "processing_error_code": "unsupported_metric_type",
+            }
+
+        unsupported_workout_statistics = [
+            statistic
+            for workout in request.data.workouts
+            for statistic in workout.values or []
+            if not _is_supported_workout_statistic(statistic)
+        ]
+        if require_terminal_receipt and unsupported_workout_statistics:
+            return {
+                "workouts_saved": 0,
+                "records_saved": 0,
+                "types": [],
+                "sleep_saved": 0,
+                "dropped": dropped,
+                "validation_ms": validation_ms,
+                "tombstones_received": 0,
+                "tombstones_applied": 0,
+                "tombstones_unresolved": 0,
+                "tombstone_rows_deleted": 0,
+                "tombstone_error_code": None,
+                "unprocessed_count": len(unsupported_workout_statistics),
+                "processing_error_code": "unsupported_workout_statistic_type",
+            }
+
+        user_uuid = UUID(user_id)
+        sleep_inbox_ids: tuple[UUID, ...] = ()
+        if require_terminal_receipt and request.data.sleep:
+            if batch_id is None:
+                return {
+                    "workouts_saved": 0,
+                    "records_saved": 0,
+                    "types": [],
+                    "sleep_saved": 0,
+                    "dropped": dropped,
+                    "validation_ms": validation_ms,
+                    "tombstones_received": 0,
+                    "tombstones_applied": 0,
+                    "tombstones_unresolved": 0,
+                    "tombstone_rows_deleted": 0,
+                    "tombstone_error_code": None,
+                    "unprocessed_count": len(request.data.sleep),
+                    "processing_error_code": "batch_id_invalid",
+                }
+            try:
+                sleep_batch_id = UUID(batch_id)
+            except ValueError:
+                return {
+                    "workouts_saved": 0,
+                    "records_saved": 0,
+                    "types": [],
+                    "sleep_saved": 0,
+                    "dropped": dropped,
+                    "validation_ms": validation_ms,
+                    "tombstones_received": 0,
+                    "tombstones_applied": 0,
+                    "tombstones_unresolved": 0,
+                    "tombstone_rows_deleted": 0,
+                    "tombstone_error_code": None,
+                    "unprocessed_count": len(request.data.sleep),
+                    "processing_error_code": "batch_id_invalid",
+                }
+            sleep_stage = sdk_sleep_inbox_service.stage(
+                db_session,
+                user_id=user_uuid,
+                provider=request.provider,
+                batch_id=sleep_batch_id,
+                records=request.data.sleep,
+            )
+            if sleep_stage.error_code:
+                return {
+                    "workouts_saved": 0,
+                    "records_saved": 0,
+                    "types": [],
+                    "sleep_saved": 0,
+                    "dropped": dropped,
+                    "validation_ms": validation_ms,
+                    "tombstones_received": 0,
+                    "tombstones_applied": 0,
+                    "tombstones_unresolved": 0,
+                    "tombstone_rows_deleted": 0,
+                    "tombstone_error_code": None,
+                    "unprocessed_count": len(request.data.sleep),
+                    "processing_error_code": sleep_stage.error_code,
+                }
+            sleep_saved = sleep_stage.staged_count
+            sleep_inbox_ids = sleep_stage.row_ids
 
         # Process workouts in batch
         workout_bundles = list(self._build_workout_bundles(request, user_id))
@@ -389,17 +743,45 @@ class ImportService:
         # Process time series samples (records)
         samples = self._build_statistic_bundles(request, user_id)
         if samples:
-            self.timeseries_service.bulk_create_samples(db_session, samples)
-            records_saved += len(samples)
+            try:
+                sample_writes = self.timeseries_service.bulk_create_samples(db_session, samples)
+            except (DataPointSourcePayloadConflictError, DataSourceProvenanceConflictError) as exc:
+                error_code = (
+                    "metric_source_payload_conflict"
+                    if isinstance(exc, DataPointSourcePayloadConflictError)
+                    else "source_identity_conflict"
+                )
+                return {
+                    "workouts_saved": 0,
+                    "records_saved": 0,
+                    "types": [],
+                    "sleep_saved": 0,
+                    "dropped": dropped,
+                    "validation_ms": validation_ms,
+                    "tombstones_received": 0,
+                    "tombstones_applied": 0,
+                    "tombstones_unresolved": 0,
+                    "tombstone_rows_deleted": 0,
+                    "tombstone_error_code": None,
+                    "unprocessed_count": len(samples),
+                    "processing_error_code": error_code,
+                }
+            records_saved += int(sample_writes)
             types.update(sample.series_type.value for sample in samples)
 
         # Commit all workout and timeseries changes in one transaction
         db_session.commit()
 
         # Process sleep (count sleep segments from input)
-        if request.data.sleep:
+        if request.data.sleep and not require_terminal_receipt:
             handle_sleep_data(db_session, request, user_id)
             sleep_saved = len(request.data.sleep)
+            db_session.commit()
+        elif sleep_inbox_ids:
+            sdk_sleep_inbox_service.schedule_projection(
+                user_id=user_uuid,
+                provider=request.provider,
+            )
 
         return {
             "workouts_saved": workouts_saved,
@@ -408,6 +790,13 @@ class ImportService:
             "sleep_saved": sleep_saved,
             "dropped": dropped,
             "validation_ms": validation_ms,
+            "tombstones_received": 0,
+            "tombstones_applied": 0,
+            "tombstones_unresolved": 0,
+            "tombstone_rows_deleted": 0,
+            "tombstone_error_code": None,
+            "unprocessed_count": 0,
+            "processing_error_code": None,
         }
 
     def import_data_from_request(
@@ -417,6 +806,7 @@ class ImportService:
         content_type: str,
         user_id: str,
         batch_id: str | None = None,
+        require_terminal_receipt: bool = False,
     ) -> UploadDataResponse:
         provider = "unknown"
         try:
@@ -446,12 +836,45 @@ class ImportService:
             records = inner_data.get("records")
             workouts = inner_data.get("workouts")
             sleep = inner_data.get("sleep")
+            deletions = inner_data.get("deletions")
             incoming_records = len(records) if isinstance(records, list) else 0
             incoming_workouts = len(workouts) if isinstance(workouts, list) else 0
             incoming_sleep = len(sleep) if isinstance(sleep, list) else 0
+            incoming_deletions = len(deletions) if isinstance(deletions, list) else 0
 
             # Load data and get saved counts
-            saved_counts = self.load_data(db_session, data, user_id=user_id, batch_id=batch_id)
+            saved_counts = self.load_data(
+                db_session,
+                data,
+                user_id=user_id,
+                batch_id=batch_id,
+                require_terminal_receipt=require_terminal_receipt,
+            )
+
+            if saved_counts["processing_error_code"]:
+                db_session.rollback()
+                return UploadDataResponse(
+                    status_code=409,
+                    response="SDK item quarantined because durable processing is unavailable",
+                    user_id=user_id,
+                    dropped_count=len(saved_counts.get("dropped") or []) + saved_counts["unprocessed_count"],
+                    processing_error_code=saved_counts["processing_error_code"],
+                )
+
+            if saved_counts["tombstones_unresolved"]:
+                db_session.rollback()
+                return UploadDataResponse(
+                    status_code=409,
+                    response="HealthKit deletion quarantined until end-to-end deletion projection is supported",
+                    user_id=user_id,
+                    dropped_count=len(saved_counts.get("dropped") or []),
+                    tombstones_received=saved_counts["tombstones_received"],
+                    tombstones_applied=saved_counts["tombstones_applied"],
+                    tombstones_unresolved=saved_counts["tombstones_unresolved"],
+                    tombstone_rows_deleted=saved_counts["tombstone_rows_deleted"],
+                    tombstone_error_code=saved_counts["tombstone_error_code"],
+                    processing_error_code=saved_counts["processing_error_code"],
+                )
 
             connection = self.user_connection_repo.get_by_user_and_provider(db_session, UUID(user_id), provider)
             if connection:
@@ -469,9 +892,12 @@ class ImportService:
                 incoming_records=incoming_records,
                 incoming_workouts=incoming_workouts,
                 incoming_sleep=incoming_sleep,
+                incoming_deletions=incoming_deletions,
                 records_saved=saved_counts["records_saved"],
                 workouts_saved=saved_counts["workouts_saved"],
                 sleep_saved=saved_counts["sleep_saved"],
+                tombstones_applied=saved_counts["tombstones_applied"],
+                tombstone_rows_deleted=saved_counts["tombstone_rows_deleted"],
                 validation_ms=saved_counts["validation_ms"],
             )
 
@@ -517,25 +943,35 @@ class ImportService:
                 status_code=200,
                 response="Import successful",
                 user_id=user_id,
-                dropped_count=len(dropped),
+                dropped_count=len(dropped) + saved_counts["unprocessed_count"],
                 records_saved=saved_counts["records_saved"],
                 types=saved_counts["types"],
                 workouts_saved=saved_counts["workouts_saved"],
                 sleep_saved=saved_counts["sleep_saved"],
+                tombstones_received=saved_counts["tombstones_received"],
+                tombstones_applied=saved_counts["tombstones_applied"],
+                tombstones_unresolved=saved_counts["tombstones_unresolved"],
+                tombstone_rows_deleted=saved_counts["tombstone_rows_deleted"],
+                tombstone_error_code=saved_counts["tombstone_error_code"],
+                processing_error_code=saved_counts["processing_error_code"],
             )
 
         except ValidationError as e:
+            db_session.rollback()
             # Reached ONLY when the envelope itself is invalid (provider/sdkVersion/
             # syncTimestamp/data shape) — _parse_sync_request re-raised because nothing was
             # salvageable. Per-record failures never reach here: they are collected inside
             # load_data and handled above as a partial success. Report + 400 the whole batch.
             errors = e.errors()
             first = errors[0] if errors else {}
-            # Drop `input` (raw record value — may contain health data/PII) and `url`
-            # before sending to Sentry; keep loc/msg/type. Preserve the 20-error cap.
-            safe_errors = [{k: v for k, v in err.items() if k not in ("input", "url")} for err in errors[:20]]
+            # Keep only loc/msg/type. Pydantic's raw exception string, `input`,
+            # `ctx`, and traceback can all include submitted health values.
+            safe_errors = [{key: err[key] for key in ("loc", "msg", "type") if key in err} for err in errors[:20]]
+            sanitized_error = ValueError(
+                f"SDK payload validation failed: {json.dumps(safe_errors, default=str, separators=(',', ':'))}"
+            )
             log_and_capture_error(
-                e,
+                sanitized_error,
                 self.log,
                 f"{provider} SDK payload failed validation for user {user_id}",
                 extra={
@@ -545,6 +981,7 @@ class ImportService:
                     "error_count": len(errors),
                     "errors": safe_errors,
                 },
+                include_exc_info=False,
             )
             log_structured(
                 self.log,
@@ -565,6 +1002,7 @@ class ImportService:
             )
 
         except Exception as e:
+            db_session.rollback()
             log_and_capture_error(
                 e,
                 self.log,

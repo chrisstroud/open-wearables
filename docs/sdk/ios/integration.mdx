@@ -61,6 +61,21 @@ graph TD
   **Building a standalone app with no backend of your own?** Invitation codes are an alternative - a single-use code the app redeems directly, no backend channel required. This is **not** the standard flow; it exists mainly for the [Open Wearables app](/app/introduction) and the [example apps](/sdk/flutter/example-app). If your app authenticates users against your own backend (the normal case), use the backend token flow above. See [Choosing an onboarding flow](/sdk#choosing-an-onboarding-flow).
 </Note>
 
+### Private activation-policy extension
+
+The dashboard.fitness private deployment may include an optional
+`activation_policy` when it creates a single-use invitation. Open Wearables
+stores that immutable object with the code and returns it unchanged from both
+invitation creation and redemption. The bounded fields are `purpose`,
+`window_version`, `lower_bound_inclusive`, `upper_bound_exclusive`, `timezone`,
+and `completed_day_count`; they contain no health values or reusable secret.
+
+The dashboard.fitness iOS companion requires a valid version-2 policy covering
+exactly 30 completed days at midnight in the supplied account timezone. It
+persists those exact bounds before its first HealthKit query. A legacy code
+whose redemption has no policy, or a malformed/different policy, is rejected
+before sign-in; request a fresh code from the website instead.
+
 ## Step 1: Backend Setup
 
 Your backend needs a single endpoint that generates access tokens for your users by calling the Open Wearables API and forwarding the tokens.
@@ -642,6 +657,66 @@ The SDK sends health data to:
 ```
 POST {host}/api/v1/sdk/users/{userId}/sync
 ```
+
+Every persisted outbox item supplies its stable UUID in the `X-Open-Wearables-Batch-ID` header. HTTP `202` means the worker has only queued or started the batch. The SDK keeps its HealthKit anchor and payload until the same POST returns a terminal `200` receipt with no dropped records or unresolved tombstones. Receipt state is also available from:
+
+```text
+GET {host}/api/v1/sdk/users/{userId}/sync/{batchId}
+```
+
+After all data batches in a bounded activation, archive, or post-archive catch-up window have terminal receipts, send one metadata-only `syncWindow` batch. Its header batch ID must equal `windowId`, `purpose` must be `activation`, `archive`, or `incremental`, and `windowVersion` is `2`. The manifest must cover the window with at least one accepted `batchId` or one explicitly terminal empty/no-access HealthKit type. Incremental catch-up manifests include the exact reconciliation bounds used for their anchored replay:
+
+```json
+{
+  "provider": "apple",
+  "sdkVersion": "2.0.0",
+  "syncTimestamp": "2026-08-25T12:00:00Z",
+  "data": {},
+  "syncWindow": {
+    "windowId": "6c36f778-dc8d-4fc1-a10f-0c32ed823dcc",
+    "purpose": "activation",
+    "windowVersion": 2,
+    "lowerBoundInclusive": "2026-07-26T00:00:00-04:00",
+    "upperBoundExclusive": "2026-08-25T00:00:00-04:00",
+    "batchIds": ["2ec78c0d-e272-46ec-b7b2-62cc1ddd87bd"],
+    "emptyOrNoAccessTypes": ["HKQuantityTypeIdentifierBodyMass"],
+    "reconciliationStartInclusive": "2026-08-24T00:00:00-04:00",
+    "reconciliationEndExclusive": "2026-08-25T00:00:00-04:00"
+  }
+}
+```
+
+The server accepts this authority only after every referenced batch succeeded with zero drops and zero unresolved tombstones. Sleep additions may terminal-succeed once their exact source payload is durable, but the whole-window receipt waits until every referenced sleep-inbox row is verified in the canonical sleep projection. A delayed sleep projector therefore returns the retryable manifest-batch error `window_sleep_projection_pending`; replay the identical manifest automatically.
+
+Accepted window manifests are immutable. Reusing a `windowId` with different bounds, purpose, version, batches, empty types, or reconciliation bounds returns a terminal conflict. Read accepted authority from either endpoint:
+
+```text
+GET {host}/api/v1/sdk/users/{userId}/sync-windows/{windowId}
+GET {host}/api/v1/sdk/users/{userId}/sync-windows?provider=apple&limit=200
+```
+
+The exact endpoint returns `200` with the accepted manifest or `404` while it is absent. The list endpoint returns `200` with newest accepted receipts first. The dashboard can use its scoped API key; an SDK token remains restricted to its bound user.
+
+Normalized metric provenance remains available from `GET /api/v1/users/{user_id}/timeseries`: `external_id` is the upstream HealthKit sample UUID, `source.source` is the bounded human-readable writer name, `source.source_identifier` is the bounded bundle/app identifier, and the existing `source.device`/`source.device_name` fields carry the bounded model or product-type descriptor. These fields preserve values supplied by HealthKit; the server does not infer a specific product brand from a generic manufacturer label. Metric identity uses two fail-closed paths: records with an `external_id` are unique by source, series type, and that stable upstream ID, while legacy records without an ID remain unique by source, series type, and timestamp. This preserves UUID-distinct samples recorded at the same instant and keeps exact UUID replays idempotent.
+
+Anchored HealthKit deletions use the UUID/type pair exposed by `HKDeletedObject` and the query type:
+
+```json
+{
+  "data": {
+    "deletions": [
+      {
+        "id": "0D45E1BA-44CF-4F8C-8E72-D6CDB0B133E5",
+        "type": "HKQuantityTypeIdentifierHeartRate"
+      }
+    ]
+  }
+}
+```
+
+Deletion-bearing uploads currently fail closed with the typed terminal error `deletion_projection_unsupported`. The server does not acknowledge metric, workout, or sleep tombstones until the downstream dashboard has a stable-ID retraction contract; the affected type remains on its last acknowledged anchor. Keep deletion pages partitioned by type so the SDK can quarantine only that type while unrelated types continue.
+
+Supported sleep additions are acknowledged at the batch layer only after their exact HealthKit UUID, source payload, and originating batch are committed to the durable SQL sleep inbox. Redis remains a projection cache, not delivery evidence. Automatic replay projects due inbox rows into the current sleep state and retries after lock, worker, or broker interruptions; the window fence above prevents the dashboard from declaring the bounded window complete before that projection is verified.
 
 Data is automatically normalized to the Open Wearables unified data model and can be accessed through the standard API endpoints.
 

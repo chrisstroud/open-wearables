@@ -5,9 +5,10 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any
+from typing import Annotated, Any, Literal
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.constants.series_types.sdk import SDKMetricType, SleepPhase, WorkoutStatisticType
 from app.constants.workout_types import SDKWorkoutType
@@ -70,7 +71,7 @@ class SourceInfo(BaseModel):
 class MetricRecord(BaseModel):
     """Health metric record from HealthKit (heart rate, steps, distance, etc.)."""
 
-    id: str | None = None
+    id: str | None = Field(default=None, max_length=100)
     parentId: str | None = None
     type: SDKMetricType | str | None = None
     startDate: datetime
@@ -126,6 +127,57 @@ class Workout(BaseModel):
     metadata: list[dict[str, Any]] | dict[str, Any] | None = None
 
 
+class DeletedObject(BaseModel):
+    """A HealthKit object deletion emitted by an anchored query.
+
+    ``HKDeletedObject`` exposes only the stable object UUID. The query's sample
+    type is carried alongside it so the server can select the correct storage
+    family without guessing from dates or source metadata.
+    """
+
+    id: str = Field(min_length=1, max_length=100)
+    type: str = Field(min_length=1, max_length=255)
+
+
+class SyncWindowManifest(BaseModel):
+    """Manifest proving one bounded mobile export window is durably complete."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    windowId: UUID
+    purpose: Literal["activation", "archive", "incremental"]
+    windowVersion: Literal[2]
+    lowerBoundInclusive: datetime
+    upperBoundExclusive: datetime
+    batchIds: list[UUID] = Field(default_factory=list)
+    emptyOrNoAccessTypes: list[Annotated[str, Field(min_length=1, max_length=255)]] = Field(default_factory=list)
+    reconciliationStartInclusive: datetime | None = None
+    reconciliationEndExclusive: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> SyncWindowManifest:
+        if self.lowerBoundInclusive.tzinfo is None or self.upperBoundExclusive.tzinfo is None:
+            raise ValueError("syncWindow bounds must include timezone offsets")
+        if self.lowerBoundInclusive >= self.upperBoundExclusive:
+            raise ValueError("syncWindow lowerBoundInclusive must precede upperBoundExclusive")
+        if not self.batchIds and not self.emptyOrNoAccessTypes:
+            raise ValueError("syncWindow must reference accepted batches or terminal empty/no-access types")
+        reconciliation_values = (
+            self.reconciliationStartInclusive,
+            self.reconciliationEndExclusive,
+        )
+        if (reconciliation_values[0] is None) != (reconciliation_values[1] is None):
+            raise ValueError("syncWindow reconciliation bounds must be supplied together")
+        if self.purpose == "incremental" and reconciliation_values[0] is None:
+            raise ValueError("incremental syncWindow requires reconciliation bounds")
+        if reconciliation_values[0] is not None and reconciliation_values[1] is not None:
+            if reconciliation_values[0].tzinfo is None or reconciliation_values[1].tzinfo is None:
+                raise ValueError("syncWindow reconciliation bounds must include timezone offsets")
+            if reconciliation_values[0] >= reconciliation_values[1]:
+                raise ValueError("syncWindow reconciliation start must precede its end")
+        return self
+
+
 class SyncRequestData(BaseModel):
     """Inner data structure for Apple HealthKit sync request.
 
@@ -143,6 +195,10 @@ class SyncRequestData(BaseModel):
     workouts: list[Workout] = Field(
         default_factory=list,
         description="Exercise/workout sessions with optional statistics (distance, heart rate, calories, etc.)",
+    )
+    deletions: list[DeletedObject] = Field(
+        default_factory=list,
+        description="HealthKit tombstones identified by source object UUID and HealthKit sample type.",
     )
 
 
@@ -167,6 +223,7 @@ class SyncRequest(BaseModel):
         default_factory=SyncRequestData,
         description="Container for health data arrays (records, sleep, workouts)",
     )
+    syncWindow: SyncWindowManifest | None = None
 
     class Config:
         json_schema_extra = {
