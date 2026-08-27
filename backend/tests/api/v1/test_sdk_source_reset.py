@@ -1103,9 +1103,7 @@ def test_multi_source_reset_reopens_only_after_verified_empty_and_rejects_target
             digest=reviewed.inventory_digest_sha256,
             resulting_policy="multi-source",
         )
-        changed_target = request.model_copy(
-            update={"resulting_health_source_policy": "apple-mobile-v2-only"}
-        )
+        changed_target = request.model_copy(update={"resulting_health_source_policy": "apple-mobile-v2-only"})
 
         fenced = sdk_source_reset_service.fence(db, user_id=user.id, request=request)
         assert fenced.health_write_state == "fenced"

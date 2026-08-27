@@ -57,9 +57,7 @@ def downgrade() -> None:
         )
     ).scalar_one()
     if multi_source_exists:
-        raise RuntimeError(
-            "Cannot downgrade multi-source health reset policy while multi-source state exists"
-        )
+        raise RuntimeError("Cannot downgrade multi-source health reset policy while multi-source state exists")
 
     op.drop_constraint(
         "ck_user_health_reset_resulting_source_policy",
