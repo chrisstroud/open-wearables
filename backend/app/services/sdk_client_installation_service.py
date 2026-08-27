@@ -94,7 +94,8 @@ class SDKClientInstallationService:
             )
         # Once an account has ever accepted a first-class client, legacy invite
         # credentials stay fenced even if every installation is later revoked.
-        user.health_source_policy = "apple-mobile-v2-only"
+        if user.health_source_policy != "multi-source":
+            user.health_source_policy = "apple-mobile-v2-only"
         if user.health_write_state == "awaiting-v2-pairing":
             user.health_write_state = "activating"
         existing = self.crud.get_for_update(db_session, registration.installation_id)
@@ -307,6 +308,7 @@ class SDKClientInstallationService:
         user_id: UUID,
         operation_id: UUID,
         expected_health_evidence_generation: int,
+        resulting_health_source_policy: str = "apple-mobile-v2-only",
         commit: bool = True,
     ) -> User:
         """Idempotently stop every health writer without deleting any evidence."""
@@ -317,6 +319,11 @@ class SDKClientInstallationService:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Health evidence generation changed")
         if user.health_write_state == "fenced":
             if user.health_reset_operation_id == operation_id:
+                if user.health_reset_resulting_source_policy != resulting_health_source_policy:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="Health reset resulting source policy changed",
+                    )
                 return user
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Another health reset is already active")
         if user.health_reset_operation_id == operation_id and user.health_write_state == "awaiting-v2-pairing":
@@ -324,9 +331,10 @@ class SDKClientInstallationService:
             return user
 
         now = self._now()
-        user.health_source_policy = "apple-mobile-v2-only"
+        user.health_source_policy = resulting_health_source_policy
         user.health_write_state = "fenced"
         user.health_reset_operation_id = operation_id
+        user.health_reset_resulting_source_policy = resulting_health_source_policy
         active = self.crud.get_active_for_user(db_session, user_id)
         if active is not None:
             active.status = "revoked"

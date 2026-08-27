@@ -15,11 +15,13 @@ from app.repositories.health_score_repository import HealthScoreRepository
 from app.repositories.health_write_authority import (
     HealthWriteAuthorityError,
     acquire_health_maintenance_authority,
+    require_health_write_authority,
 )
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.auth import ConnectionStatus
 from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.schemas.model_crud.activities import EventRecordCreate, EventRecordDetailCreate, HealthScoreCreate
+from app.schemas.model_crud.credentials import SDKClientRegistration
 from app.schemas.model_crud.user_management import UserConnectionCreate, UserConnectionUpdate
 from app.services.provider_identity_authority import (
     ProviderIdentityFingerprint,
@@ -27,6 +29,7 @@ from app.services.provider_identity_authority import (
     acquire_provider_identity_value_locks,
     provider_identity_fingerprints,
 )
+from app.services.sdk_client_installation_service import sdk_client_installation_service
 from tests.factories import DataSourceFactory, EventRecordFactory, UserConnectionFactory, UserFactory
 
 
@@ -178,6 +181,50 @@ def test_internal_score_requires_generation_bound_maintenance_authority(db: Sess
     repo.bulk_create(db, [creator])
     db.commit()
     assert db.get(HealthScore, creator.id) is not None
+
+
+def test_multi_source_allows_cloud_writes_but_apple_requires_current_v2_installation(db: Session) -> None:
+    user = UserFactory(
+        health_evidence_generation=1,
+        health_source_policy="multi-source",
+        health_write_state="active",
+    )
+    installation = sdk_client_installation_service.activate(
+        db,
+        user_id=user.id,
+        registration=SDKClientRegistration(
+            installation_id=uuid4(),
+            bundle_id="fitness.dashboard.app",
+            app_version="1.0.0",
+            build_number="1",
+            protocol_version=2,
+        ),
+    )
+    db.flush()
+
+    require_health_write_authority(db, user_id=user.id, provider=ProviderName.WHOOP)
+    with pytest.raises(HealthWriteAuthorityError, match="Current v2"):
+        require_health_write_authority(db, user_id=user.id, provider=ProviderName.APPLE)
+
+    db.info["health_write_authority"] = (
+        user.id,
+        user.health_evidence_generation,
+        installation.id,
+        installation.generation,
+    )
+    require_health_write_authority(db, user_id=user.id, provider=ProviderName.APPLE)
+    db.refresh(user)
+    assert user.health_source_policy == "multi-source"
+
+
+def test_apple_only_policy_still_rejects_cloud_writes(db: Session) -> None:
+    user = UserFactory(
+        health_evidence_generation=1,
+        health_source_policy="apple-mobile-v2-only",
+        health_write_state="active",
+    )
+    with pytest.raises(HealthWriteAuthorityError, match="Current v2"):
+        require_health_write_authority(db, user_id=user.id, provider=ProviderName.WHOOP)
 
 
 def test_event_record_direct_source_cannot_cross_account(db: Session) -> None:

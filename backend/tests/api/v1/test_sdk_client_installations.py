@@ -369,6 +369,54 @@ class TestSDKClientInstallationPairing:
         )
         assert legacy_mint.status_code == 409
 
+    def test_multi_source_pairing_preserves_cloud_policy_and_rejects_legacy_apple_upload(
+        self,
+        client: TestClient,
+        db: Session,
+        api_v1_prefix: str,
+    ) -> None:
+        developer = DeveloperFactory()
+        api_key = ApiKeyFactory(developer=developer)
+        user = UserFactory(
+            health_evidence_generation=1,
+            health_write_state="active",
+            health_source_policy="multi-source",
+        )
+        installation_id = uuid4()
+        code = generate_code(client, api_v1_prefix, user_id=user.id, developer_id=developer.id)
+
+        legacy_redeem = client.post(
+            f"{api_v1_prefix}/invitation-code/redeem",
+            json={"code": code},
+        )
+        paired = redeem(
+            client,
+            api_v1_prefix,
+            code=code,
+            client_registration=registration(installation_id),
+        )
+
+        assert legacy_redeem.status_code == 426
+        assert paired.status_code == 200
+        db.refresh(user)
+        assert user.health_write_state == "active"
+        assert user.health_source_policy == "multi-source"
+
+        api_key_upload = client.post(
+            f"{api_v1_prefix}/sdk/users/{user.id}/sync",
+            headers={
+                **api_key_headers(api_key.id),
+                "X-Open-Wearables-Batch-ID": str(uuid4()),
+            },
+            json={
+                "provider": "apple",
+                "sdkVersion": "1.0.0",
+                "syncTimestamp": "2026-08-27T12:00:00Z",
+                "data": {"records": [], "sleep": [], "workouts": [], "deletions": []},
+            },
+        )
+        assert api_key_upload.status_code == 403
+
 
 class TestSDKClientInstallationManagement:
     def test_api_key_lists_safe_projection_and_revoke_is_idempotent(
