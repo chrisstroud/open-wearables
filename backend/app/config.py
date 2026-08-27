@@ -213,7 +213,9 @@ class Settings(BaseSettings):
     whoop_client_id: str | None = None
     whoop_client_secret: SecretStr | None = None
     whoop_redirect_uri: str | None = None  # Deprecated: use API_BASE_URL
-    whoop_default_scope: str = "offline read:cycles read:sleep read:recovery read:workout"
+    whoop_default_scope: str = (
+        "offline read:profile read:body_measurement read:cycles read:sleep read:recovery read:workout"
+    )
 
     # SENSORBIO OAUTH SETTINGS
     sensorbio_client_id: str | None = None

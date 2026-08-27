@@ -86,17 +86,6 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
                     task="get_workouts",
                     user_id=str(user_id),
                 )
-                # If we got some data, return what we have; otherwise re-raise
-                if all_workouts:
-                    log_structured(
-                        self.logger,
-                        "warning",
-                        f"Returning partial workout data due to error: {e}",
-                        provider="whoop",
-                        task="get_workouts",
-                        user_id=str(user_id),
-                    )
-                    break
                 raise
 
         return all_workouts
@@ -391,17 +380,6 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
                     task="load_data",
                     user_id=str(user_id),
                 )
-                # If we got some data, continue processing; otherwise re-raise
-                if all_workouts:
-                    log_structured(
-                        self.logger,
-                        "warning",
-                        f"Processing partial workout data due to error: {e}",
-                        provider="whoop",
-                        task="load_data",
-                        user_id=str(user_id),
-                    )
-                    break
                 raise
 
         # Process and save all workouts
