@@ -20,7 +20,13 @@ from app.services.sdk_source_reset_external import (
     ObjectReference,
     RedisReference,
 )
-from tests.factories import DataSourceFactory, HealthScoreFactory, UserConnectionFactory, UserFactory
+from tests.factories import (
+    DataSourceFactory,
+    EventRecordFactory,
+    HealthScoreFactory,
+    UserConnectionFactory,
+    UserFactory,
+)
 
 
 class _FakeExternalPlanes:
@@ -168,7 +174,28 @@ def test_execute_deletes_only_shadow_whoop_state_and_preserves_keeper(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target, keeper, target_connection, keeper_connection = _seed_shared_whoop_pair(db)
-    _seed_target_whoop_evidence(db, target=target, connection=target_connection)
+    target_source = _seed_target_whoop_evidence(db, target=target, connection=target_connection)
+    target_sleep = EventRecordFactory(
+        data_source=target_source,
+        category="sleep",
+        type="sleep",
+        source_name="WHOOP",
+    )
+    HealthScoreFactory(
+        data_source=target_source,
+        user_id=target.id,
+        provider=ProviderName.INTERNAL,
+        category=HealthScoreCategory.RECOVERY,
+        value=Decimal("70"),
+    )
+    HealthScoreFactory(
+        data_source_id=None,
+        user_id=target.id,
+        provider=ProviderName.INTERNAL,
+        category=HealthScoreCategory.SLEEP,
+        value=Decimal("79"),
+        sleep_record_id=target_sleep.id,
+    )
     keeper_source = DataSourceFactory(
         user=keeper,
         provider=ProviderName.WHOOP,
@@ -202,6 +229,9 @@ def test_execute_deletes_only_shadow_whoop_state_and_preserves_keeper(
 
     assert plan.executable is True
     assert plan.blockers == ()
+    assert plan.counts["whoop_health_scores"] == 2
+    assert plan.counts["internal_health_scores"] == 2
+    assert plan.counts["target_health_scores"] == 4
     assert str(target.id) not in str(plan.public_dict())
     assert "shadow-access-token" not in str(plan.public_dict())
 
@@ -316,6 +346,7 @@ def test_execute_rejects_plan_drift_before_fencing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target, keeper, target_connection, _keeper_connection = _seed_shared_whoop_pair(db)
+    target_source = _seed_target_whoop_evidence(db, target=target, connection=target_connection)
     fake_external = _FakeExternalPlanes(target.id)
     monkeypatch.setattr(
         "app.services.founder_shadow_whoop_cleanup_service.sdk_source_reset_external_planes",
@@ -326,12 +357,13 @@ def test_execute_rejects_plan_drift_before_fencing(
         target_user_id=target.id,
         keeper_user_id=keeper.id,
     )
-    DataSourceFactory(
-        user=target,
+    HealthScoreFactory(
+        data_source=target_source,
+        user_id=target.id,
         provider=ProviderName.WHOOP,
-        user_connection_id=target_connection.id,
-        source="late-whoop-source",
-        device_model="late",
+        category=HealthScoreCategory.RECOVERY,
+        value=Decimal("73"),
+        recorded_at=datetime(2026, 8, 27, 12, tzinfo=timezone.utc),
     )
     db.flush()
 
@@ -356,6 +388,7 @@ def test_external_failure_leaves_prepared_state_that_can_be_replanned(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target, keeper, target_connection, _keeper_connection = _seed_shared_whoop_pair(db)
+    _seed_target_whoop_evidence(db, target=target, connection=target_connection)
     fake_external = _FakeExternalPlanes(target.id, fail_objects_once=True)
     monkeypatch.setattr(
         "app.services.founder_shadow_whoop_cleanup_service.sdk_source_reset_external_planes",
@@ -405,7 +438,8 @@ def test_plan_rejects_uuid_scoped_non_whoop_external_object(
     db: Session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    target, keeper, _target_connection, _keeper_connection = _seed_shared_whoop_pair(db)
+    target, keeper, target_connection, _keeper_connection = _seed_shared_whoop_pair(db)
+    _seed_target_whoop_evidence(db, target=target, connection=target_connection)
     fake_external = _FakeExternalPlanes(target.id, non_whoop_object=True)
     monkeypatch.setattr(
         "app.services.founder_shadow_whoop_cleanup_service.sdk_source_reset_external_planes",
@@ -420,6 +454,170 @@ def test_plan_rejects_uuid_scoped_non_whoop_external_object(
 
     assert plan.executable is False
     assert "founder-shadow.external-object-is-not-exact-whoop" in plan.blockers
+    assert fake_external.erase_object_calls == 0
+
+
+def test_plan_rejects_internal_score_outside_shadow_whoop_closure(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target, keeper, target_connection, keeper_connection = _seed_shared_whoop_pair(db)
+    _seed_target_whoop_evidence(db, target=target, connection=target_connection)
+    keeper_source = DataSourceFactory(
+        user=keeper,
+        provider=ProviderName.WHOOP,
+        user_connection_id=keeper_connection.id,
+        source="whoop_api",
+    )
+    keeper_event = EventRecordFactory(
+        data_source=keeper_source,
+        category="sleep",
+        type="sleep",
+        source_name="WHOOP",
+    )
+    HealthScoreFactory(
+        data_source=keeper_source,
+        user_id=target.id,
+        provider=ProviderName.INTERNAL,
+        category=HealthScoreCategory.RECOVERY,
+    )
+    HealthScoreFactory(
+        data_source_id=None,
+        user_id=target.id,
+        provider=ProviderName.INTERNAL,
+        category=HealthScoreCategory.SLEEP,
+        sleep_record_id=keeper_event.id,
+    )
+    db.flush()
+    monkeypatch.setattr(
+        "app.services.founder_shadow_whoop_cleanup_service.sdk_source_reset_external_planes",
+        _FakeExternalPlanes(target.id),
+    )
+
+    plan = founder_shadow_whoop_cleanup_service.plan(
+        db,
+        target_user_id=target.id,
+        keeper_user_id=keeper.id,
+    )
+
+    assert plan.executable is False
+    assert "founder-shadow.target-score-source-mismatch" in plan.blockers
+    assert "founder-shadow.target-score-event-mismatch" in plan.blockers
+
+
+def test_plan_rejects_cross_user_score_references_into_shadow_whoop_closure(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target, keeper, target_connection, _keeper_connection = _seed_shared_whoop_pair(db)
+    target_source = _seed_target_whoop_evidence(db, target=target, connection=target_connection)
+    target_event = EventRecordFactory(
+        data_source=target_source,
+        category="sleep",
+        type="sleep",
+        source_name="WHOOP",
+    )
+    HealthScoreFactory(
+        data_source=target_source,
+        user_id=keeper.id,
+        provider=ProviderName.INTERNAL,
+        category=HealthScoreCategory.RECOVERY,
+    )
+    HealthScoreFactory(
+        data_source_id=None,
+        user_id=keeper.id,
+        provider=ProviderName.INTERNAL,
+        category=HealthScoreCategory.SLEEP,
+        sleep_record_id=target_event.id,
+    )
+    db.flush()
+    monkeypatch.setattr(
+        "app.services.founder_shadow_whoop_cleanup_service.sdk_source_reset_external_planes",
+        _FakeExternalPlanes(target.id),
+    )
+
+    plan = founder_shadow_whoop_cleanup_service.plan(
+        db,
+        target_user_id=target.id,
+        keeper_user_id=keeper.id,
+    )
+
+    assert plan.executable is False
+    assert "founder-shadow.cross-owner-health-score-source-reference" in plan.blockers
+    assert "founder-shadow.cross-owner-health-score-event-reference" in plan.blockers
+
+
+def test_plan_rejects_unexpected_target_score_provider(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target, keeper, target_connection, _keeper_connection = _seed_shared_whoop_pair(db)
+    _seed_target_whoop_evidence(db, target=target, connection=target_connection)
+    HealthScoreFactory(
+        data_source_id=None,
+        user_id=target.id,
+        provider=ProviderName.GARMIN,
+        category=HealthScoreCategory.RECOVERY,
+    )
+    db.flush()
+    monkeypatch.setattr(
+        "app.services.founder_shadow_whoop_cleanup_service.sdk_source_reset_external_planes",
+        _FakeExternalPlanes(target.id),
+    )
+
+    plan = founder_shadow_whoop_cleanup_service.plan(
+        db,
+        target_user_id=target.id,
+        keeper_user_id=keeper.id,
+    )
+
+    assert plan.executable is False
+    assert "founder-shadow.other-provider-health-score-present" in plan.blockers
+
+
+def test_execute_rejects_target_score_payload_drift_before_fencing(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target, keeper, target_connection, _keeper_connection = _seed_shared_whoop_pair(db)
+    target_source = _seed_target_whoop_evidence(db, target=target, connection=target_connection)
+    internal_score = cast(
+        HealthScore,
+        HealthScoreFactory(
+            data_source=target_source,
+            user_id=target.id,
+            provider=ProviderName.INTERNAL,
+            category=HealthScoreCategory.RECOVERY,
+            value=Decimal("70"),
+        ),
+    )
+    db.flush()
+    fake_external = _FakeExternalPlanes(target.id)
+    monkeypatch.setattr(
+        "app.services.founder_shadow_whoop_cleanup_service.sdk_source_reset_external_planes",
+        fake_external,
+    )
+    plan = founder_shadow_whoop_cleanup_service.plan(
+        db,
+        target_user_id=target.id,
+        keeper_user_id=keeper.id,
+    )
+    internal_score.value = Decimal("71")
+    db.flush()
+
+    with pytest.raises(FounderShadowWhoopCleanupError) as exc_info:
+        founder_shadow_whoop_cleanup_service.execute(
+            db,
+            target_user_id=target.id,
+            keeper_user_id=keeper.id,
+            expected_plan_sha256=plan.plan_digest_sha256,
+        )
+
+    assert exc_info.value.blockers == ("founder-shadow.plan-digest-mismatch",)
+    db.refresh(target)
+    db.refresh(target_connection)
+    assert target.health_write_state == "active"
+    assert target_connection.status == ConnectionStatus.ACTIVE
     assert fake_external.erase_object_calls == 0
 
 
