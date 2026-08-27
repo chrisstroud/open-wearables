@@ -48,7 +48,9 @@ from app.services.sdk_source_reset_external import (
 )
 
 WHOOP = ProviderName.WHOOP.value
-_PLAN_VERSION = 1
+INTERNAL = ProviderName.INTERNAL.value
+_PLAN_VERSION = 2
+_ALLOWED_SCORE_PROVIDERS = frozenset({WHOOP, INTERNAL})
 _SDK_MODELS = (
     SDKUploadInbox,
     SDKSyncWindowReceipt,
@@ -138,7 +140,7 @@ class FounderShadowWhoopCleanupService:
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
         return hmac.new(
             settings.secret_key.encode(),
-            f"founder-shadow-whoop-cleanup:v1:{label}\0{canonical}".encode(),
+            f"founder-shadow-whoop-cleanup:v2:{label}\0{canonical}".encode(),
             hashlib.sha256,
         ).hexdigest()
 
@@ -287,6 +289,8 @@ class FounderShadowWhoopCleanupService:
         )
         whoop_sources = [row for row in target_source_rows if cls._provider_value(row.provider) == WHOOP]
         other_sources = [row for row in target_source_rows if cls._provider_value(row.provider) != WHOOP]
+        if len(whoop_sources) != 1:
+            blockers.append("founder-shadow.target-source-count-invalid")
         if other_sources:
             blockers.append("founder-shadow.other-provider-data-source-present")
         if target_connection is not None and any(
@@ -316,14 +320,18 @@ class FounderShadowWhoopCleanupService:
             db_session.query(HealthScore).filter(HealthScore.user_id == target_user_id).order_by(HealthScore.id).all()
         )
         whoop_scores = [row for row in target_score_rows if cls._provider_value(row.provider) == WHOOP]
-        if any(cls._provider_value(row.provider) != WHOOP for row in target_score_rows):
+        internal_scores = [row for row in target_score_rows if cls._provider_value(row.provider) == INTERNAL]
+        if any(cls._provider_value(row.provider) not in _ALLOWED_SCORE_PROVIDERS for row in target_score_rows):
             blockers.append("founder-shadow.other-provider-health-score-present")
         allowed_source_ids = set(source_ids)
         allowed_event_ids = set(event_ids)
-        if any(row.data_source_id is not None and row.data_source_id not in allowed_source_ids for row in whoop_scores):
+        if any(
+            row.data_source_id is not None and row.data_source_id not in allowed_source_ids for row in target_score_rows
+        ):
             blockers.append("founder-shadow.target-score-source-mismatch")
         if any(
-            row.sleep_record_id is not None and row.sleep_record_id not in allowed_event_ids for row in whoop_scores
+            row.sleep_record_id is not None and row.sleep_record_id not in allowed_event_ids
+            for row in target_score_rows
         ):
             blockers.append("founder-shadow.target-score-event-mismatch")
         if (
@@ -331,7 +339,7 @@ class FounderShadowWhoopCleanupService:
             and db_session.query(HealthScore)
             .filter(
                 HealthScore.data_source_id.in_(source_ids),
-                or_(HealthScore.user_id != target_user_id, HealthScore.provider != ProviderName.WHOOP),
+                HealthScore.user_id != target_user_id,
             )
             .count()
         ):
@@ -341,7 +349,7 @@ class FounderShadowWhoopCleanupService:
             and db_session.query(HealthScore)
             .filter(
                 HealthScore.sleep_record_id.in_(event_ids),
-                or_(HealthScore.user_id != target_user_id, HealthScore.provider != ProviderName.WHOOP),
+                HealthScore.user_id != target_user_id,
             )
             .count()
         ):
@@ -381,9 +389,11 @@ class FounderShadowWhoopCleanupService:
             "identity_connections": len(identity_owner_ids),
             "whoop_data_sources": len(whoop_sources),
             "whoop_health_scores": len(whoop_scores),
+            "internal_health_scores": len(internal_scores),
+            "target_health_scores": len(target_score_rows),
             "whoop_event_records": len(event_ids),
             "other_provider_rows": len(other_sources)
-            + sum(cls._provider_value(row.provider) != WHOOP for row in target_score_rows)
+            + sum(cls._provider_value(row.provider) not in _ALLOWED_SCORE_PROVIDERS for row in target_score_rows)
             + sum(row.provider != WHOOP for row in target_connections),
             "sdk_or_reset_rows": sum(sdk_counts.values()),
         }
@@ -396,7 +406,8 @@ class FounderShadowWhoopCleanupService:
             "identity_owners": cls._ids_digest("identity-owners", identity_owner_ids),
             "source_ids": cls._ids_digest("source-ids", source_ids),
             "event_ids": cls._ids_digest("event-ids", event_ids),
-            "score_ids": cls._ids_digest("score-ids", tuple(row.id for row in whoop_scores)),
+            "score_ids": cls._ids_digest("score-ids", tuple(row.id for row in target_score_rows)),
+            "score_rows": cls._rows_digest("target-score-rows", tuple(target_score_rows)),
             "sdk_counts": sdk_counts,
             "blockers": sorted(set(blockers)),
         }
@@ -674,7 +685,7 @@ class FounderShadowWhoopCleanupService:
         )
         db_session.query(HealthScore).filter(
             HealthScore.user_id == target_user_id,
-            HealthScore.provider == ProviderName.WHOOP,
+            HealthScore.provider.in_((ProviderName.WHOOP, ProviderName.INTERNAL)),
         ).delete(synchronize_session=False)
         db_session.query(DataSource).filter(
             DataSource.user_id == target_user_id,
