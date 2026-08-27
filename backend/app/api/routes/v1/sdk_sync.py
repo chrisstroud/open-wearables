@@ -191,7 +191,7 @@ async def sync_sdk_data(
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     if auth.auth_type == "api_key" and (
-        user.health_source_policy == "apple-mobile-v2-only"
+        user.health_source_policy != "legacy-mixed"
         or bool(sdk_client_installation_service.crud.list_for_user(db, user_uuid))
     ):
         raise HTTPException(

@@ -18,8 +18,13 @@ class User(BaseDbModel):
             name="ck_user_health_write_state",
         ),
         CheckConstraint(
-            "health_source_policy IN ('legacy-mixed', 'apple-mobile-v2-only')",
+            "health_source_policy IN ('legacy-mixed', 'apple-mobile-v2-only', 'multi-source')",
             name="ck_user_health_source_policy",
+        ),
+        CheckConstraint(
+            "health_reset_resulting_source_policy IS NULL OR "
+            "health_reset_resulting_source_policy IN ('apple-mobile-v2-only', 'multi-source')",
+            name="ck_user_health_reset_resulting_source_policy",
         ),
         CheckConstraint(
             "health_evidence_generation >= 0",
@@ -40,6 +45,7 @@ class User(BaseDbModel):
     health_reset_manifest_counts: Mapped[dict[str, int] | None] = mapped_column(JSONB, nullable=True)
     health_reset_deleted_counts: Mapped[dict[str, int] | None] = mapped_column(JSONB, nullable=True)
     health_reset_applied_at: Mapped[datetime | None]
+    health_reset_resulting_source_policy: Mapped[str | None] = mapped_column(String(32), nullable=True)
     health_write_state: Mapped[str] = mapped_column(String(32), default="active", server_default="active")
     health_source_policy: Mapped[str] = mapped_column(
         String(32),

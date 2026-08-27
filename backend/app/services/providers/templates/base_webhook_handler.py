@@ -120,7 +120,8 @@ class BaseWebhookHandler(ABC):
         connection lookup. This serializes raw storage and enqueueing with source reset:
         once reset fences an account, a provider callback can only be acknowledged and
         dropped. ``apple-mobile-v2-only`` remains closed to every cloud-provider ingress
-        even after the paired Apple installation makes the account active again.
+        even after the paired Apple installation makes the account active again, while
+        ``multi-source`` explicitly permits current cloud connections alongside Apple v2.
         """
         requested_user_ids = self._bounded_webhook_identities(provider_user_ids or set())
         requested_usernames = self._bounded_webhook_identities(provider_usernames or set())
@@ -162,7 +163,7 @@ class BaseWebhookHandler(ABC):
         permitted_user_ids = {
             user.id
             for user in locked_users
-            if user.health_write_state == "active" and user.health_source_policy == "legacy-mixed"
+            if user.health_write_state == "active" and user.health_source_policy in {"legacy-mixed", "multi-source"}
         }
         if not permitted_user_ids:
             return WebhookIngressAuthority(frozenset(), frozenset())

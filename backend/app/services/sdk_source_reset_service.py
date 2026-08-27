@@ -507,8 +507,12 @@ class SDKSourceResetService:
                 user.health_write_state,
             ),
             health_source_policy=cast(
-                Literal["legacy-mixed", "apple-mobile-v2-only"],
+                Literal["legacy-mixed", "apple-mobile-v2-only", "multi-source"],
                 user.health_source_policy,
+            ),
+            resulting_health_source_policy=cast(
+                Literal["apple-mobile-v2-only", "multi-source"] | None,
+                user.health_reset_resulting_source_policy,
             ),
             active_installation_id=active.id if active is not None else None,
             active_installation_generation=active.generation if active is not None else None,
@@ -532,6 +536,24 @@ class SDKSourceResetService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
         return user
 
+    @staticmethod
+    def _terminal_write_state(
+        resulting_source_policy: Literal["apple-mobile-v2-only", "multi-source"],
+    ) -> Literal["active", "awaiting-v2-pairing"]:
+        return "active" if resulting_source_policy == "multi-source" else "awaiting-v2-pairing"
+
+    @staticmethod
+    def _require_resulting_source_policy(user: User, request: SDKHealthResetTransitionRequest) -> None:
+        if (
+            user.health_reset_operation_id == request.operation_id
+            and user.health_reset_resulting_source_policy is not None
+            and user.health_reset_resulting_source_policy != request.resulting_health_source_policy
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Health reset resulting source policy changed",
+            )
+
     def inspect(
         self,
         db_session: DbSession,
@@ -540,9 +562,11 @@ class SDKSourceResetService:
         request: SDKHealthResetTransitionRequest,
     ) -> SDKHealthResetStateRead:
         user = self._require_user(db_session, user_id, for_update=False)
+        self._require_resulting_source_policy(user, request)
+        terminal_state = self._terminal_write_state(request.resulting_health_source_policy)
         same_applied_operation = (
             user.health_reset_operation_id == request.operation_id
-            and user.health_write_state in {"fenced", "awaiting-v2-pairing"}
+            and user.health_write_state in {"fenced", terminal_state}
             and user.health_evidence_generation == request.expected_health_evidence_generation + 1
             and user.health_reset_applied_at is not None
         )
@@ -574,6 +598,7 @@ class SDKSourceResetService:
         request: SDKHealthResetTransitionRequest,
     ) -> SDKHealthResetStateRead:
         user = self._require_user(db_session, user_id, for_update=True)
+        self._require_resulting_source_policy(user, request)
         resuming = (
             user.health_write_state == "fenced"
             and user.health_reset_operation_id == request.operation_id
@@ -606,6 +631,7 @@ class SDKSourceResetService:
                 user_id=user_id,
                 operation_id=request.operation_id,
                 expected_health_evidence_generation=request.expected_health_evidence_generation,
+                resulting_health_source_policy=request.resulting_health_source_policy,
                 commit=False,
             )
             user.health_reset_manifest_sha256 = inventory.inventory_digest_sha256
@@ -665,6 +691,7 @@ class SDKSourceResetService:
             identity_scope=identity_scope,
         )
         user = self._require_user(db_session, user_id, for_update=True)
+        self._require_resulting_source_policy(user, request)
         connections = (
             db_session.query(UserConnection)
             .filter(UserConnection.user_id == user_id)
@@ -707,6 +734,7 @@ class SDKSourceResetService:
             identity_scope=identity_scope,
         )
         user = self._require_user(db_session, user_id, for_update=True)
+        self._require_resulting_source_policy(user, request)
         if (
             user.health_write_state != "fenced"
             or user.health_reset_operation_id != request.operation_id
@@ -751,6 +779,7 @@ class SDKSourceResetService:
         request: SDKHealthResetTransitionRequest,
     ) -> SDKHealthResetStateRead:
         user = self._require_user(db_session, user_id, for_update=True)
+        self._require_resulting_source_policy(user, request)
         if (
             user.health_reset_operation_id != request.operation_id
             or user.health_write_state != "fenced"
@@ -832,10 +861,12 @@ class SDKSourceResetService:
         request: SDKHealthResetTransitionRequest,
     ) -> SDKHealthResetStateRead:
         observed_user = self._require_user(db_session, user_id, for_update=False)
+        self._require_resulting_source_policy(observed_user, request)
+        terminal_state = self._terminal_write_state(request.resulting_health_source_policy)
         observed_database_applied = (
             observed_user.health_reset_operation_id == request.operation_id
             and observed_user.health_evidence_generation == request.expected_health_evidence_generation + 1
-            and observed_user.health_write_state in {"fenced", "awaiting-v2-pairing"}
+            and observed_user.health_write_state in {"fenced", terminal_state}
             and observed_user.health_reset_manifest_sha256 == request.expected_inventory_digest_sha256
             and observed_user.health_reset_applied_at is not None
         )
@@ -850,10 +881,11 @@ class SDKSourceResetService:
             identity_scope=identity_scope,
         )
         user = self._require_user(db_session, user_id, for_update=True)
+        self._require_resulting_source_policy(user, request)
         database_applied = (
             user.health_reset_operation_id == request.operation_id
             and user.health_evidence_generation == request.expected_health_evidence_generation + 1
-            and user.health_write_state in {"fenced", "awaiting-v2-pairing"}
+            and user.health_write_state in {"fenced", terminal_state}
             and user.health_reset_manifest_sha256 == request.expected_inventory_digest_sha256
             and user.health_reset_applied_at is not None
         )
@@ -908,7 +940,7 @@ class SDKSourceResetService:
             # queue entry and result after connection/receipt rows are gone.
             self._delete_database_state(db_session, user_id)
             user.health_evidence_generation += 1
-            user.health_source_policy = "apple-mobile-v2-only"
+            user.health_source_policy = request.resulting_health_source_policy
             # Keep the durable account fence closed until every external plane
             # is verified empty. ``health_reset_applied_at`` plus the advanced
             # generation is the resumable database-half receipt.
@@ -932,10 +964,11 @@ class SDKSourceResetService:
         # activation cannot create new generation-bound state that cleanup
         # could erase.
         user = self._require_user(db_session, user_id, for_update=True)
+        self._require_resulting_source_policy(user, request)
         if (
             user.health_reset_operation_id != request.operation_id
             or user.health_evidence_generation != request.expected_health_evidence_generation + 1
-            or user.health_write_state not in {"fenced", "awaiting-v2-pairing"}
+            or user.health_write_state not in {"fenced", terminal_state}
             or user.health_reset_manifest_sha256 != request.expected_inventory_digest_sha256
             or user.health_reset_applied_at is None
         ):
@@ -985,7 +1018,7 @@ class SDKSourceResetService:
                 },
             )
         deleted_counts = self._public_counts(user.health_reset_deleted_counts)
-        user.health_write_state = "awaiting-v2-pairing"
+        user.health_write_state = terminal_state
         response = self._response(
             db_session,
             user,
@@ -1005,6 +1038,7 @@ class SDKSourceResetService:
         request: SDKHealthResetTransitionRequest,
     ) -> SDKHealthResetStateRead:
         user = self._require_user(db_session, user_id, for_update=False)
+        self._require_resulting_source_policy(user, request)
         if (
             user.health_reset_operation_id != request.operation_id
             or user.health_reset_manifest_sha256 != request.expected_inventory_digest_sha256

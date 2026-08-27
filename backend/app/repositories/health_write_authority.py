@@ -54,7 +54,12 @@ def require_health_write_authorities(
         user = users[user_id]
         if user.health_write_state not in {"active", "activating"}:
             raise HealthWriteAuthorityError("Health writes are fenced")
-        if user.health_source_policy != "apple-mobile-v2-only":
+        if user.health_source_policy == "legacy-mixed":
+            continue
+        if user.health_source_policy == "multi-source" and provider not in {
+            ProviderName.APPLE.value,
+            ProviderName.INTERNAL.value,
+        }:
             continue
 
         if (

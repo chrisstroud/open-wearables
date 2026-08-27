@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from threading import Event
-from typing import cast
+from typing import Literal, cast
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
@@ -167,12 +167,14 @@ def _transition(
     generation: int = 0,
     installation_generation: int | None = None,
     digest: str | None = None,
+    resulting_policy: Literal["apple-mobile-v2-only", "multi-source"] = "apple-mobile-v2-only",
 ) -> SDKHealthResetTransitionRequest:
     return SDKHealthResetTransitionRequest(
         operation_id=operation_id,
         expected_health_evidence_generation=generation,
         expected_installation_generation=installation_generation,
         expected_inventory_digest_sha256=digest,
+        resulting_health_source_policy=resulting_policy,
     )
 
 
@@ -1084,6 +1086,7 @@ def test_all_provider_reset_is_manifest_bound_idempotent_and_preserves_profile(d
         assert fenced.health_evidence_generation == 0
         assert fenced.health_write_state == "fenced"
         assert fenced.health_source_policy == "apple-mobile-v2-only"
+        assert fenced.resulting_health_source_policy == "apple-mobile-v2-only"
         assert fenced.active_installation_id is None
         assert fenced.resource_counts == reviewed_counts
         assert fenced.inventory_digest_sha256 == digest
@@ -1102,6 +1105,7 @@ def test_all_provider_reset_is_manifest_bound_idempotent_and_preserves_profile(d
         assert applied.health_evidence_generation == 1
         assert applied.health_write_state == "awaiting-v2-pairing"
         assert applied.health_source_policy == "apple-mobile-v2-only"
+        assert applied.resulting_health_source_policy == "apple-mobile-v2-only"
         assert applied.resource_counts == reviewed_counts
         assert applied.inventory_digest_sha256 == digest
         assert applied.verified_empty is True
@@ -1206,6 +1210,74 @@ def test_reset_inventory_and_erasure_include_only_target_apple_daily_summaries(d
     assert db.get(SDKBatchReceipt, other_batch_id) is not None
     assert db.get(SDKClientInstallation, other_installation_id) is not None
     assert db.get(User, other.id) is not None
+
+
+def test_multi_source_reset_reopens_only_after_verified_empty_and_rejects_target_drift(db: Session) -> None:
+    fake_external = FakeExternalPlanes()
+    fake_provider_fence = FakeProviderFence()
+    user, installation = _seed_all_provider_state(db)
+    operation_id = uuid4()
+
+    with (
+        patch(
+            "app.services.sdk_source_reset_service.sdk_source_reset_external_planes",
+            fake_external,
+        ),
+        patch(
+            "app.services.sdk_source_reset_service.sdk_source_reset_provider_fence",
+            fake_provider_fence,
+        ),
+    ):
+        reviewed = sdk_source_reset_service.inspect(
+            db,
+            user_id=user.id,
+            request=_transition(operation_id, resulting_policy="multi-source"),
+        )
+        request = _transition(
+            operation_id,
+            installation_generation=installation.generation,
+            digest=reviewed.inventory_digest_sha256,
+            resulting_policy="multi-source",
+        )
+        changed_target = request.model_copy(
+            update={"resulting_health_source_policy": "apple-mobile-v2-only"}
+        )
+
+        fenced = sdk_source_reset_service.fence(db, user_id=user.id, request=request)
+        assert fenced.health_write_state == "fenced"
+        assert fenced.health_source_policy == "multi-source"
+        assert fenced.resulting_health_source_policy == "multi-source"
+
+        for transition in (
+            sdk_source_reset_service.inspect,
+            sdk_source_reset_service.fence,
+            sdk_source_reset_service.drain,
+            sdk_source_reset_service.apply,
+            sdk_source_reset_service.verify,
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                transition(db, user_id=user.id, request=changed_target)
+            assert exc_info.value.status_code == 409
+            assert exc_info.value.detail == "Health reset resulting source policy changed"
+            db.rollback()
+
+        drained = sdk_source_reset_service.drain(db, user_id=user.id, request=request)
+        assert drained.drained is True
+        applied = sdk_source_reset_service.apply(db, user_id=user.id, request=request)
+        assert applied.health_evidence_generation == 1
+        assert applied.health_write_state == "active"
+        assert applied.health_source_policy == "multi-source"
+        assert applied.resulting_health_source_policy == "multi-source"
+        assert applied.verified_empty is True
+
+        retry = sdk_source_reset_service.apply(db, user_id=user.id, request=request)
+        assert retry.health_write_state == "active"
+        assert retry.health_evidence_generation == 1
+        assert retry.verified_empty is True
+
+        verified = sdk_source_reset_service.verify(db, user_id=user.id, request=request)
+        assert verified.health_write_state == "active"
+        assert verified.verified_empty is True
 
 
 @pytest.mark.parametrize("drift", ["credential-substitution", "normalized-addition"])
