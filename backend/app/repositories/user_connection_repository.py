@@ -14,15 +14,15 @@ from app.repositories.health_write_authority import (
     require_health_write_authority,
     require_user_connection_authority,
 )
+from app.repositories.provider_identity_authority import (
+    acquire_provider_identity_locks,
+    provider_identity_fingerprints,
+)
 from app.repositories.repositories import CrudRepository
 from app.schemas.auth import ConnectionStatus
 from app.schemas.model_crud.user_management import (
     UserConnectionCreate,
     UserConnectionUpdate,
-)
-from app.services.provider_identity_authority import (
-    acquire_provider_identity_locks,
-    provider_identity_fingerprints,
 )
 
 logger = getLogger(__name__)

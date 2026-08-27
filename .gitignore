@@ -165,6 +165,7 @@ volumes
 .streamlit/
 
 *.json
+!backend/railway.json
 *.xml
 
 # AI instruction local overrides (not committed)
