@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 
 import boto3
 from celery import current_app as current_celery_app
+from redis.exceptions import ResponseError, WatchError
 
 from app.config import settings
 from app.integrations.redis_client import get_redis_client
@@ -40,6 +41,12 @@ REDIS_QUEUED_PREFIXES = ("unacked",)
 REDIS_PRIORITY_SEPARATOR = "\x06\x16"
 REDIS_PRIORITY_SUFFIXES = ("3", "6", "9")
 REDIS_SUPPORTED_TYPES = ("string", "list", "set", "zset", "hash", "stream")
+REDIS_INVENTORY_KEY_RETRY_LIMIT = 3
+REDIS_INVENTORY_CLIENT_BLOCKER = "open-wearables.redis-coordination.inventory-client-unavailable"
+REDIS_INVENTORY_PING_BLOCKER = "open-wearables.redis-coordination.inventory-ping-unavailable"
+REDIS_INVENTORY_SCAN_BLOCKER = "open-wearables.redis-coordination.inventory-scan-unavailable"
+REDIS_INVENTORY_KEY_REVIEW_BLOCKER = "open-wearables.redis-coordination.inventory-key-review-unavailable"
+REDIS_INVENTORY_KEY_UNSTABLE_BLOCKER = "open-wearables.redis-coordination.inventory-key-review-unstable"
 
 # These providers accept asynchronous webhook payloads whose raw S3 key and
 # Celery envelope can contain only the provider-side identity.  The internal
@@ -237,6 +244,14 @@ class ExternalResetInventory:
     redis_references: tuple[RedisReference, ...]
     active_task_ids: tuple[str, ...]
     configuration_digest_sha256: str = ""
+
+
+class _RedisKeyDisappearedDuringReviewError(RuntimeError):
+    """A watched Redis key vanished before its exact state could be captured."""
+
+
+class _RedisKeyReviewUnstableError(RuntimeError):
+    """A Redis key changed throughout the bounded inventory retry window."""
 
 
 class SDKSourceResetExternalPlanes:
@@ -713,7 +728,7 @@ class SDKSourceResetExternalPlanes:
         key_type = str(client.type(key))
         dumped = client.dump(key)
         if key_type == "none" or dumped is None:
-            raise RuntimeError("Redis key disappeared during inventory")
+            raise _RedisKeyDisappearedDuringReviewError("Redis key disappeared during inventory")
         if isinstance(dumped, memoryview):
             dumped = dumped.tobytes()
         if isinstance(dumped, bytearray):
@@ -791,193 +806,277 @@ class SDKSourceResetExternalPlanes:
             entries.append((str(entry_id), field_values))
         return tuple(entries)
 
+    @staticmethod
+    def _verify_watched_redis_absence(review_pipe: Any) -> None:
+        """Prove a watched key stayed absent through a no-op transaction."""
+
+        review_pipe.multi()
+        review_pipe.ping()
+        if review_pipe.execute() != [True]:
+            raise RuntimeError("Redis key absence transaction was incomplete")
+
+    def _redis_key_inventory_once(
+        self,
+        client: Any,
+        redis_key: str,
+        *,
+        user_id: UUID,
+        identity_scope: ProviderIdentityScope,
+    ) -> tuple[RedisReference, ...]:
+        user = str(user_id)
+        review_pipe = client.pipeline(transaction=True)
+        try:
+            watched_keys = (redis_key, REDIS_UNACKED_INDEX_KEY) if redis_key == REDIS_UNACKED_KEY else (redis_key,)
+            review_pipe.watch(*watched_keys)
+            reviewed_key_type = str(review_pipe.type(redis_key))
+            if reviewed_key_type == "none":
+                self._verify_watched_redis_absence(review_pipe)
+                return ()
+
+            resource_key = self._redis_resource_key(redis_key)
+            key_references: list[RedisReference] = []
+            try:
+                if user in redis_key:
+                    key_references.append(RedisReference(resource_key, redis_key, "key", None, None))
+                elif reviewed_key_type == "string":
+                    value = review_pipe.get(redis_key)
+                    if value is not None and self._contains_identity(
+                        {"key": redis_key, "value": value},
+                        user_id=user,
+                        identity_scope=identity_scope,
+                    ):
+                        key_references.append(RedisReference(resource_key, redis_key, "key", None, str(value)))
+                elif reviewed_key_type == "list":
+                    values = tuple(str(value) for value in review_pipe.lrange(redis_key, 0, -1))
+                    for position, value in enumerate(values):
+                        if self._contains_identity(
+                            {"key": redis_key, "value": value},
+                            user_id=user,
+                            identity_scope=identity_scope,
+                        ):
+                            key_references.append(
+                                RedisReference(
+                                    resource_key,
+                                    redis_key,
+                                    "list",
+                                    str(position),
+                                    value,
+                                )
+                            )
+                elif reviewed_key_type == "set":
+                    for value in review_pipe.sscan_iter(redis_key):
+                        if self._contains_identity(
+                            {"key": redis_key, "value": value},
+                            user_id=user,
+                            identity_scope=identity_scope,
+                        ):
+                            key_references.append(RedisReference(resource_key, redis_key, "set", None, str(value)))
+                elif reviewed_key_type == "zset":
+                    for value, _score in review_pipe.zscan_iter(redis_key):
+                        if self._contains_identity(
+                            {"key": redis_key, "value": value},
+                            user_id=user,
+                            identity_scope=identity_scope,
+                        ):
+                            key_references.append(RedisReference(resource_key, redis_key, "zset", None, str(value)))
+                elif reviewed_key_type == "hash":
+                    for hash_field, value in review_pipe.hscan_iter(redis_key):
+                        if self._contains_identity(
+                            {"key": redis_key, "field": hash_field, "value": value},
+                            user_id=user,
+                            identity_scope=identity_scope,
+                        ):
+                            key_references.append(
+                                RedisReference(
+                                    resource_key,
+                                    redis_key,
+                                    "hash",
+                                    str(hash_field),
+                                    str(value),
+                                )
+                            )
+                elif reviewed_key_type == "stream":
+                    for entry_id, field_values in self._raw_stream_entries(review_pipe, redis_key):
+                        if self._contains_identity(
+                            {"key": redis_key, "field_values": field_values},
+                            user_id=user,
+                            identity_scope=identity_scope,
+                        ):
+                            key_references.append(
+                                RedisReference(
+                                    resource_key,
+                                    redis_key,
+                                    "stream",
+                                    entry_id,
+                                    json.dumps(
+                                        field_values,
+                                        ensure_ascii=False,
+                                        separators=(",", ":"),
+                                        default=str,
+                                    ),
+                                )
+                            )
+
+                reviewed_digest: str | None = None
+                if key_references:
+                    final_key_type, final_dump = self._redis_serialized_state(review_pipe, redis_key)
+                    if final_key_type != reviewed_key_type:
+                        raise RuntimeError("Redis key type changed during inventory")
+                    reviewed_digest = self._redis_state_digest(redis_key, reviewed_key_type, final_dump)
+
+                paired_references: list[RedisReference] = []
+                if redis_key == REDIS_UNACKED_KEY and key_references:
+                    delivery_tags = tuple(
+                        sorted(
+                            {
+                                row.locator
+                                for row in key_references
+                                if row.value_type == "hash" and row.locator is not None
+                            }
+                        )
+                    )
+                    if len(delivery_tags) != len(key_references):
+                        raise RuntimeError("Redis unacked review is inconsistent")
+                    index_type = str(review_pipe.type(REDIS_UNACKED_INDEX_KEY))
+                    if index_type != "zset":
+                        raise RuntimeError("Redis unacked index is unavailable")
+                    for delivery_tag in delivery_tags:
+                        if review_pipe.zscore(REDIS_UNACKED_INDEX_KEY, delivery_tag) is None:
+                            raise RuntimeError("Redis unacked index member is unavailable")
+                    final_index_type, final_index_dump = self._redis_serialized_state(
+                        review_pipe,
+                        REDIS_UNACKED_INDEX_KEY,
+                    )
+                    if final_index_type != index_type:
+                        raise RuntimeError("Redis unacked index type changed during inventory")
+                    index_digest = self._redis_state_digest(
+                        REDIS_UNACKED_INDEX_KEY,
+                        index_type,
+                        final_index_dump,
+                    )
+                    paired_references.extend(
+                        RedisReference(
+                            QUEUED_TASKS,
+                            REDIS_UNACKED_INDEX_KEY,
+                            "zset",
+                            None,
+                            delivery_tag,
+                            reviewed_key_type=index_type,
+                            reviewed_state_digest_sha256=index_digest,
+                        )
+                        for delivery_tag in delivery_tags
+                    )
+            except _RedisKeyDisappearedDuringReviewError:
+                self._verify_watched_redis_absence(review_pipe)
+                return ()
+            except (ResponseError, RuntimeError):
+                # A WRONGTYPE or consistency error can be either stable
+                # structural corruption or ordinary queue churn between the
+                # watched TYPE and the type-specific read. A successful no-op
+                # transaction proves the failure was stable and is re-raised;
+                # WatchError proves concurrency and enters the bounded retry.
+                review_pipe.multi()
+                review_pipe.ping()
+                if review_pipe.execute() != [True]:
+                    raise RuntimeError("Redis key error-review transaction was incomplete")
+                raise
+
+            review_pipe.multi()
+            review_pipe.ping()
+            if review_pipe.execute() != [True]:
+                raise RuntimeError("Redis key review transaction was incomplete")
+
+            references = tuple(
+                replace(
+                    row,
+                    reviewed_key_type=reviewed_key_type,
+                    reviewed_state_digest_sha256=reviewed_digest,
+                )
+                for row in key_references
+                if reviewed_digest is not None
+            )
+            return (*references, *paired_references)
+        finally:
+            review_pipe.reset()
+
+    def _redis_key_inventory(
+        self,
+        client: Any,
+        redis_key: str,
+        *,
+        user_id: UUID,
+        identity_scope: ProviderIdentityScope,
+    ) -> tuple[RedisReference, ...]:
+        for attempt in range(REDIS_INVENTORY_KEY_RETRY_LIMIT):
+            try:
+                return self._redis_key_inventory_once(
+                    client,
+                    redis_key,
+                    user_id=user_id,
+                    identity_scope=identity_scope,
+                )
+            except WatchError as exc:
+                if attempt + 1 == REDIS_INVENTORY_KEY_RETRY_LIMIT:
+                    raise _RedisKeyReviewUnstableError("Redis key remained unstable during inventory") from exc
+        raise AssertionError("Redis key inventory retry loop did not terminate")
+
     def _redis_inventory(
         self,
         user_id: UUID,
         identity_scope: ProviderIdentityScope | None = None,
     ) -> tuple[tuple[RedisReference, ...], tuple[str, ...]]:
-        user = str(user_id)
         scope = identity_scope or ProviderIdentityScope()
-        references: list[RedisReference] = []
         try:
             client = get_redis_client()
-            client.ping()
-            for raw_key in client.scan_iter(match="*", count=500):
-                redis_key = str(raw_key)
-                review_pipe = client.pipeline(transaction=True)
-                try:
-                    watched_keys = (
-                        (redis_key, REDIS_UNACKED_INDEX_KEY) if redis_key == REDIS_UNACKED_KEY else (redis_key,)
-                    )
-                    review_pipe.watch(*watched_keys)
-                    reviewed_key_type = str(review_pipe.type(redis_key))
-                    if reviewed_key_type == "none":
-                        raise RuntimeError("Redis key disappeared during inventory")
-                    resource_key = self._redis_resource_key(redis_key)
-                    key_references: list[RedisReference] = []
-                    if user in redis_key:
-                        key_references.append(RedisReference(resource_key, redis_key, "key", None, None))
-                    elif reviewed_key_type == "string":
-                        value = review_pipe.get(redis_key)
-                        if value is not None and self._contains_identity(
-                            {"key": redis_key, "value": value},
-                            user_id=user,
-                            identity_scope=scope,
-                        ):
-                            key_references.append(RedisReference(resource_key, redis_key, "key", None, str(value)))
-                    elif reviewed_key_type == "list":
-                        values = tuple(str(value) for value in review_pipe.lrange(redis_key, 0, -1))
-                        for position, value in enumerate(values):
-                            if self._contains_identity(
-                                {"key": redis_key, "value": value},
-                                user_id=user,
-                                identity_scope=scope,
-                            ):
-                                key_references.append(
-                                    RedisReference(
-                                        resource_key,
-                                        redis_key,
-                                        "list",
-                                        str(position),
-                                        value,
-                                    )
-                                )
-                    elif reviewed_key_type == "set":
-                        for value in review_pipe.sscan_iter(redis_key):
-                            if self._contains_identity(
-                                {"key": redis_key, "value": value},
-                                user_id=user,
-                                identity_scope=scope,
-                            ):
-                                key_references.append(RedisReference(resource_key, redis_key, "set", None, str(value)))
-                    elif reviewed_key_type == "zset":
-                        for value, _score in review_pipe.zscan_iter(redis_key):
-                            if self._contains_identity(
-                                {"key": redis_key, "value": value},
-                                user_id=user,
-                                identity_scope=scope,
-                            ):
-                                key_references.append(RedisReference(resource_key, redis_key, "zset", None, str(value)))
-                    elif reviewed_key_type == "hash":
-                        for hash_field, value in review_pipe.hscan_iter(redis_key):
-                            if self._contains_identity(
-                                {"key": redis_key, "field": hash_field, "value": value},
-                                user_id=user,
-                                identity_scope=scope,
-                            ):
-                                key_references.append(
-                                    RedisReference(
-                                        resource_key,
-                                        redis_key,
-                                        "hash",
-                                        str(hash_field),
-                                        str(value),
-                                    )
-                                )
-                    elif reviewed_key_type == "stream":
-                        for entry_id, field_values in self._raw_stream_entries(review_pipe, redis_key):
-                            if self._contains_identity(
-                                {"key": redis_key, "field_values": field_values},
-                                user_id=user,
-                                identity_scope=scope,
-                            ):
-                                key_references.append(
-                                    RedisReference(
-                                        resource_key,
-                                        redis_key,
-                                        "stream",
-                                        entry_id,
-                                        json.dumps(
-                                            field_values,
-                                            ensure_ascii=False,
-                                            separators=(",", ":"),
-                                            default=str,
-                                        ),
-                                    )
-                                )
-
-                    reviewed_digest: str | None = None
-                    if key_references:
-                        final_key_type, final_dump = self._redis_serialized_state(review_pipe, redis_key)
-                        if final_key_type != reviewed_key_type:
-                            raise RuntimeError("Redis key type changed during inventory")
-                        reviewed_digest = self._redis_state_digest(redis_key, reviewed_key_type, final_dump)
-
-                    paired_references: list[RedisReference] = []
-                    if redis_key == REDIS_UNACKED_KEY and key_references:
-                        delivery_tags = tuple(
-                            sorted(
-                                {
-                                    row.locator
-                                    for row in key_references
-                                    if row.value_type == "hash" and row.locator is not None
-                                }
-                            )
-                        )
-                        if len(delivery_tags) != len(key_references):
-                            raise RuntimeError("Redis unacked review is inconsistent")
-                        index_type = str(review_pipe.type(REDIS_UNACKED_INDEX_KEY))
-                        if index_type != "zset":
-                            raise RuntimeError("Redis unacked index is unavailable")
-                        for delivery_tag in delivery_tags:
-                            if review_pipe.zscore(REDIS_UNACKED_INDEX_KEY, delivery_tag) is None:
-                                raise RuntimeError("Redis unacked index member is unavailable")
-                        final_index_type, final_index_dump = self._redis_serialized_state(
-                            review_pipe,
-                            REDIS_UNACKED_INDEX_KEY,
-                        )
-                        if final_index_type != index_type:
-                            raise RuntimeError("Redis unacked index type changed during inventory")
-                        index_digest = self._redis_state_digest(
-                            REDIS_UNACKED_INDEX_KEY,
-                            index_type,
-                            final_index_dump,
-                        )
-                        paired_references.extend(
-                            RedisReference(
-                                QUEUED_TASKS,
-                                REDIS_UNACKED_INDEX_KEY,
-                                "zset",
-                                None,
-                                delivery_tag,
-                                reviewed_key_type=index_type,
-                                reviewed_state_digest_sha256=index_digest,
-                            )
-                            for delivery_tag in delivery_tags
-                        )
-
-                    review_pipe.multi()
-                    review_pipe.ping()
-                    if review_pipe.execute() != [True]:
-                        raise RuntimeError("Redis key review transaction was incomplete")
-                finally:
-                    review_pipe.reset()
-
-                if key_references and reviewed_digest is not None:
-                    references.extend(
-                        replace(
-                            row,
-                            reviewed_key_type=reviewed_key_type,
-                            reviewed_state_digest_sha256=reviewed_digest,
-                        )
-                        for row in key_references
-                    )
-                    references.extend(paired_references)
-            unique = {
-                (
-                    row.resource_key,
-                    row.key,
-                    row.value_type,
-                    row.locator,
-                    row.raw_value,
-                    row.reviewed_key_type,
-                    row.reviewed_state_digest_sha256,
-                ): row
-                for row in references
-            }
-            return tuple(unique.values()), ()
         except Exception:
-            return (), ("open-wearables.redis-coordination.inventory-unavailable",)
+            return (), (REDIS_INVENTORY_CLIENT_BLOCKER,)
+        try:
+            if client.ping() is not True:
+                raise RuntimeError("Redis inventory ping did not confirm availability")
+        except Exception:
+            return (), (REDIS_INVENTORY_PING_BLOCKER,)
+
+        try:
+            key_iterator = iter(client.scan_iter(match="*", count=500))
+        except Exception:
+            return (), (REDIS_INVENTORY_SCAN_BLOCKER,)
+
+        references: list[RedisReference] = []
+        while True:
+            try:
+                raw_key = next(key_iterator)
+            except StopIteration:
+                break
+            except Exception:
+                return (), (REDIS_INVENTORY_SCAN_BLOCKER,)
+
+            try:
+                references.extend(
+                    self._redis_key_inventory(
+                        client,
+                        str(raw_key),
+                        user_id=user_id,
+                        identity_scope=scope,
+                    )
+                )
+            except _RedisKeyReviewUnstableError:
+                return (), (REDIS_INVENTORY_KEY_UNSTABLE_BLOCKER,)
+            except Exception:
+                return (), (REDIS_INVENTORY_KEY_REVIEW_BLOCKER,)
+
+        unique = {
+            (
+                row.resource_key,
+                row.key,
+                row.value_type,
+                row.locator,
+                row.raw_value,
+                row.reviewed_key_type,
+                row.reviewed_state_digest_sha256,
+            ): row
+            for row in references
+        }
+        return tuple(unique.values()), ()
 
     @classmethod
     def _task_inventory(
