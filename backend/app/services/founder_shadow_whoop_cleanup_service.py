@@ -40,6 +40,7 @@ from app.schemas.auth import ConnectionStatus
 from app.schemas.enums import ProviderName
 from app.services.provider_identity_authority import acquire_provider_identity_value_locks
 from app.services.sdk_source_reset_external import (
+    REDIS_COORDINATION,
     ExternalResetInventory,
     ProviderIdentityScope,
     RedisReference,
@@ -454,8 +455,33 @@ class FounderShadowWhoopCleanupService:
             re.IGNORECASE,
         )
         provider_pattern = re.compile(r"(?<![a-z0-9])whoop(?![a-z0-9])", re.IGNORECASE)
-        return any(user_pattern.search(value) for value in values) and any(
-            provider_pattern.search(value) for value in values
+        target_present = any(user_pattern.search(value) for value in values)
+        if target_present and any(provider_pattern.search(value) for value in values):
+            return True
+
+        # The shared Redis inventory intentionally represents keys containing
+        # the target UUID as whole-key references without returning their
+        # values.  These two sync-status keys are intrinsically scoped to one
+        # Open Wearables user, but their key grammar is provider-neutral.  The
+        # founder repair may accept only these exact shapes; queued tasks,
+        # result rows, shared keys, and every other provider-neutral reference
+        # must continue to carry both the target UUID and an explicit WHOOP
+        # marker above.
+        expected_key_types = {
+            f"sync:status:user:{target_user_id}:recent": "list",
+            f"sync:status:user:{target_user_id}:runs": "set",
+        }
+        expected_key_type = expected_key_types.get(reference.key)
+        state_digest = str(reference.reviewed_state_digest_sha256 or "").lower()
+        return (
+            reference.resource_key == REDIS_COORDINATION
+            and expected_key_type is not None
+            and reference.value_type == "key"
+            and reference.locator is None
+            and reference.raw_value is None
+            and reference.reviewed_key_type == expected_key_type
+            and len(state_digest) == 64
+            and all(char in "0123456789abcdef" for char in state_digest)
         )
 
     @classmethod
