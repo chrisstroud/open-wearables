@@ -621,18 +621,28 @@ def test_execute_rejects_target_score_payload_drift_before_fencing(
     assert fake_external.erase_object_calls == 0
 
 
-def test_redis_reference_requires_bounded_uuid_and_whoop_tokens() -> None:
+def test_redis_reference_requires_bounded_uuid_and_whoop_tokens_or_exact_target_status_key() -> None:
     target_user_id = uuid4()
+    keeper_user_id = uuid4()
 
-    def reference(key: str) -> RedisReference:
+    def reference(
+        key: str,
+        *,
+        resource_key: str = "open-wearables.redis-coordination",
+        value_type: str = "key",
+        locator: str | None = None,
+        raw_value: str | None = None,
+        reviewed_key_type: str = "string",
+        reviewed_state_digest_sha256: str | None = "a" * 64,
+    ) -> RedisReference:
         return RedisReference(
-            "open-wearables.redis-coordination",
+            resource_key,
             key,
-            "key",
-            None,
-            None,
-            reviewed_key_type="string",
-            reviewed_state_digest_sha256="a" * 64,
+            value_type,
+            locator,
+            raw_value,
+            reviewed_key_type=reviewed_key_type,
+            reviewed_state_digest_sha256=reviewed_state_digest_sha256,
         )
 
     assert founder_shadow_whoop_cleanup_service._redis_reference_is_exact_whoop(
@@ -647,3 +657,73 @@ def test_redis_reference_requires_bounded_uuid_and_whoop_tokens() -> None:
         reference(f"sync_history:{target_user_id}:notwhoop"),
         target_user_id=target_user_id,
     )
+    assert founder_shadow_whoop_cleanup_service._redis_reference_is_exact_whoop(
+        reference(
+            f"sync:status:user:{target_user_id}:recent",
+            reviewed_key_type="list",
+        ),
+        target_user_id=target_user_id,
+    )
+    assert founder_shadow_whoop_cleanup_service._redis_reference_is_exact_whoop(
+        reference(
+            f"sync:status:user:{target_user_id}:runs",
+            reviewed_key_type="set",
+        ),
+        target_user_id=target_user_id,
+    )
+
+    rejected_provider_neutral_references = (
+        reference(
+            f"sync:status:user:{target_user_id}:recent:extra",
+            reviewed_key_type="list",
+        ),
+        reference(
+            f"sync:status:user:{target_user_id}:recent",
+            reviewed_key_type="set",
+        ),
+        reference(
+            f"sync:status:user:{target_user_id}:recent",
+            value_type="list",
+            reviewed_key_type="list",
+        ),
+        reference(
+            f"sync:status:user:{keeper_user_id}:recent",
+            reviewed_key_type="list",
+        ),
+        reference(
+            f"arbitrary:{target_user_id}",
+            reviewed_key_type="string",
+        ),
+        reference(
+            "sync:status:all",
+            value_type="list",
+            locator="0",
+            raw_value=f'{{"user_id":"{target_user_id}"}}',
+            reviewed_key_type="list",
+        ),
+        reference(
+            f"sync:status:user:{target_user_id}:recent",
+            resource_key="open-wearables.queued-tasks",
+            reviewed_key_type="list",
+        ),
+        reference(
+            f"sync:status:user:{target_user_id}:recent",
+            locator="shared-member",
+            reviewed_key_type="list",
+        ),
+        reference(
+            f"sync:status:user:{target_user_id}:recent",
+            raw_value="shared-value",
+            reviewed_key_type="list",
+        ),
+        reference(
+            f"sync:status:user:{target_user_id}:recent",
+            reviewed_key_type="list",
+            reviewed_state_digest_sha256=None,
+        ),
+    )
+    for rejected in rejected_provider_neutral_references:
+        assert not founder_shadow_whoop_cleanup_service._redis_reference_is_exact_whoop(
+            rejected,
+            target_user_id=target_user_id,
+        )

@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from uuid import UUID
 
 from app.database import SessionLocal
+from app.integrations.celery import create_celery
 from app.services.founder_shadow_whoop_cleanup_service import (
     FounderShadowWhoopCleanupError,
     founder_shadow_whoop_cleanup_service,
@@ -49,6 +50,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         target_user_id = _required_uuid(TARGET_ENV)
         keeper_user_id = _required_uuid(KEEPER_ENV)
+        # Standalone operators do not import app.main, which is otherwise the
+        # only place the process-wide Celery app receives the Railway Redis
+        # broker configuration.  Configure it explicitly before the external
+        # inventory performs its mandatory worker inspection.
+        create_celery()
         with SessionLocal() as db_session:
             if args.mode == "plan":
                 plan = founder_shadow_whoop_cleanup_service.plan(

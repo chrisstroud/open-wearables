@@ -56,11 +56,22 @@ class _Service:
         return SimpleNamespace(verified=True, public_dict=lambda: {"verified": True, "blockers": []})
 
 
-def _configure(module: ModuleType, monkeypatch: pytest.MonkeyPatch, service: _Service) -> None:
+def _configure(
+    module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    service: _Service,
+    *,
+    celery_calls: list[str] | None = None,
+) -> None:
     monkeypatch.setenv(module.TARGET_ENV, str(_TARGET))
     monkeypatch.setenv(module.KEEPER_ENV, str(_KEEPER))
     monkeypatch.setattr(module, "SessionLocal", lambda: nullcontext(object()))
     monkeypatch.setattr(module, "founder_shadow_whoop_cleanup_service", service)
+    monkeypatch.setattr(
+        module,
+        "create_celery",
+        lambda: celery_calls.append("configured") if celery_calls is not None else None,
+    )
 
 
 def test_plan_output_is_value_minimized(
@@ -69,7 +80,8 @@ def test_plan_output_is_value_minimized(
 ) -> None:
     module = _load_module()
     service = _Service()
-    _configure(module, monkeypatch, service)
+    celery_calls: list[str] = []
+    _configure(module, monkeypatch, service, celery_calls=celery_calls)
 
     assert module.main(["plan"]) == 0
 
@@ -78,6 +90,7 @@ def test_plan_output_is_value_minimized(
     assert payload["phase"] == "planned"
     assert str(_TARGET) not in output
     assert str(_KEEPER) not in output
+    assert celery_calls == ["configured"]
     assert service.calls == [("plan", _TARGET, _KEEPER, None)]
 
 
