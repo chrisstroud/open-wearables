@@ -120,7 +120,13 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
         """Get detailed workout data from Whoop API."""
         return self._make_api_request(db, user_id, f"/v2/activity/workout/{workout_id}")
 
-    def load_single_workout(self, db: DbSession, user_id: UUID, workout_id: str) -> int:
+    def load_single_workout(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        workout_id: str,
+        user_connection_id: UUID | None = None,
+    ) -> int:
         """Fetch a single workout by ID, normalize, and save to database. Returns 1 on success."""
         try:
             raw = self.get_workout_detail_from_api(db, user_id, workout_id)
@@ -136,12 +142,15 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
             workout = WhoopWorkoutJSON(**raw)
             if workout.score_state != "SCORED" and workout.score is None:
                 return 0
-            record, detail, health_score = self._normalize_workout(workout, user_id)
+            record, detail, health_score = self._normalize_workout(workout, user_id, user_connection_id)
             created = event_record_service.create(db, record)
             detail_for_record = detail.model_copy(update={"record_id": created.id})
             event_record_service.create_detail(db, detail_for_record)
             if health_score:
-                health_score_service.create(db, health_score)
+                health_score_service.create(
+                    db,
+                    health_score.model_copy(update={"data_source_id": created.data_source_id}),
+                )
             return 1
         except Exception as e:
             log_structured(
@@ -241,6 +250,7 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
         self,
         raw_workout: WhoopWorkoutJSON,
         user_id: UUID,
+        user_connection_id: UUID | None = None,
     ) -> tuple[EventRecordCreate, EventRecordDetailCreate, HealthScoreCreate | None]:  # ty:ignore[invalid-method-override]
         """Normalize Whoop workout to EventRecordCreate, EventRecordDetailCreate, and strain HealthScoreCreate."""
         workout_id = uuid4()
@@ -268,6 +278,7 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
             external_id=raw_workout.id,  # Whoop workout UUID
             source=self.provider_name,
             user_id=user_id,
+            user_connection_id=user_connection_id,
         )
 
         # Create EventRecordDetailCreate
@@ -282,12 +293,13 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
         self,
         raw: list[WhoopWorkoutJSON],
         user_id: UUID,
+        user_connection_id: UUID | None = None,
     ) -> Iterable[tuple[EventRecordCreate, EventRecordDetailCreate]]:
         """Build event record payloads for Whoop workouts."""
         for raw_workout in raw:
             # Only process workouts that are scored
             if raw_workout.score_state == "SCORED" or raw_workout.score is not None:
-                record, details, _ = self._normalize_workout(raw_workout, user_id)
+                record, details, _ = self._normalize_workout(raw_workout, user_id, user_connection_id)
                 yield record, details
 
     def load_data(
@@ -304,6 +316,7 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
         # Get start/end dates from kwargs (support both 'start'/'end' and 'start_date'/'end_date')
         start = kwargs.get("start") or kwargs.get("start_date")
         end = kwargs.get("end") or kwargs.get("end_date")
+        user_connection_id = kwargs.get("user_connection_id")
 
         # Default to last 30 days if no dates provided
         if not start:
@@ -387,13 +400,15 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
         strain_scores: list[HealthScoreCreate] = []
         for raw_workout in all_workouts:
             if raw_workout.score_state == "SCORED" or raw_workout.score is not None:
-                record, details, strain_score = self._normalize_workout(raw_workout, user_id)
+                record, details, strain_score = self._normalize_workout(raw_workout, user_id, user_connection_id)
                 created_record = event_record_service.create(db, record)
                 detail_for_record = details.model_copy(update={"record_id": created_record.id})
                 event_record_service.create_detail(db, detail_for_record)
                 count += 1
                 if strain_score:
-                    strain_scores.append(strain_score)
+                    strain_scores.append(
+                        strain_score.model_copy(update={"data_source_id": created_record.data_source_id})
+                    )
 
         if strain_scores:
             try:

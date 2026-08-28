@@ -9,18 +9,21 @@ Tests cover:
 - bulk_create with on_conflict_do_nothing
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from uuid import uuid4
+from threading import Barrier
+from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
-from app.models import HealthScore
-from app.repositories.health_score_repository import HealthScoreRepository
+from app.models import DataSource, HealthScore, User
+from app.repositories.health_score_repository import HealthScoreProvenanceConflictError, HealthScoreRepository
+from app.repositories.health_write_authority import HealthWriteAuthorityError
 from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.schemas.model_crud.activities import HealthScoreCreate, HealthScoreQueryParams
-from tests.factories import DataSourceFactory, HealthScoreFactory, UserFactory
+from tests.factories import DataSourceFactory, EventRecordFactory, HealthScoreFactory, UserFactory
 
 
 @pytest.fixture
@@ -30,7 +33,7 @@ def repo() -> HealthScoreRepository:
 
 class TestHealthScoreRepositoryCreate:
     def test_create(self, db: Session, repo: HealthScoreRepository) -> None:
-        data_source = DataSourceFactory()
+        data_source = DataSourceFactory(provider=ProviderName.GARMIN)
         score = HealthScoreCreate(
             id=uuid4(),
             user_id=data_source.user_id,
@@ -51,7 +54,7 @@ class TestHealthScoreRepositoryCreate:
 
     def test_create_duplicate_returns_existing(self, db: Session, repo: HealthScoreRepository) -> None:
         recorded_at = datetime.now(timezone.utc)
-        data_source = DataSourceFactory()
+        data_source = DataSourceFactory(provider=ProviderName.GARMIN)
         score = HealthScoreCreate(
             id=uuid4(),
             user_id=data_source.user_id,
@@ -76,6 +79,51 @@ class TestHealthScoreRepositoryCreate:
 
         assert result.id == score.id
         assert result.value == Decimal("82.00")
+
+    def test_create_rejects_data_source_from_different_provider(
+        self,
+        db: Session,
+        repo: HealthScoreRepository,
+    ) -> None:
+        user = UserFactory()
+        data_source = DataSourceFactory(user=user, provider=ProviderName.GARMIN)
+        score = HealthScoreCreate(
+            id=uuid4(),
+            user_id=user.id,
+            data_source_id=data_source.id,
+            provider=ProviderName.WHOOP,
+            category=HealthScoreCategory.RECOVERY,
+            value=Decimal("82.00"),
+            recorded_at=datetime.now(timezone.utc),
+        )
+
+        with pytest.raises(HealthWriteAuthorityError, match="another provider"):
+            repo.create(db, score)
+
+    def test_create_allows_internal_sleep_score_to_retain_external_source_lineage(
+        self,
+        db: Session,
+        repo: HealthScoreRepository,
+    ) -> None:
+        user = UserFactory()
+        data_source = DataSourceFactory(user=user, provider=ProviderName.APPLE)
+        sleep_record = EventRecordFactory(data_source=data_source, category="sleep")
+        score = HealthScoreCreate(
+            id=uuid4(),
+            user_id=user.id,
+            data_source_id=data_source.id,
+            provider=ProviderName.INTERNAL,
+            category=HealthScoreCategory.SLEEP,
+            value=Decimal("82.00"),
+            sleep_record_id=sleep_record.id,
+            recorded_at=datetime.now(timezone.utc),
+        )
+
+        created = repo.create(db, score)
+
+        assert created.provider == ProviderName.INTERNAL
+        assert created.data_source_id == data_source.id
+        assert created.sleep_record_id == sleep_record.id
 
 
 class TestHealthScoreRepositoryGetWithFilters:
@@ -179,7 +227,7 @@ class TestHealthScoreRepositoryLatest:
 
 class TestHealthScoreRepositoryBulkCreate:
     def test_bulk_create(self, db: Session, repo: HealthScoreRepository) -> None:
-        data_source = DataSourceFactory()
+        data_source = DataSourceFactory(provider=ProviderName.GARMIN)
         now = datetime.now(timezone.utc)
         scores = [
             HealthScoreCreate(
@@ -201,7 +249,7 @@ class TestHealthScoreRepositoryBulkCreate:
         assert len(results) == 3
 
     def test_bulk_create_ignores_duplicates(self, db: Session, repo: HealthScoreRepository) -> None:
-        data_source = DataSourceFactory()
+        data_source = DataSourceFactory(provider=ProviderName.GARMIN)
         recorded_at = datetime.now(timezone.utc)
         original = HealthScoreCreate(
             id=uuid4(),
@@ -230,3 +278,72 @@ class TestHealthScoreRepositoryBulkCreate:
         results = db.query(HealthScore).filter(HealthScore.data_source_id == data_source.id).all()
         assert len(results) == 1
         assert results[0].value == Decimal("80.00")
+
+
+def test_concurrent_bulk_create_serializes_absent_identity_and_rejects_conflicting_source(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """The owner-row authority lock closes the absent-score adoption race."""
+    user_id = uuid4()
+    source_ids = (uuid4(), uuid4())
+    recorded_at = datetime.now(timezone.utc)
+    with session_factory() as setup:
+        setup.add(
+            User(
+                id=user_id,
+                external_user_id=f"health-score-race-{user_id}",
+                health_evidence_generation=0,
+                health_write_state="active",
+                health_source_policy="legacy-mixed",
+            )
+        )
+        setup.flush()
+        setup.add_all(
+            [
+                DataSource(
+                    id=source_id,
+                    user_id=user_id,
+                    provider=ProviderName.WHOOP,
+                    source=f"whoop-{index}",
+                )
+                for index, source_id in enumerate(source_ids)
+            ]
+        )
+        setup.commit()
+
+    ready = Barrier(2)
+
+    def write(source_id: UUID) -> str:
+        with session_factory() as write_session:
+            ready.wait(timeout=5)
+            creator = HealthScoreCreate(
+                id=uuid4(),
+                user_id=user_id,
+                data_source_id=source_id,
+                provider=ProviderName.WHOOP,
+                category=HealthScoreCategory.RECOVERY,
+                value=Decimal("82.00"),
+                recorded_at=recorded_at,
+            )
+            try:
+                HealthScoreRepository(HealthScore).bulk_create(write_session, [creator])
+                write_session.commit()
+                return "created"
+            except HealthScoreProvenanceConflictError:
+                write_session.rollback()
+                return "conflict"
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(write, source_ids))
+
+        assert sorted(results) == ["conflict", "created"]
+        with session_factory() as verify:
+            stored = verify.query(HealthScore).filter(HealthScore.user_id == user_id).one()
+            assert stored.data_source_id in source_ids
+    finally:
+        with session_factory() as cleanup:
+            cleanup.query(HealthScore).filter(HealthScore.user_id == user_id).delete()
+            cleanup.query(DataSource).filter(DataSource.user_id == user_id).delete()
+            cleanup.query(User).filter(User.id == user_id).delete()
+            cleanup.commit()

@@ -197,8 +197,7 @@ class DataSourceRepository(
         existing = self.get_by_identity(db_session, user_id, provider, device_model, source)
         if existing:
             updated = False
-            if user_connection_id and existing.user_connection_id is None:
-                object.__setattr__(existing, "user_connection_id", user_connection_id)
+            if self._adopt_connection_identity(existing, user_connection_id):
                 updated = True
             if software_version and existing.software_version is None:
                 object.__setattr__(existing, "software_version", software_version)
@@ -234,6 +233,22 @@ class DataSourceRepository(
         result = self.create(db_session, create_payload)
         assert result is not None
         return result
+
+    @staticmethod
+    def _adopt_connection_identity(data_source: DataSource, user_connection_id: UUID | None) -> bool:
+        """Attach an unowned legacy source to its now-known authorization.
+
+        Existing non-null attribution is immutable here: a different
+        connection must be reconciled explicitly rather than silently moved.
+        """
+        if user_connection_id is None:
+            return False
+        if data_source.user_connection_id is not None:
+            if data_source.user_connection_id != user_connection_id:
+                raise DataSourceProvenanceConflictError("Data source is already attributed to a different connection")
+            return False
+        object.__setattr__(data_source, "user_connection_id", user_connection_id)
+        return True
 
     def _infer_device_type(
         self,
@@ -293,6 +308,8 @@ class DataSourceRepository(
                     original_source_name=original_source_name,
                 )
                 if resolved is not None:
+                    if self._adopt_connection_identity(resolved, user_connection_id):
+                        db_session.flush()
                     result[identity] = resolved.id
                     remaining_identities.remove(identity)
 
@@ -312,13 +329,18 @@ class DataSourceRepository(
         for ds in existing:
             identity = (ds.user_id, ds.device_model, ds.source)
             result[identity] = ds.id
+            updated = self._adopt_connection_identity(ds, user_connection_id)
             metadata = identity_metadata.get(identity) if identity_metadata else None
             if metadata:
                 software_version, original_source_name = metadata
                 if software_version and ds.software_version is None:
                     object.__setattr__(ds, "software_version", software_version)
+                    updated = True
                 if original_source_name and ds.original_source_name is None:
                     object.__setattr__(ds, "original_source_name", original_source_name)
+                    updated = True
+            if updated:
+                db_session.flush()
 
         missing = [i for i in identities_list if i not in result]
 
@@ -351,6 +373,8 @@ class DataSourceRepository(
 
             newly_inserted = db_session.query(self.model).filter(or_(*conditions)).all()
             for ds in newly_inserted:
+                if self._adopt_connection_identity(ds, user_connection_id):
+                    db_session.flush()
                 result[(ds.user_id, ds.device_model, ds.source)] = ds.id
 
         return result

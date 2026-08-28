@@ -100,7 +100,7 @@ class TestHealthScoreServiceLatest:
 
 class TestHealthScoreServiceBulkCreate:
     def test_bulk_create(self, db: Session) -> None:
-        data_source = DataSourceFactory()
+        data_source = DataSourceFactory(provider=ProviderName.GARMIN)
         now = datetime.now(timezone.utc)
         scores = [
             HealthScoreCreate(
