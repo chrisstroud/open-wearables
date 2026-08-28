@@ -9,10 +9,13 @@ from app.database import DbSession
 from app.models import DataSource, EventRecord, HealthScore
 from app.repositories.health_write_authority import (
     HealthWriteAuthorityError,
+    require_data_source_authority,
     require_health_write_authorities,
     require_health_write_authority,
+    require_user_connection_authority,
 )
 from app.repositories.repositories import CrudRepository
+from app.schemas.auth import ConnectionStatus
 from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.schemas.model_crud.activities import HealthScoreCreate, HealthScoreQueryParams, HealthScoreUpdate
 from app.utils.pagination import decode_cursor
@@ -208,6 +211,85 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
         stmt = insert(HealthScore).values(values).on_conflict_do_nothing()
         db_session.execute(stmt)
         # Caller is responsible for commit — allows batching with other operations
+
+    def adopt_missing_data_sources(
+        self,
+        db_session: DbSession,
+        *,
+        user_id: UUID,
+        provider: ProviderName,
+        data_source_id: UUID,
+        start_datetime: datetime,
+        end_datetime: datetime,
+    ) -> int:
+        """Attach bounded legacy scores to one unambiguous active source.
+
+        A score without ``data_source_id`` contains no device/source identity of
+        its own. Repair is therefore allowed only when this account/provider has
+        exactly one source tied to the same active connection and no score in the
+        requested window contradicts that attribution.
+        """
+        if start_datetime >= end_datetime:
+            raise ValueError("Health score attribution window must be non-empty")
+
+        data_source = require_data_source_authority(
+            db_session,
+            data_source_id=data_source_id,
+            expected_user_id=user_id,
+            expected_provider=provider,
+        )
+        if data_source.user_connection_id is None:
+            raise HealthScoreProvenanceConflictError("Health score repair requires a connection-backed data source")
+        connection = require_user_connection_authority(
+            db_session,
+            connection_id=data_source.user_connection_id,
+            expected_user_id=user_id,
+            expected_provider=provider,
+        )
+        if connection.status != ConnectionStatus.ACTIVE:
+            raise HealthWriteAuthorityError("Health score repair requires an active user connection")
+
+        provider_sources = set(
+            db_session.query(DataSource.id, DataSource.user_connection_id)
+            .filter(DataSource.user_id == user_id, DataSource.provider == provider)
+            .all()
+        )
+        if provider_sources != {(data_source.id, connection.id)}:
+            raise HealthScoreProvenanceConflictError(
+                "Health score repair requires one unambiguous provider data source"
+            )
+
+        window_filter = (
+            HealthScore.user_id == user_id,
+            HealthScore.provider == provider,
+            HealthScore.recorded_at >= start_datetime,
+            HealthScore.recorded_at < end_datetime,
+        )
+        conflicting = (
+            db_session.query(HealthScore.id)
+            .filter(
+                *window_filter,
+                HealthScore.data_source_id.is_not(None),
+                HealthScore.data_source_id != data_source.id,
+            )
+            .first()
+        )
+        if conflicting is not None:
+            raise HealthScoreProvenanceConflictError(
+                "Health score repair window is already attributed to a different data source"
+            )
+
+        missing = (
+            db_session.query(HealthScore)
+            .filter(*window_filter, HealthScore.data_source_id.is_(None))
+            .with_for_update()
+            .all()
+        )
+        for score in missing:
+            score.data_source_id = data_source.id
+        if missing:
+            db_session.flush()
+        return len(missing)
 
     def get_latest_by_category(
         self,
