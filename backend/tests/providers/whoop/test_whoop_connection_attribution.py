@@ -149,6 +149,41 @@ def test_247_loader_adopts_legacy_source_and_emits_connection_in_source_api(
     assert source_response.items[0].user_connection_id == connection.id
 
 
+def test_247_historical_sync_repairs_bounded_legacy_scores_without_provider_rows(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = UserFactory()
+    connection = UserConnectionFactory(user=user, provider="whoop", status=ConnectionStatus.ACTIVE)
+    legacy_scores = [
+        HealthScoreFactory(
+            user_id=user.id,
+            data_source_id=None,
+            provider=ProviderName.WHOOP,
+            category=category,
+            recorded_at=datetime(2026, 8, 20, 8, tzinfo=timezone.utc),
+        )
+        for category in (HealthScoreCategory.SLEEP, HealthScoreCategory.RECOVERY)
+    ]
+    handler = _data_247()
+    monkeypatch.setattr(handler, "get_sleep_data", MagicMock(return_value=[]))
+    monkeypatch.setattr(handler, "get_recovery_data", MagicMock(return_value=[]))
+    monkeypatch.setattr(handler, "get_body_measurement", MagicMock(return_value={}))
+
+    result = handler.load_and_save_all(
+        db,
+        user.id,
+        start_time=START,
+        end_time=END,
+        user_connection_id=connection.id,
+    )
+
+    assert result["health_scores_attributed"] == 2
+    source = db.query(DataSource).filter(DataSource.user_id == user.id, DataSource.provider == "whoop").one()
+    assert source.user_connection_id == connection.id
+    assert {score.data_source_id for score in legacy_scores} == {source.id}
+
+
 def test_webhook_update_propagates_exact_active_connection_identity(
     db: Session,
     monkeypatch: pytest.MonkeyPatch,

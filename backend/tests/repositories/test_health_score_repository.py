@@ -21,9 +21,16 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.models import DataSource, HealthScore, User
 from app.repositories.health_score_repository import HealthScoreProvenanceConflictError, HealthScoreRepository
 from app.repositories.health_write_authority import HealthWriteAuthorityError
+from app.schemas.auth import ConnectionStatus
 from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.schemas.model_crud.activities import HealthScoreCreate, HealthScoreQueryParams
-from tests.factories import DataSourceFactory, EventRecordFactory, HealthScoreFactory, UserFactory
+from tests.factories import (
+    DataSourceFactory,
+    EventRecordFactory,
+    HealthScoreFactory,
+    UserConnectionFactory,
+    UserFactory,
+)
 
 
 @pytest.fixture
@@ -278,6 +285,191 @@ class TestHealthScoreRepositoryBulkCreate:
         results = db.query(HealthScore).filter(HealthScore.data_source_id == data_source.id).all()
         assert len(results) == 1
         assert results[0].value == Decimal("80.00")
+
+
+class TestHealthScoreRepositoryMissingSourceAdoption:
+    def test_adopts_only_null_scores_inside_bounded_window(
+        self,
+        db: Session,
+        repo: HealthScoreRepository,
+    ) -> None:
+        user = UserFactory()
+        connection = UserConnectionFactory(user=user, provider="whoop")
+        source = DataSourceFactory(
+            user=user,
+            provider=ProviderName.WHOOP,
+            source="whoop",
+            user_connection_id=connection.id,
+        )
+        inside = HealthScoreFactory(
+            user_id=user.id,
+            data_source_id=None,
+            provider=ProviderName.WHOOP,
+            category=HealthScoreCategory.RECOVERY,
+            recorded_at=datetime(2026, 8, 20, 8, tzinfo=timezone.utc),
+        )
+        outside = HealthScoreFactory(
+            user_id=user.id,
+            data_source_id=None,
+            provider=ProviderName.WHOOP,
+            category=HealthScoreCategory.RECOVERY,
+            recorded_at=datetime(2026, 8, 19, 8, tzinfo=timezone.utc),
+        )
+
+        adopted = repo.adopt_missing_data_sources(
+            db,
+            user_id=user.id,
+            provider=ProviderName.WHOOP,
+            data_source_id=source.id,
+            start_datetime=datetime(2026, 8, 20, tzinfo=timezone.utc),
+            end_datetime=datetime(2026, 8, 21, tzinfo=timezone.utc),
+        )
+
+        assert adopted == 1
+        assert inside.data_source_id == source.id
+        assert outside.data_source_id is None
+
+    def test_matching_attribution_is_idempotent(
+        self,
+        db: Session,
+        repo: HealthScoreRepository,
+    ) -> None:
+        user = UserFactory()
+        connection = UserConnectionFactory(user=user, provider="whoop")
+        source = DataSourceFactory(
+            user=user,
+            provider=ProviderName.WHOOP,
+            source="whoop",
+            user_connection_id=connection.id,
+        )
+        score = HealthScoreFactory(
+            user_id=user.id,
+            data_source_id=source.id,
+            provider=ProviderName.WHOOP,
+            category=HealthScoreCategory.SLEEP,
+            recorded_at=datetime(2026, 8, 20, 8, tzinfo=timezone.utc),
+        )
+
+        adopted = repo.adopt_missing_data_sources(
+            db,
+            user_id=user.id,
+            provider=ProviderName.WHOOP,
+            data_source_id=source.id,
+            start_datetime=datetime(2026, 8, 20, tzinfo=timezone.utc),
+            end_datetime=datetime(2026, 8, 21, tzinfo=timezone.utc),
+        )
+
+        assert adopted == 0
+        assert score.data_source_id == source.id
+
+    def test_rejects_ambiguous_connection_backed_sources(
+        self,
+        db: Session,
+        repo: HealthScoreRepository,
+    ) -> None:
+        user = UserFactory()
+        connection = UserConnectionFactory(user=user, provider="whoop")
+        source = DataSourceFactory(
+            user=user,
+            provider=ProviderName.WHOOP,
+            source="whoop",
+            device_model=None,
+            user_connection_id=connection.id,
+        )
+        DataSourceFactory(
+            user=user,
+            provider=ProviderName.WHOOP,
+            source="whoop",
+            device_model="legacy-device",
+            user_connection_id=connection.id,
+        )
+        HealthScoreFactory(
+            user_id=user.id,
+            data_source_id=None,
+            provider=ProviderName.WHOOP,
+            category=HealthScoreCategory.RECOVERY,
+            recorded_at=datetime(2026, 8, 20, 8, tzinfo=timezone.utc),
+        )
+
+        with pytest.raises(HealthScoreProvenanceConflictError, match="unambiguous"):
+            repo.adopt_missing_data_sources(
+                db,
+                user_id=user.id,
+                provider=ProviderName.WHOOP,
+                data_source_id=source.id,
+                start_datetime=datetime(2026, 8, 20, tzinfo=timezone.utc),
+                end_datetime=datetime(2026, 8, 21, tzinfo=timezone.utc),
+            )
+
+    def test_rejects_window_already_attributed_to_different_source(
+        self,
+        db: Session,
+        repo: HealthScoreRepository,
+    ) -> None:
+        user = UserFactory()
+        connection = UserConnectionFactory(user=user, provider="whoop")
+        canonical_source = DataSourceFactory(
+            user=user,
+            provider=ProviderName.WHOOP,
+            source="whoop",
+            device_model=None,
+            user_connection_id=connection.id,
+        )
+        legacy_source = DataSourceFactory(
+            user=user,
+            provider=ProviderName.GARMIN,
+            source="garmin",
+            device_model="legacy-device",
+            user_connection_id=None,
+        )
+        HealthScoreFactory(
+            user_id=user.id,
+            data_source_id=legacy_source.id,
+            provider=ProviderName.WHOOP,
+            category=HealthScoreCategory.RECOVERY,
+            recorded_at=datetime(2026, 8, 20, 8, tzinfo=timezone.utc),
+        )
+
+        with pytest.raises(HealthScoreProvenanceConflictError, match="different data source"):
+            repo.adopt_missing_data_sources(
+                db,
+                user_id=user.id,
+                provider=ProviderName.WHOOP,
+                data_source_id=canonical_source.id,
+                start_datetime=datetime(2026, 8, 20, tzinfo=timezone.utc),
+                end_datetime=datetime(2026, 8, 21, tzinfo=timezone.utc),
+            )
+
+    def test_rejects_inactive_connection(self, db: Session, repo: HealthScoreRepository) -> None:
+        user = UserFactory()
+        connection = UserConnectionFactory(
+            user=user,
+            provider="whoop",
+            status=ConnectionStatus.REVOKED,
+        )
+        source = DataSourceFactory(
+            user=user,
+            provider=ProviderName.WHOOP,
+            source="whoop",
+            user_connection_id=connection.id,
+        )
+        HealthScoreFactory(
+            user_id=user.id,
+            data_source_id=None,
+            provider=ProviderName.WHOOP,
+            category=HealthScoreCategory.RECOVERY,
+            recorded_at=datetime(2026, 8, 20, 8, tzinfo=timezone.utc),
+        )
+
+        with pytest.raises(HealthWriteAuthorityError, match="active user connection"):
+            repo.adopt_missing_data_sources(
+                db,
+                user_id=user.id,
+                provider=ProviderName.WHOOP,
+                data_source_id=source.id,
+                start_datetime=datetime(2026, 8, 20, tzinfo=timezone.utc),
+                end_datetime=datetime(2026, 8, 21, tzinfo=timezone.utc),
+            )
 
 
 def test_concurrent_bulk_create_serializes_absent_identity_and_rejects_conflicting_source(

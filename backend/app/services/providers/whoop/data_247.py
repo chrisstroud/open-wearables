@@ -491,6 +491,18 @@ class Whoop247Data(Base247DataTemplate):
             db, user_id, user_connection_id
         )
 
+        if user_connection_id is not None:
+            data_source = self._ensure_whoop_data_source(db, user_id, user_connection_id)
+            results["health_scores_attributed"] = health_score_service.adopt_missing_data_sources(
+                db,
+                user_id=user_id,
+                provider=ProviderName.WHOOP,
+                data_source_id=data_source.id,
+                start_datetime=start_time,
+                end_datetime=end_time,
+            )
+            db.commit()
+
         return results
 
     # -------------------------------------------------------------------------
