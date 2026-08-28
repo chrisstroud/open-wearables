@@ -108,6 +108,50 @@ class TestSyncVendorDataTask:
 
     @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
     @patch("app.services.providers.factory.ProviderFactory.get_provider")
+    def test_whoop_sync_propagates_active_connection_identity_to_both_loaders(
+        self,
+        mock_get_provider: MagicMock,
+        mock_session_local: MagicMock,
+        db: Session,
+        mock_celery_app: MagicMock,
+    ) -> None:
+        """WHOOP writes must retain the concrete authorization that produced them."""
+        user = UserFactory()
+        connection = UserConnectionFactory(
+            user=user,
+            provider="whoop",
+            status=ConnectionStatus.ACTIVE,
+        )
+
+        mock_session_local.return_value.__enter__.return_value = db
+        mock_session_local.return_value.__exit__.return_value = None
+
+        workouts = MagicMock()
+        workouts.load_data.return_value = 1
+        data_247 = MagicMock()
+        data_247.load_and_save_all.return_value = {}
+        strategy = MagicMock()
+        strategy.capabilities.rest_pull = True
+        strategy.capabilities.webhook_stream = True
+        strategy.workouts = workouts
+        strategy.data_247 = data_247
+        mock_get_provider.return_value = strategy
+
+        result = sync_vendor_data(
+            str(user.id),
+            start_date="2026-08-01T00:00:00Z",
+            end_date="2026-08-02T00:00:00Z",
+            providers=["whoop"],
+            is_historical=True,
+        )
+
+        assert workouts.load_data.call_args.kwargs["user_connection_id"] == connection.id
+        assert data_247.load_and_save_all.call_args.kwargs["user_connection_id"] == connection.id
+        assert "user_connection_id" not in result["providers_synced"]["whoop"]["params"]["workouts"]
+        assert "user_connection_id" not in result["providers_synced"]["whoop"]["params"]["data_247"]
+
+    @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
+    @patch("app.services.providers.factory.ProviderFactory.get_provider")
     def test_sync_vendor_data_multiple_providers(
         self,
         mock_get_provider: MagicMock,
