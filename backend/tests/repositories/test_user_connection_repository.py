@@ -528,6 +528,40 @@ class TestUserConnectionRepository:
         assert result.last_synced_at is not None
         assert abs((result.last_synced_at - now).total_seconds()) < 1
 
+    def test_update_last_synced_at_accepts_fixed_sync_window_end(
+        self,
+        db: Session,
+        connection_repo: UserConnectionRepository,
+    ) -> None:
+        """A caller can persist its pre-captured successful window end exactly."""
+        connection = UserConnectionFactory(last_synced_at=None)
+        sync_window_end = datetime(2026, 8, 30, 12, 34, 56, tzinfo=timezone.utc)
+
+        result = connection_repo.update_last_synced_at(
+            db,
+            connection,
+            synced_at=sync_window_end,
+        )
+
+        assert result.last_synced_at == sync_window_end
+
+    def test_update_last_synced_at_never_regresses_existing_cursor(
+        self,
+        db: Session,
+        connection_repo: UserConnectionRepository,
+    ) -> None:
+        """An older or naive fan-out window cannot move a newer cursor backward."""
+        existing_cursor = datetime(2026, 8, 31, 12, tzinfo=timezone.utc)
+        connection = UserConnectionFactory(last_synced_at=existing_cursor)
+
+        result = connection_repo.update_last_synced_at(
+            db,
+            connection,
+            synced_at=datetime(2026, 8, 30, 12),
+        )
+
+        assert result.last_synced_at == existing_cursor
+
     def test_get_all_with_filters(self, db: Session, connection_repo: UserConnectionRepository) -> None:
         """Test filtering connections using get_all."""
         # Arrange

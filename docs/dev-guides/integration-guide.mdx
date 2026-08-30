@@ -436,7 +436,7 @@ Returned when an invalid mode string or an explicit `null` is sent for `live_syn
 </Note>
 
 <Note>
-  **Pull mode and late revisions.** In `pull` mode each periodic sync starts from the connection's last synced time and moves forward, so a day a provider revises *after* we passed it (e.g. Oura finalising a step count once the ring finishes uploading) is not re-fetched. Set the server-side `PULL_SYNC_LOOKBACK` env var (compact duration — `2d`, `20h`, `90m`, `1d12h`; disabled by default, capped per provider by its `max_historical_days`) to re-fetch a trailing window on every live pull. Re-fetched days are upserted, so unchanged values stay as they are. `webhook` mode is unaffected — providers push the exact object that changed.
+  **Pull mode, late revisions, and cursors.** Every live pull captures one fixed end time before provider work begins and re-fetches a trailing window from the connection's last successful cursor. The default `PULL_SYNC_LOOKBACK` is `2d`; it accepts compact durations such as `20h`, `90m`, or `1d12h`, is capped per provider by `max_historical_days`, and can be disabled with `0m`. Re-fetched records use idempotent upserts, so unchanged values remain stable while late-finalised or revised records are refreshed. The cursor advances to the captured end only when every required provider substream succeeds, and it never moves backward if an older explicit window completes later; partial and failed pulls retry the same window next time. Historical pulls never change the live cursor, and `webhook` mode is unaffected.
 </Note>
 
 ### Get Authorization URL
@@ -1012,4 +1012,3 @@ async def main():
     View source code and contribute.
   </Card>
 </CardGroup>
-
