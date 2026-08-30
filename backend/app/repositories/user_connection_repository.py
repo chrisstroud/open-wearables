@@ -558,16 +558,31 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         db_session: DbSession,
         connection: UserConnection,
         *,
+        synced_at: datetime | None = None,
         commit: bool = True,
     ) -> UserConnection:
-        """Update the last synced timestamp."""
+        """Update the last synced timestamp, optionally to a fixed sync-window end."""
         connection = require_user_connection_authority(
             db_session,
             connection_id=connection.id,
             expected_user_id=connection.user_id,
             expected_provider=connection.provider,
         )
-        connection.last_synced_at = datetime.now(timezone.utc)
+        candidate = synced_at if synced_at is not None else datetime.now(timezone.utc)
+        if candidate.tzinfo is None:
+            candidate = candidate.replace(tzinfo=timezone.utc)
+        else:
+            candidate = candidate.astimezone(timezone.utc)
+
+        current = connection.last_synced_at
+        if current is not None:
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=timezone.utc)
+            else:
+                current = current.astimezone(timezone.utc)
+            candidate = max(current, candidate)
+
+        connection.last_synced_at = candidate
         db_session.add(connection)
         if commit:
             db_session.commit()

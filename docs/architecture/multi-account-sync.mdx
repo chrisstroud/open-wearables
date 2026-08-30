@@ -75,8 +75,10 @@ Secondary profiles receive their data through the **webhook fan-out** described 
 For providers polled periodically (Whoop, Oura, Suunto — those in `PULL` live sync mode), `sync_vendor_data` runs per-user. When a connection has a `provider_user_id`:
 
 1. `try_become_primary(provider, provider_user_id, user_id, scope="pull")` is called.
-   - **Won** → performs the API call normally; after completion triggers `sync_vendor_data` for all other linked profiles with `_skip_linked_fan_out=True` so they receive the same date range without making their own API call; releases the lock.
-   - **Lost** → emits a `LINKED_ACCOUNT / SUCCESS` event, updates `last_synced_at`, and skips the API call for this connection.
+   - **Won** → captures one sync-window end, performs the provider work, and releases the lock. Only a fully successful pull advances the primary cursor and triggers `sync_vendor_data` for the other linked profiles with `_skip_linked_fan_out=True`; every fan-out receives the primary's exact effective start and end.
+   - **Lost** → skips the API call and leaves `last_synced_at` unchanged while the lock holder finishes. The later fan-out advances this profile independently only if its own required provider work succeeds.
+
+Partial or failed primary pulls do not fan out and do not advance any cursor. Successful cursor writes are monotonic, so an out-of-order fan-out with an older explicit window cannot regress a newer cursor. Historical fan-out preserves the same exact-window coordination but never changes the live cursor.
 
 The lock TTL is 4 hours. Because `sync_vendor_data` tasks for different profiles may run in any order, the "primary" role is simply the first task to acquire the lock in a given polling cycle. If the primary completes before a competing task runs, that task acquires a fresh lock and does its own pull — which is acceptable (one extra API call per cycle, no data corruption).
 

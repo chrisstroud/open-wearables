@@ -51,6 +51,23 @@ def _include_in_periodic_pull(caps: Any, live_sync_mode: LiveSyncMode | None, is
     return live_sync_mode == LiveSyncMode.PULL
 
 
+def _resolve_sync_window_end(end_date: str | None) -> tuple[datetime, str]:
+    """Capture one fixed upper bound for every provider substream in this task."""
+    captured_end = datetime.now(timezone.utc)
+    if end_date is None:
+        return captured_end, captured_end.isoformat()
+
+    try:
+        parsed_end = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+    except ValueError:
+        # Preserve the existing pass-through behaviour for provider-specific parsers.
+        return captured_end, end_date
+
+    if parsed_end.tzinfo is None:
+        parsed_end = parsed_end.replace(tzinfo=timezone.utc)
+    return parsed_end.astimezone(timezone.utc), end_date
+
+
 @shared_task
 def sync_vendor_data(
     user_id: str,
@@ -67,9 +84,10 @@ def sync_vendor_data(
     Args:
         user_id: UUID of the user to sync data for
         start_date: ISO 8601 date string for start of sync period.
-            When None, defaults to connection.last_synced_at (or now for first-ever sync)
-            so that live syncs never re-pull history.
-        end_date: ISO 8601 date string for end of sync period (None = current time)
+            When None, defaults to connection.last_synced_at minus the configured
+            live lookback (or the captured window end for a first-ever sync).
+        end_date: ISO 8601 date string for end of sync period. When None, one
+            current-time bound is captured before any provider work begins.
         providers: Optional list of provider names to sync (None = all active providers)
         is_historical: When True, skips updating last_synced_at so the live-sync
             cursor is not clobbered by a user-initiated historical pull.
@@ -113,6 +131,7 @@ def sync_vendor_data(
         start_date=start_date,
         end_date=end_date,
     )
+    sync_window_end, effective_end = _resolve_sync_window_end(end_date)
 
     with SessionLocal() as db:
         try:
@@ -223,34 +242,32 @@ def sync_vendor_data(
                         # task for this profile that emits a LINKED_ACCOUNT completed event
                         # once the actual data delivery is done.  A pre-emptive event here
                         # would show up as a duplicate in the sync log.
-                        if not is_historical:
-                            user_connection_repo.update_last_synced_at(db, connection)
                         result.providers_synced[provider_name] = ProviderSyncResult(
                             success=True, params={"linked_account": True}
                         )
                         continue
 
-                _emit_sync_status(
-                    started,
-                    user_uuid,
-                    provider_name,
-                    sync_source,
-                    run_id=run_id,
-                    message=(
-                        f"Historical sync from {provider_name} started"
-                        if is_historical
-                        else f"Live sync from {provider_name} started"
-                    ),
-                    primary_user_id=primary_uuid,
-                    metadata={
-                        "trace_id": trace_id,
-                        "is_historical": is_historical,
-                        "start_date": start_date,
-                        "end_date": end_date,
-                    },
-                )
-
                 try:
+                    _emit_sync_status(
+                        started,
+                        user_uuid,
+                        provider_name,
+                        sync_source,
+                        run_id=run_id,
+                        message=(
+                            f"Historical sync from {provider_name} started"
+                            if is_historical
+                            else f"Live sync from {provider_name} started"
+                        ),
+                        primary_user_id=primary_uuid,
+                        metadata={
+                            "trace_id": trace_id,
+                            "is_historical": is_historical,
+                            "start_date": start_date,
+                            "end_date": effective_end,
+                        },
+                    )
+
                     strategy = factory.get_provider(provider_name)
                     provider_result = ProviderSyncResult(success=True, params={})
 
@@ -261,8 +278,8 @@ def sync_vendor_data(
                     pull_updated = 0
                     applied_lookback: timedelta | None = None  # set when the lookback actually widened the window
 
-                    # Resolve effective start: explicit arg > last_synced_at > now
-                    # This ensures live syncs never re-pull history.
+                    # Resolve effective start: explicit arg > last_synced_at > window end.
+                    # Live pulls may intentionally re-fetch the configured trailing window.
                     effective_start = start_date
                     if effective_start is None:
                         last = connection.last_synced_at
@@ -272,20 +289,20 @@ def sync_vendor_data(
                             # Optional trailing lookback so late provider revisions get
                             # re-fetched (live pull only; capped by max_historical_days).
                             lookback = settings.pull_sync_lookback
-                            if lookback is not None and not is_historical:
+                            if lookback and not is_historical:
                                 last -= lookback
                                 max_days = strategy.capabilities.max_historical_days
                                 if max_days is not None:
-                                    last = max(last, datetime.now(timezone.utc) - timedelta(days=max_days))
+                                    last = max(last, sync_window_end - timedelta(days=max_days))
                                 applied_lookback = lookback
                             effective_start = last.isoformat()
                         else:
                             # First ever sync — start from now, historical must be explicit
-                            effective_start = datetime.now(timezone.utc).isoformat()
+                            effective_start = sync_window_end.isoformat()
 
                     # Sync workouts
                     if strategy.workouts:
-                        params = build_sync_params(effective_start, end_date)
+                        params = build_sync_params(effective_start, effective_end)
                         _emit_sync_status(
                             progress,
                             user_uuid,
@@ -337,10 +354,7 @@ def sync_vendor_data(
 
                         # effective_start is always set above; parse into datetime objects
                         start_dt = datetime.fromisoformat(effective_start.replace("Z", "+00:00"))
-                        end_dt = datetime.now(timezone.utc)
-                        if end_date:
-                            with suppress(ValueError):
-                                end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                        end_dt = sync_window_end
 
                         _emit_sync_status(
                             progress,
@@ -410,42 +424,6 @@ def sync_vendor_data(
                             )
                             provider_result.params["data_247"] = {"success": False, "error": str(e)}
 
-                    if not is_historical:
-                        user_connection_repo.update_last_synced_at(db, connection)
-
-                    if shared_token and connection.provider_user_id:
-                        release_primary(
-                            provider_name, connection.provider_user_id, user_uuid, shared_token, scope="pull"
-                        )
-                        # Fan-out: trigger sync for every other OW profile sharing this
-                        # provider account so they receive the same data.
-                        linked_connections = user_connection_repo.get_all_by_provider_user_id(
-                            db, provider_name, connection.provider_user_id
-                        )
-                        for linked_conn in linked_connections:
-                            if linked_conn.user_id == user_uuid:
-                                continue
-                            log_structured(
-                                logger,
-                                "info",
-                                f"Fanning out {provider_name} sync to linked profile",
-                                provider=provider_name,
-                                task="sync_vendor_data",
-                                user_id=user_id,
-                                linked_user_id=str(linked_conn.user_id),
-                            )
-                            sync_vendor_data.apply_async(
-                                kwargs={
-                                    "user_id": str(linked_conn.user_id),
-                                    "start_date": start_date,
-                                    "end_date": end_date,
-                                    "providers": [provider_name],
-                                    "is_historical": is_historical,
-                                    "_skip_linked_fan_out": True,
-                                    "_linked_primary_user_id": user_id,
-                                }
-                            )
-
                     result.providers_synced[provider_name] = provider_result
                     log_structured(
                         logger,
@@ -469,6 +447,37 @@ def sync_vendor_data(
                         final_status = SyncStatus.PARTIAL
                     else:
                         final_status = SyncStatus.SUCCESS
+
+                    if shared_token and connection.provider_user_id and final_status == SyncStatus.SUCCESS:
+                        # Fan-out only a fully successful pull. Linked profiles replay
+                        # the primary's exact bounded window and advance independently
+                        # only after their own provider work succeeds.
+                        linked_connections = user_connection_repo.get_all_by_provider_user_id(
+                            db, provider_name, connection.provider_user_id
+                        )
+                        for linked_conn in linked_connections:
+                            if linked_conn.user_id == user_uuid:
+                                continue
+                            log_structured(
+                                logger,
+                                "info",
+                                f"Fanning out {provider_name} sync to linked profile",
+                                provider=provider_name,
+                                task="sync_vendor_data",
+                                user_id=user_id,
+                                linked_user_id=str(linked_conn.user_id),
+                            )
+                            sync_vendor_data.apply_async(
+                                kwargs={
+                                    "user_id": str(linked_conn.user_id),
+                                    "start_date": effective_start,
+                                    "end_date": effective_end,
+                                    "providers": [provider_name],
+                                    "is_historical": is_historical,
+                                    "_skip_linked_fan_out": True,
+                                    "_linked_primary_user_id": user_id,
+                                }
+                            )
 
                     if final_status == SyncStatus.FAILED:
                         _emit_sync_status(
@@ -517,10 +526,6 @@ def sync_vendor_data(
                         )
 
                 except Exception as e:
-                    if shared_token and connection.provider_user_id:
-                        release_primary(
-                            provider_name, connection.provider_user_id, user_uuid, shared_token, scope="pull"
-                        )
                     _emit_sync_status(
                         failed,
                         user_uuid,
@@ -544,6 +549,20 @@ def sync_vendor_data(
                     )
                     result.errors[provider_name] = str(e)
                     continue
+                finally:
+                    if shared_token and connection.provider_user_id:
+                        release_primary(
+                            provider_name, connection.provider_user_id, user_uuid, shared_token, scope="pull"
+                        )
+
+                # Persist the cursor last: an exception anywhere after acquiring a
+                # shared lock leaves the previous window available for a safe retry.
+                if final_status == SyncStatus.SUCCESS and not is_historical:
+                    user_connection_repo.update_last_synced_at(
+                        db,
+                        connection,
+                        synced_at=sync_window_end,
+                    )
 
             return result.model_dump()
 
