@@ -424,18 +424,6 @@ def sync_vendor_data(
                             )
                             provider_result.params["data_247"] = {"success": False, "error": str(e)}
 
-                    result.providers_synced[provider_name] = provider_result
-                    log_structured(
-                        logger,
-                        "info",
-                        f"Successfully synced {provider_name} for user {user_id}",
-                        provider=provider_name,
-                        task="sync_vendor_data",
-                        user_id=user_id,
-                        effective_start=effective_start,
-                        lookback=format_duration(settings.pull_sync_lookback) if settings.pull_sync_lookback else None,
-                    )
-
                     sub_results = list(provider_result.params.values())
                     all_failed = bool(sub_results) and all(
                         isinstance(r, dict) and r.get("success") is False for r in sub_results
@@ -447,6 +435,24 @@ def sync_vendor_data(
                         final_status = SyncStatus.PARTIAL
                     else:
                         final_status = SyncStatus.SUCCESS
+
+                    provider_result.success = final_status == SyncStatus.SUCCESS
+                    result.providers_synced[provider_name] = provider_result
+                    log_structured(
+                        logger,
+                        "info" if provider_result.success else "warning",
+                        (
+                            f"Successfully synced {provider_name} for user {user_id}"
+                            if provider_result.success
+                            else f"Sync from {provider_name} completed with status {final_status.value}"
+                        ),
+                        provider=provider_name,
+                        task="sync_vendor_data",
+                        user_id=user_id,
+                        effective_start=effective_start,
+                        lookback=format_duration(settings.pull_sync_lookback) if settings.pull_sync_lookback else None,
+                        sync_status=final_status.value,
+                    )
 
                     if shared_token and connection.provider_user_id and final_status == SyncStatus.SUCCESS:
                         # Fan-out only a fully successful pull. Linked profiles replay
