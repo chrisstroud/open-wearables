@@ -25,6 +25,9 @@ from app.repositories import (
     EventRecordRepository,
     HealthScoreRepository,
 )
+from app.repositories.health_write_authority import (
+    scoped_health_maintenance_authority,
+)
 from app.schemas.enums import WORKOUTS_WITH_PACE, HealthScoreCategory, ProviderName
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
@@ -163,30 +166,31 @@ class EventRecordService(
         been flushed, so sleep_score_service sees up-to-date rows within the
         same transaction.
         """
-        for d in sleep_dates:
-            self.health_score_repo.delete_for_user_date(db_session, user_id, d, HealthScoreCategory.SLEEP)
-        scores = sleep_score_service.get_sleep_scores_for_date_range(db_session, user_id, list(sleep_dates))
-        if not scores:
-            return
-        creators = [
-            HealthScoreCreate(
-                id=uuid4(),
-                user_id=user_id,
-                data_source_id=None,
-                provider=ProviderName.INTERNAL,
-                category=HealthScoreCategory.SLEEP,
-                value=result.overall_score,
-                recorded_at=datetime(d.year, d.month, d.day, tzinfo=timezone.utc),
-                components={
-                    "duration": ScoreComponent(value=result.breakdown.duration.score),
-                    "stages": ScoreComponent(value=result.breakdown.stages.score),
-                    "consistency": ScoreComponent(value=result.breakdown.consistency.score),
-                    "interruptions": ScoreComponent(value=result.breakdown.interruptions.score),
-                },
-            )
-            for d, result in scores.items()
-        ]
-        self.health_score_repo.bulk_create(db_session, creators)
+        with scoped_health_maintenance_authority(db_session, user_id=user_id):
+            for d in sleep_dates:
+                self.health_score_repo.delete_for_user_date(db_session, user_id, d, HealthScoreCategory.SLEEP)
+            scores = sleep_score_service.get_sleep_scores_for_date_range(db_session, user_id, list(sleep_dates))
+            if not scores:
+                return
+            creators = [
+                HealthScoreCreate(
+                    id=uuid4(),
+                    user_id=user_id,
+                    data_source_id=None,
+                    provider=ProviderName.INTERNAL,
+                    category=HealthScoreCategory.SLEEP,
+                    value=result.overall_score,
+                    recorded_at=datetime(d.year, d.month, d.day, tzinfo=timezone.utc),
+                    components={
+                        "duration": ScoreComponent(value=result.breakdown.duration.score),
+                        "stages": ScoreComponent(value=result.breakdown.stages.score),
+                        "consistency": ScoreComponent(value=result.breakdown.consistency.score),
+                        "interruptions": ScoreComponent(value=result.breakdown.interruptions.score),
+                    },
+                )
+                for d, result in scores.items()
+            ]
+            self.health_score_repo.bulk_create(db_session, creators)
 
     def find_adjacent_sleep_record(
         self,
