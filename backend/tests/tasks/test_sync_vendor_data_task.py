@@ -327,6 +327,7 @@ class TestSyncVendorDataTask:
 
         assert result["providers_synced"]["oura"]["params"]["workouts"]["success"] is True
         assert result["providers_synced"]["oura"]["params"]["data_247"]["success"] is False
+        assert result["providers_synced"]["oura"]["success"] is False
         db.refresh(connection)
         assert connection.last_synced_at == original_watermark
         mock_release.assert_called_once()
@@ -637,6 +638,7 @@ class TestSyncVendorDataTask:
         # Assert
         assert str(result["user_id"]) == str(user.id)
         assert "garmin" in result["providers_synced"]
+        assert result["providers_synced"]["garmin"]["success"] is False
         assert result["providers_synced"]["garmin"]["params"]["workouts"]["success"] is False
         assert "Provider API unavailable" in result["providers_synced"]["garmin"]["params"]["workouts"]["error"]
 
@@ -671,6 +673,7 @@ class TestSyncVendorDataTask:
 
         # Assert - provider is added to providers_synced with workouts success=False
         assert "polar" in result["providers_synced"]
+        assert result["providers_synced"]["polar"]["success"] is False
         assert result["providers_synced"]["polar"]["params"]["workouts"]["success"] is False
         assert result["errors"] == {}
 

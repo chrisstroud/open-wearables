@@ -16,6 +16,7 @@ from app.repositories.health_write_authority import (
     HealthWriteAuthorityError,
     acquire_health_maintenance_authority,
     require_health_write_authority,
+    scoped_health_maintenance_authority,
 )
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.auth import ConnectionStatus
@@ -181,6 +182,28 @@ def test_internal_score_requires_generation_bound_maintenance_authority(db: Sess
     repo.bulk_create(db, [creator])
     db.commit()
     assert db.get(HealthScore, creator.id) is not None
+
+
+def test_scoped_maintenance_authority_restores_the_prior_session_capability(db: Session) -> None:
+    prior_user = UserFactory(health_evidence_generation=2)
+    current_user = UserFactory(health_evidence_generation=3)
+    prior_authority = (prior_user.id, prior_user.health_evidence_generation)
+    db.info["health_maintenance_authority"] = prior_authority
+
+    def fail_derived_score() -> None:
+        assert db.info["health_maintenance_authority"] == (
+            current_user.id,
+            current_user.health_evidence_generation,
+        )
+        raise RuntimeError("derived score failed")
+
+    with (
+        pytest.raises(RuntimeError, match="derived score failed"),
+        scoped_health_maintenance_authority(db, user_id=current_user.id),
+    ):
+        fail_derived_score()
+
+    assert db.info["health_maintenance_authority"] == prior_authority
 
 
 def test_multi_source_allows_cloud_writes_but_apple_requires_current_v2_installation(db: Session) -> None:
