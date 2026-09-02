@@ -1,11 +1,15 @@
 from datetime import datetime
 from logging import Logger, getLogger
-from uuid import UUID
+from uuid import UUID, uuid4
+
+from fastapi import HTTPException, status
 
 from app.database import DbSession
 from app.models import UserConnection
 from app.repositories.data_source_repository import DataSourceRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
+from app.repositories.whoop_sync_dispatch_repository import WhoopSyncDispatchRepository
+from app.schemas.auth import ConnectionStatus
 from app.schemas.enums import ProviderName
 from app.schemas.model_crud.user_management import UserConnectionCreate, UserConnectionUpdate
 from app.schemas.responses.upload import ConnectionsCoverage, ProviderConnectionCount
@@ -60,34 +64,125 @@ class UserConnectionService(
 
     @handle_exceptions
     def disconnect(
-        self, db_session: DbSession, user_id: UUID, provider: str, oauth: BaseOAuthTemplate | None = None
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        provider: str,
+        oauth: BaseOAuthTemplate | None = None,
+        *,
+        expected_connection_id: UUID | None = None,
+        expected_authorization_generation: int | None = None,
     ) -> None:
         """Disconnect a user from a provider. Raises 404 if connection not found.
 
         If oauth is provided, calls the provider's deregistration API before clearing tokens.
         Deregistration failures are logged but do not block the disconnect.
         """
-        if oauth:
-            self._deregister_from_provider(db_session, user_id, provider, oauth)
-
-        updated = self.crud.disconnect(db_session, user_id, provider)
-        if updated:
-            self.logger.info("Revoked connection for user %s from provider %s", user_id, provider)
-            connection = self.crud.get_by_user_and_provider(db_session, user_id, provider)
-            if connection:
-                on_connection_revoked(
-                    user_id=user_id,
-                    provider=provider,
-                    connection_id=connection.id,
-                    reason="user_disconnected",
-                    revoked_at=connection.updated_at.isoformat(),
-                )
-            return
-
-        # Nothing updated - check if connection exists (already revoked) or not found
+        lease_token: UUID | None = None
+        whoop_connection_id: UUID | None = None
+        whoop_authorization_generation: int | None = None
+        dispatch_repository: WhoopSyncDispatchRepository | None = None
         connection = self.crud.get_by_user_and_provider(db_session, user_id, provider)
-        if not connection:
-            raise ResourceNotFoundError("connection", user_id)
+        if expected_connection_id is not None or expected_authorization_generation is not None:
+            if expected_connection_id is None or expected_authorization_generation is None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Exact provider disconnect authority is incomplete",
+                )
+            if (
+                connection is None
+                or connection.id != expected_connection_id
+                or connection.authorization_generation != expected_authorization_generation
+                or connection.status != ConnectionStatus.ACTIVE
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Provider authorization changed; refresh before disconnecting",
+                )
+
+        if provider == "whoop":
+            if connection is None:
+                raise ResourceNotFoundError("connection", user_id)
+            whoop_connection_id = connection.id
+            whoop_authorization_generation = connection.authorization_generation
+            lease_token = uuid4()
+            dispatch_repository = WhoopSyncDispatchRepository()
+            if not dispatch_repository.try_acquire_authorization_lease(
+                db_session,
+                user_id=user_id,
+                connection_id=whoop_connection_id,
+                authorization_generation=whoop_authorization_generation,
+                lease_token=lease_token,
+                lease_kind="disconnect",
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="WHOOP authorization is busy; retry disconnect after the current operation finishes",
+                )
+
+        try:
+            if oauth:
+                self._deregister_from_provider(db_session, user_id, provider, oauth)
+
+            if (
+                dispatch_repository is not None
+                and lease_token is not None
+                and whoop_connection_id is not None
+                and whoop_authorization_generation is not None
+                and not dispatch_repository.renew_authorization_lease(
+                    db_session,
+                    user_id=user_id,
+                    connection_id=whoop_connection_id,
+                    authorization_generation=whoop_authorization_generation,
+                    lease_token=lease_token,
+                    lease_kind="disconnect",
+                )
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="WHOOP disconnect authority expired; retry disconnect",
+                )
+
+            updated = self.crud.disconnect(
+                db_session,
+                user_id,
+                provider,
+                expected_whoop_connection_id=whoop_connection_id,
+                expected_whoop_authorization_generation=whoop_authorization_generation,
+                expected_whoop_lease_token=lease_token,
+                expected_connection_id=expected_connection_id,
+                expected_authorization_generation=expected_authorization_generation,
+            )
+            if updated:
+                self.logger.info("Revoked connection for user %s from provider %s", user_id, provider)
+                connection = self.crud.get_by_user_and_provider(db_session, user_id, provider)
+                if connection:
+                    on_connection_revoked(
+                        user_id=user_id,
+                        provider=provider,
+                        connection_id=connection.id,
+                        reason="user_disconnected",
+                        revoked_at=connection.updated_at.isoformat(),
+                    )
+                return
+
+            # Nothing updated - check if connection exists (already revoked) or not found
+            connection = self.crud.get_by_user_and_provider(db_session, user_id, provider)
+            if not connection:
+                raise ResourceNotFoundError("connection", user_id)
+            if connection.status != ConnectionStatus.REVOKED:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Provider disconnect was not confirmed",
+                )
+        finally:
+            if dispatch_repository is not None and lease_token is not None:
+                db_session.rollback()
+                dispatch_repository.release_authorization_lease(
+                    db_session,
+                    user_id=user_id,
+                    lease_token=lease_token,
+                )
 
     @handle_exceptions
     def purge_provider_data(

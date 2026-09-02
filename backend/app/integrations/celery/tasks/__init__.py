@@ -48,6 +48,10 @@ from .seed_data_task import generate_seed_data
 from .send_email_task import send_invitation_email_task
 from .sync_vendor_data_task import sync_vendor_data
 from .webhook_push_task import process_webhook_push
+from .whoop_sync_dispatch_task import (
+    drain_whoop_sync_dispatch_outbox,
+    execute_whoop_sync_dispatch,
+)
 
 __all__ = [
     # Garmin backfill (30-day webhook-based sync)
@@ -83,6 +87,8 @@ __all__ = [
     "process_webhook_push",
     "register_provider_webhooks",
     "renew_oura_webhooks",
+    "drain_whoop_sync_dispatch_outbox",
+    "execute_whoop_sync_dispatch",
     # Outgoing webhooks
     "emit_webhook_event",
 ]

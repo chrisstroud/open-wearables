@@ -25,6 +25,7 @@ class UserConnectionCreate(UserConnectionBase):
     access_token: str | None = None  # Optional for SDK-based providers (e.g., Apple)
     refresh_token: str | None = None
     token_expires_at: datetime | None = None  # Optional for SDK-based providers
+    authorization_generation: int = Field(default=1, ge=1)
     status: ConnectionStatus = ConnectionStatus.ACTIVE
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -52,6 +53,7 @@ class UserConnectionRead(UserConnectionBase):
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
     id: UUID
+    authorization_generation: int
     status: ConnectionStatus
     last_synced_at: datetime | None
     created_at: datetime

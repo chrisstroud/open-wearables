@@ -156,6 +156,12 @@ def create_celery() -> Celery:
             "args": (),
             "kwargs": {},
         },
+        "drain-whoop-sync-dispatch-outbox": {
+            "task": "app.integrations.celery.tasks.whoop_sync_dispatch_task.drain_whoop_sync_dispatch_outbox",
+            "schedule": 15.0,
+            "args": (),
+            "kwargs": {},
+        },
         "run-daily-archival": {
             "task": "app.integrations.celery.tasks.archival_task.run_daily_archival",
             "schedule": crontab(hour=3, minute=0),  # Daily at 03:00 UTC

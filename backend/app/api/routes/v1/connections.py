@@ -83,6 +83,32 @@ def disconnect_provider_endpoint(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+@router.delete(
+    "/users/{user_id}/connections/{provider}/{connection_id}/authorizations/{authorization_generation}",
+)
+def disconnect_exact_provider_authorization_endpoint(
+    user_id: UUID,
+    provider: ProviderName,
+    connection_id: UUID,
+    authorization_generation: int,
+    db: DbSession,
+    _api_key: ApiKeyDep,
+) -> Response:
+    """Disconnect only the exact WHOOP authorization reviewed by the caller."""
+    if provider is not ProviderName.WHOOP or authorization_generation < 1:
+        return Response(status_code=status.HTTP_409_CONFLICT)
+    strategy = ProviderFactory().get_provider(provider.value)
+    user_connection_service.disconnect(
+        db,
+        user_id,
+        provider.value,
+        oauth=strategy.oauth,
+        expected_connection_id=connection_id,
+        expected_authorization_generation=authorization_generation,
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.delete("/users/{user_id}/connections/{provider}/data")
 def delete_provider_data_endpoint(
     user_id: UUID,

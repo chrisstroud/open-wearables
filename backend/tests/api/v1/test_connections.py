@@ -319,6 +319,62 @@ class TestDisconnectEndpoint:
         conn = db.query(UserConnection).filter_by(user_id=user.id, provider="garmin").one()
         assert conn.status == ConnectionStatus.REVOKED
 
+    def test_disconnects_only_the_exact_whoop_authorization(
+        self,
+        client: TestClient,
+        db: Session,
+    ) -> None:
+        user = UserFactory()
+        connection = UserConnectionFactory(
+            user=user,
+            provider="whoop",
+            status=ConnectionStatus.ACTIVE,
+            authorization_generation=4,
+            access_token=None,
+        )
+        api_key = ApiKeyFactory()
+        headers = api_key_headers(api_key.id)
+
+        stale = client.delete(
+            f"/api/v1/users/{user.id}/connections/whoop/{connection.id}/authorizations/3",
+            headers=headers,
+        )
+        assert stale.status_code == 409
+        db.refresh(connection)
+        assert connection.status == ConnectionStatus.ACTIVE
+
+        current = client.delete(
+            f"/api/v1/users/{user.id}/connections/whoop/{connection.id}/authorizations/4",
+            headers=headers,
+        )
+        assert current.status_code == 204
+        db.refresh(connection)
+        assert connection.status == ConnectionStatus.REVOKED
+
+    def test_exact_authorization_disconnect_rejects_non_whoop_provider(
+        self,
+        client: TestClient,
+        db: Session,
+    ) -> None:
+        user = UserFactory()
+        connection = UserConnectionFactory(
+            user=user,
+            provider="garmin",
+            status=ConnectionStatus.ACTIVE,
+            authorization_generation=4,
+            access_token=None,
+        )
+        api_key = ApiKeyFactory()
+
+        response = client.delete(
+            f"/api/v1/users/{user.id}/connections/garmin/{connection.id}/authorizations/4",
+            headers=api_key_headers(api_key.id),
+        )
+
+        assert response.status_code == 409
+        db.refresh(connection)
+        assert connection.status == ConnectionStatus.ACTIVE
+
     def test_disconnect_clears_tokens(self, client: TestClient, db: Session) -> None:
         """Test that disconnecting clears access_token, refresh_token, and token_expires_at."""
         # Arrange

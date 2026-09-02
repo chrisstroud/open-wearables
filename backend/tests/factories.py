@@ -390,6 +390,7 @@ class UserConnectionFactory(BaseFactory):
     refresh_token = LazyFunction(lambda: f"refresh_{uuid4().hex}")
     token_expires_at = LazyFunction(lambda: datetime(2025, 12, 31, tzinfo=timezone.utc))  # Optional for SDK providers
     scope = "read_all"
+    authorization_generation = 1
     status = ConnectionStatus.ACTIVE
     last_synced_at = None
     created_at = LazyFunction(lambda: datetime.now(timezone.utc))

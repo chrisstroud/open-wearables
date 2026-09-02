@@ -27,6 +27,8 @@ from .sleep_details import SleepDetails
 from .user import User
 from .user_connection import UserConnection
 from .user_invitation_code import UserInvitationCode
+from .whoop_authorization_lease import WhoopAuthorizationLease
+from .whoop_sync_dispatch_receipt import WhoopSyncDispatchReceipt
 from .workout_details import WorkoutDetails
 
 # Single source of truth mapping detail_type -> concrete model, derived from the
@@ -57,6 +59,8 @@ __all__ = [
     "MenstrualCycleDetails",
     "SleepDetails",
     "WorkoutDetails",
+    "WhoopAuthorizationLease",
+    "WhoopSyncDispatchReceipt",
     "PersonalRecord",
     "DataPointSeries",
     "SeriesTypeDefinition",
