@@ -144,17 +144,19 @@ def _content_coverage(request: SDKSyncRequest) -> tuple[list[str], str | None, s
     return sorted(type_identifiers), lower.isoformat(), upper.isoformat()
 
 
-def validated_content_coverage(request_content: str) -> dict[str, list[str] | str | None]:
+def validated_content_coverage(request_content: str) -> dict[str, list[str] | str | bool | None]:
     """Return privacy-safe bounds/types and any exact compact revision-set digest."""
     raw = json.loads(request_content)
     request = SDKSyncRequest.model_validate(raw)
     covered_types, content_lower, content_upper = _content_coverage(request)
-    result: dict[str, list[str] | str | None] = {
+    result: dict[str, list[str] | str | bool | None] = {
         "covered_type_identifiers": covered_types,
         "content_lower_bound_inclusive": content_lower,
         "content_upper_bound_exclusive": content_upper,
     }
-    if request.schema_version == "apple-health-daily-summary.v1":
+    is_daily_summary_envelope = request.schema_version == "apple-health-daily-summary.v1"
+    result["daily_summary_envelope"] = is_daily_summary_envelope
+    if is_daily_summary_envelope:
         result["revision_set_digest"] = calculate_revision_set_digest(request.data)
     return result
 

@@ -15,10 +15,36 @@ from app.services.sdk_client_installation_service import sdk_client_installation
 logger = getLogger(__name__)
 MAX_COVERED_TYPE_IDENTIFIERS = 256
 LOWERCASE_HEX_DIGITS = frozenset("0123456789abcdef")
+EMPTY_REVISION_SET_DIGEST = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 
 def is_revision_set_digest(value: object) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(character in LOWERCASE_HEX_DIGITS for character in value)
+
+
+def is_valid_revision_set_result(
+    daily_summaries_saved: int,
+    revision_set_digest: object,
+    *,
+    daily_summary_envelope: bool,
+) -> bool:
+    """Validate the only receipt representations compact-summary imports may publish."""
+    if daily_summaries_saved < 0:
+        return False
+    if not daily_summary_envelope:
+        return daily_summaries_saved == 0 and revision_set_digest is None
+    if daily_summaries_saved == 0:
+        return revision_set_digest == EMPTY_REVISION_SET_DIGEST
+    return is_revision_set_digest(revision_set_digest) and revision_set_digest != EMPTY_REVISION_SET_DIGEST
+
+
+def is_valid_stored_revision_set_state(daily_summaries_saved: int, revision_set_digest: object) -> bool:
+    """Validate the persisted union of raw receipts and compact-summary receipts."""
+    return is_valid_revision_set_result(
+        daily_summaries_saved,
+        revision_set_digest,
+        daily_summary_envelope=revision_set_digest is not None,
+    )
 
 
 @dataclass(frozen=True)
@@ -206,8 +232,10 @@ class SDKBatchReceiptService:
 
         daily_summaries_saved = int(result.get("daily_summaries_saved", 0) or 0)
         revision_set_digest = result.get("revision_set_digest")
-        if (daily_summaries_saved > 0 and not is_revision_set_digest(revision_set_digest)) or (
-            daily_summaries_saved == 0 and revision_set_digest is not None
+        if not is_valid_revision_set_result(
+            daily_summaries_saved,
+            revision_set_digest,
+            daily_summary_envelope=result.get("daily_summary_envelope") is True,
         ):
             # The importer and receipt publication share a transaction. Roll it
             # back before fencing the receipt so a digest regression cannot
@@ -365,7 +393,7 @@ class SDKBatchReceiptService:
             status == SDKBatchReceiptStatus.SUCCEEDED
             and receipt.dropped_count == 0
             and receipt.tombstones_unresolved == 0
-            and (receipt.daily_summaries_saved == 0 or is_revision_set_digest(receipt.revision_set_digest))
+            and is_valid_stored_revision_set_state(receipt.daily_summaries_saved, receipt.revision_set_digest)
         )
         return SDKBatchReceiptResponse(
             batch_id=receipt.id,

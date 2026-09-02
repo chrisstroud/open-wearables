@@ -162,6 +162,7 @@ async def get_sdk_auth(
                     app_id=app_id,
                     installation_id=installation.id if installation is not None else None,
                     installation_generation=installation.generation if installation is not None else None,
+                    protocol_version=installation.protocol_version if installation is not None else None,
                     health_evidence_generation=(
                         payload.get("health_evidence_generation") if installation is not None else None
                     ),
@@ -236,6 +237,7 @@ async def get_sdk_revocation_auth(
         app_id=app_id,
         installation_id=installation.id,
         installation_generation=installation.generation,
+        protocol_version=installation.protocol_version,
         health_evidence_generation=payload.get("health_evidence_generation"),
     )
 

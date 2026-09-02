@@ -8,6 +8,8 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.database import BaseDbModel
 from app.mappings import FKUser, PrimaryKey, str_32, str_64, str_100
 
+EMPTY_REVISION_SET_DIGEST = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
 
 class SDKBatchReceipt(BaseDbModel):
     """Durable terminal acknowledgement state for a mobile SDK batch."""
@@ -40,10 +42,12 @@ class SDKBatchReceipt(BaseDbModel):
             name="ck_sdk_batch_receipt_revision_set_digest_format",
         ),
         CheckConstraint(
-            "(revision_set_digest IS NULL OR "
-            "(provider = 'apple' AND status = 'succeeded' AND daily_summaries_saved > 0)) "
-            "AND (daily_summaries_saved = 0 OR "
-            "(provider = 'apple' AND status = 'succeeded' AND revision_set_digest IS NOT NULL))",
+            "(revision_set_digest IS NULL AND daily_summaries_saved = 0) OR "
+            "(provider = 'apple' AND status = 'succeeded' AND "
+            "((daily_summaries_saved = 0 AND revision_set_digest = "
+            f"'{EMPTY_REVISION_SET_DIGEST}') OR "
+            "(daily_summaries_saved > 0 AND revision_set_digest <> "
+            f"'{EMPTY_REVISION_SET_DIGEST}')))",
             name="ck_sdk_batch_receipt_revision_set_digest_state",
         ),
         CheckConstraint(

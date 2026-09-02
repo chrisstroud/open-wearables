@@ -434,6 +434,7 @@ def _seed_daily_summary_state(
             "status_code": 200,
             "daily_summaries_saved": 1,
             "revision_set_digest": revision_set_digest,
+            "daily_summary_envelope": True,
         },
     )
 

@@ -1,11 +1,13 @@
 """Tests for SDK authentication utilities."""
 
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from app.schemas.model_crud.credentials.sdk_client_installation import SDKClientRegistration
+from app.services.sdk_client_installation_service import sdk_client_installation_service
 from app.services.sdk_token_service import create_sdk_user_token
 from app.utils.auth import get_current_developer, get_sdk_auth
 from tests.factories import ApiKeyFactory, DeveloperFactory, UserFactory
@@ -26,6 +28,42 @@ class TestGetSDKAuth:
         assert result.auth_type == "sdk_token"
         assert str(result.user_id) == user_id
         assert result.app_id == "app_123"
+        assert result.protocol_version is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("protocol_version", [2, 3])
+    async def test_first_class_sdk_token_returns_authenticated_installation_protocol(
+        self,
+        db: Session,
+        protocol_version: int,
+    ) -> None:
+        user = UserFactory()
+        installation = sdk_client_installation_service.activate(
+            db,
+            user_id=user.id,
+            registration=SDKClientRegistration(
+                installation_id=uuid4(),
+                bundle_id="fitness.dashboard.app",
+                app_version="1.0.0",
+                build_number="1",
+                protocol_version=protocol_version,
+            ),
+        )
+        token = create_sdk_user_token(
+            installation.app_id,
+            str(user.id),
+            installation_generation=installation.generation,
+            bundle_id=installation.bundle_id,
+            app_version=installation.app_version,
+            build_number=installation.build_number,
+            protocol_version=installation.protocol_version,
+            health_evidence_generation=installation.health_evidence_generation,
+        )
+
+        result = await get_sdk_auth(db=db, token=token, x_open_wearables_api_key=None)
+
+        assert result.installation_id == installation.id
+        assert result.protocol_version == protocol_version
 
     @pytest.mark.asyncio
     async def test_api_key_returns_context(self, db: Session) -> None:
@@ -36,6 +74,7 @@ class TestGetSDKAuth:
 
         assert result.auth_type == "api_key"
         assert result.api_key_id == api_key.id
+        assert result.protocol_version is None
 
     @pytest.mark.asyncio
     async def test_no_auth_raises_401(self, db: Session) -> None:

@@ -9,8 +9,10 @@ from starlette.testclient import TestClient
 
 from app.config import settings
 from app.models import SDKBatchReceipt
+from app.schemas.model_crud.credentials.sdk_client_installation import SDKClientRegistration
 from app.schemas.providers.mobile_sdk import SyncWindowManifest
 from app.services.sdk_batch_receipt_service import sdk_batch_receipt_service
+from app.services.sdk_client_installation_service import sdk_client_installation_service
 from app.services.sdk_sync_window_receipt_service import sdk_sync_window_receipt_service
 from app.services.sdk_token_service import create_sdk_user_token
 from tests.factories import ApiKeyFactory, UserFactory
@@ -46,6 +48,40 @@ def payload(value: int = 1) -> dict:
 
 def auth_headers(user_id: UUID, batch_id: UUID) -> dict[str, str]:
     token = create_sdk_user_token("test-app", str(user_id))
+    return {
+        "Authorization": f"Bearer {token}",
+        "X-Open-Wearables-Batch-ID": str(batch_id),
+    }
+
+
+def first_class_auth_headers(
+    db: Session,
+    user_id: UUID,
+    batch_id: UUID,
+    *,
+    protocol_version: int,
+) -> dict[str, str]:
+    installation = sdk_client_installation_service.activate(
+        db,
+        user_id=user_id,
+        registration=SDKClientRegistration(
+            installation_id=uuid4(),
+            bundle_id="fitness.dashboard.app",
+            app_version="1.0.0",
+            build_number="1",
+            protocol_version=protocol_version,
+        ),
+    )
+    token = create_sdk_user_token(
+        installation.app_id,
+        str(user_id),
+        installation_generation=installation.generation,
+        bundle_id=installation.bundle_id,
+        app_version=installation.app_version,
+        build_number=installation.build_number,
+        protocol_version=installation.protocol_version,
+        health_evidence_generation=installation.health_evidence_generation,
+    )
     return {
         "Authorization": f"Bearer {token}",
         "X-Open-Wearables-Batch-ID": str(batch_id),
@@ -219,6 +255,7 @@ class TestSDKBatchReceiptRoutes:
                 "status_code": 200,
                 "daily_summaries_saved": 1,
                 "revision_set_digest": revision_set_digest,
+                "daily_summary_envelope": True,
             },
         )
 
@@ -232,6 +269,87 @@ class TestSDKBatchReceiptRoutes:
         assert status_response.json()["revision_set_digest"] == revision_set_digest
         assert status_response.json()["accepted"] is True
         mock_sdk_worker.delay.assert_called_once()
+
+    def test_empty_daily_summary_digest_round_trips_on_duplicate_post_and_get(
+        self,
+        client: TestClient,
+        db: Session,
+        api_v1_prefix: str,
+        mock_sdk_worker: MagicMock,
+    ) -> None:
+        user = UserFactory()
+        batch_id = uuid4()
+        url = f"{api_v1_prefix}/sdk/users/{user.id}/sync"
+        headers = first_class_auth_headers(db, user.id, batch_id, protocol_version=3)
+        empty_revision_set_digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        body = {
+            "schema_version": "apple-health-daily-summary.v1",
+            "revision_set_digest": empty_revision_set_digest,
+            "provider": "apple",
+            "sdkVersion": "3.0.0",
+            "syncTimestamp": "2026-09-01T04:07:00Z",
+            "data": {"daily_summaries": [], "sleep": [], "workouts": []},
+        }
+
+        assert client.post(url, headers=headers, json=body).status_code == 202
+        claim = sdk_batch_receipt_service.claim_for_processing(db, batch_id)
+        assert claim.attempt_count is not None
+        sdk_batch_receipt_service.mark_succeeded(
+            db,
+            batch_id=batch_id,
+            attempt_count=claim.attempt_count,
+            result={
+                "status_code": 200,
+                "daily_summaries_saved": 0,
+                "revision_set_digest": empty_revision_set_digest,
+                "daily_summary_envelope": True,
+            },
+        )
+
+        duplicate = client.post(url, headers=headers, json=body)
+        assert duplicate.status_code == 200
+        assert duplicate.json()["accepted"] is True
+        assert duplicate.json()["revision_set_digest"] == empty_revision_set_digest
+
+        status_response = client.get(f"{url}/{batch_id}", headers=headers)
+        assert status_response.status_code == 200
+        assert status_response.json()["accepted"] is True
+        assert status_response.json()["revision_set_digest"] == empty_revision_set_digest
+        mock_sdk_worker.delay.assert_called_once()
+
+    def test_protocol_two_installation_cannot_enqueue_daily_summary_envelope(
+        self,
+        client: TestClient,
+        db: Session,
+        api_v1_prefix: str,
+        mock_sdk_worker: MagicMock,
+    ) -> None:
+        user = UserFactory()
+        batch_id = uuid4()
+        empty_revision_set_digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        body = {
+            "schema_version": "apple-health-daily-summary.v1",
+            "revision_set_digest": empty_revision_set_digest,
+            "provider": "apple",
+            "sdkVersion": "2.0.0",
+            "syncTimestamp": "2026-09-01T04:07:00Z",
+            "data": {"daily_summaries": [], "sleep": [], "workouts": []},
+        }
+
+        response = client.post(
+            f"{api_v1_prefix}/sdk/users/{user.id}/sync",
+            headers=first_class_auth_headers(db, user.id, batch_id, protocol_version=2),
+            json=body,
+        )
+
+        assert response.status_code == 426
+        assert response.json()["detail"] == {
+            "error_code": "daily_summary_protocol_version_required",
+            "retryable": False,
+            "required_protocol_version": 3,
+        }
+        assert db.get(SDKBatchReceipt, batch_id) is None
+        mock_sdk_worker.delay.assert_not_called()
 
     def test_terminal_drop_returns_409_and_never_redispatches(
         self,

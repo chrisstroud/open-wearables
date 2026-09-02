@@ -153,6 +153,8 @@ class AppleHealthDailySummaryRepository:
         )
         if installation is None:
             raise DailySummaryConflictError("daily_summary_revision_authority_conflict")
+        if installation.protocol_version != 3:
+            raise DailySummaryConflictError("daily_summary_protocol_version_required")
 
         identities = [(_summary_kind(summary), _stable_key(summary)) for summary in summaries]
         if len(identities) != len(set(identities)):

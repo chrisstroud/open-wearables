@@ -597,7 +597,14 @@ class SyncRequest(BaseModel):
             if raw_sleep or raw_workouts:
                 raise ValueError("daily-summary envelope cannot contain raw sleep or workout records")
             if not (self.data.daily_summaries or compact_sleep or compact_workouts):
-                raise ValueError("daily-summary envelope must contain at least one summary revision")
+                required_empty_collections = {"daily_summaries", "sleep", "workouts"}
+                if "data" not in self.model_fields_set or not required_empty_collections.issubset(
+                    self.data.model_fields_set
+                ):
+                    raise ValueError(
+                        "zero-revision daily-summary envelope must explicitly declare empty "
+                        "daily_summaries, sleep, and workouts collections"
+                    )
         elif self.revision_set_digest is not None:
             raise ValueError("revision_set_digest requires the daily-summary envelope schema")
         elif self.data.daily_summaries or compact_sleep or compact_workouts:
