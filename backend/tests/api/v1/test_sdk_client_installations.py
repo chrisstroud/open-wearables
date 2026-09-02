@@ -723,8 +723,83 @@ class TestSDKClientInstallationManagement:
 
         assert first.status_code == 200
         assert retry.status_code == 200
-        assert first.json()["id"] == retry.json()["id"]
-        assert retry.json()["status"] == "revoked"
+        assert first.json() == retry.json()
+        assert retry.json() == {
+            "installation_id": paired.json()["installation_id"],
+            "status": "revoked",
+            "revoked_at": retry.json()["revoked_at"],
+        }
+        assert retry.json()["revoked_at"]
+
+        expired_claims = jwt.decode(
+            paired.json()["access_token"],
+            settings.secret_key,
+            algorithms=[settings.algorithm],
+            options={"verify_exp": False},
+        )
+        expired_claims["exp"] = datetime.now(timezone.utc) - timedelta(minutes=1)
+        expired_access_token = jwt.encode(expired_claims, settings.secret_key, algorithm=settings.algorithm)
+        expired_retry = client.post(
+            endpoint,
+            headers={"Authorization": f"Bearer {expired_access_token}"},
+        )
+
+        assert expired_retry.status_code == 200
+        assert expired_retry.json() == first.json()
+
+        mismatched_claims = {**expired_claims, "installation_generation": expired_claims["installation_generation"] + 1}
+        mismatched_token = jwt.encode(mismatched_claims, settings.secret_key, algorithm=settings.algorithm)
+        mismatched_retry = client.post(
+            endpoint,
+            headers={"Authorization": f"Bearer {mismatched_token}"},
+        )
+        wrong_signature_token = jwt.encode(expired_claims, "wrong-signing-key", algorithm=settings.algorithm)
+        wrong_signature_retry = client.post(
+            endpoint,
+            headers={"Authorization": f"Bearer {wrong_signature_token}"},
+        )
+
+        assert mismatched_retry.status_code == 401
+        assert wrong_signature_retry.status_code == 401
+
+    def test_expired_phone_token_cannot_revoke_an_active_installation(
+        self,
+        client: TestClient,
+        db: Session,
+        api_v1_prefix: str,
+    ) -> None:
+        developer = DeveloperFactory()
+        user = UserFactory()
+        paired = redeem(
+            client,
+            api_v1_prefix,
+            code=generate_code(client, api_v1_prefix, user_id=user.id, developer_id=developer.id),
+            client_registration=registration(),
+        )
+        claims = jwt.decode(
+            paired.json()["access_token"],
+            settings.secret_key,
+            algorithms=[settings.algorithm],
+            options={"verify_exp": False},
+        )
+        claims["exp"] = datetime.now(timezone.utc) - timedelta(minutes=1)
+        expired_access_token = jwt.encode(claims, settings.secret_key, algorithm=settings.algorithm)
+
+        response = client.post(
+            f"{api_v1_prefix}/sdk/users/{user.id}/installation/revoke",
+            headers={"Authorization": f"Bearer {expired_access_token}"},
+        )
+        normal_sdk_response = client.get(
+            f"{api_v1_prefix}/sdk/users/{user.id}/sync/{uuid4()}",
+            headers={"Authorization": f"Bearer {expired_access_token}"},
+        )
+
+        assert response.status_code == 401
+        assert normal_sdk_response.status_code == 401
+        installation = db.get(SDKClientInstallation, UUID(paired.json()["installation_id"]))
+        assert installation is not None
+        assert installation.status == "active"
+        assert installation.revoked_at is None
 
     def test_api_key_cannot_upload_for_first_class_mobile_account(
         self,
