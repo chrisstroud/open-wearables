@@ -22,5 +22,6 @@ class SDKAuthContext(BaseModel):
     app_id: str | None = None  # From SDK token
     installation_id: UUID | None = None  # First-class mobile installation, when present
     installation_generation: int | None = None
+    protocol_version: int | None = None
     health_evidence_generation: int | None = None
     api_key_id: str | None = None  # From API key

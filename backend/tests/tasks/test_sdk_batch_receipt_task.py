@@ -117,6 +117,73 @@ class TestSDKBatchReceiptTask:
         completed.assert_not_called()
         failed.assert_called_once()
 
+    def test_zero_revision_checkpoint_envelope_publishes_exact_terminal_receipt(self, db: Session) -> None:
+        user = UserFactory()
+        installation = sdk_client_installation_service.activate(
+            db,
+            user_id=user.id,
+            registration=SDKClientRegistration(
+                installation_id=uuid4(),
+                bundle_id="fitness.dashboard.app",
+                app_version="1.0.0",
+                build_number="1",
+                protocol_version=3,
+            ),
+        )
+        payload = daily_summary_envelope(daily_summaries=[], sleep=[], workouts=[])
+        content = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        payload_digest = sha256(content.encode()).hexdigest()
+        batch_id = uuid4()
+        SDKBatchReceiptService().prepare_submission(
+            db,
+            batch_id=batch_id,
+            user_id=user.id,
+            installation_id=installation.id,
+            installation_generation=installation.generation,
+            health_evidence_generation=user.health_evidence_generation,
+            provider="apple",
+            payload_sha256=payload_digest,
+        )
+        sdk_upload_inbox_service.put(
+            db,
+            batch_id=batch_id,
+            user_id=user.id,
+            installation_id=installation.id,
+            installation_generation=installation.generation,
+            health_evidence_generation=user.health_evidence_generation,
+            provider="apple",
+            payload_sha256=payload_digest,
+            content_type="application/json",
+            content=content,
+        )
+
+        with (
+            patch(
+                "app.integrations.celery.tasks.process_sdk_upload_task.SessionLocal",
+                return_value=session_context(db),
+            ),
+            patch("app.integrations.celery.tasks.process_sdk_upload_task.started"),
+            patch("app.integrations.celery.tasks.process_sdk_upload_task.completed") as completed,
+            patch("app.integrations.celery.tasks.process_sdk_upload_task.failed") as failed,
+        ):
+            result = process_sdk_upload(
+                batch_id=str(batch_id),
+                require_terminal_receipt=True,
+            )
+
+        receipt = sdk_batch_receipt_service.get_for_user(db, batch_id, user.id)
+        assert receipt is not None
+        response = sdk_batch_receipt_service.to_response(receipt)
+        assert result["revision_set_digest"] == sha256(b"").hexdigest()
+        assert receipt.status == SDKBatchReceiptStatus.SUCCEEDED
+        assert receipt.daily_summaries_saved == 0
+        assert receipt.revision_set_digest == sha256(b"").hexdigest()
+        assert response.accepted is True
+        assert db.query(AppleHealthDailySummary).filter_by(batch_id=batch_id).count() == 0
+        assert db.get(SDKUploadInbox, batch_id) is None
+        completed.assert_called_once()
+        failed.assert_not_called()
+
     def test_daily_summary_receipt_uses_authoritative_digest_reparsed_from_inbox(
         self,
         db: Session,
@@ -148,6 +215,7 @@ class TestSDKBatchReceiptTask:
                     "content_lower_bound_inclusive": "2026-08-31T07:49:00-04:00",
                     "content_upper_bound_exclusive": "2026-08-31T08:17:00-04:00",
                     "revision_set_digest": authoritative_digest,
+                    "daily_summary_envelope": True,
                 },
             ),
             patch("app.integrations.celery.tasks.process_sdk_upload_task.started"),

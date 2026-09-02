@@ -20,7 +20,7 @@ from app.services.apple.healthkit.import_service import (
     import_service as sdk_import_service,
 )
 from app.services.apple.healthkit.import_service import validated_content_coverage
-from app.services.sdk_batch_receipt_service import is_revision_set_digest, sdk_batch_receipt_service
+from app.services.sdk_batch_receipt_service import is_valid_revision_set_result, sdk_batch_receipt_service
 from app.services.sdk_client_installation_service import sdk_client_installation_service
 from app.services.sdk_sleep_inbox_service import sdk_sleep_inbox_service
 from app.services.sync_status_service import completed, failed, started
@@ -305,8 +305,10 @@ def process_sdk_upload(
             dropped_count = int(result.get("dropped_count", 0) or 0)
             tombstones_unresolved = int(result.get("tombstones_unresolved", 0) or 0)
             processing_error_code = result.get("processing_error_code")
-            if (daily_summaries_saved > 0 and not is_revision_set_digest(revision_set_digest)) or (
-                daily_summaries_saved == 0 and revision_set_digest is not None
+            if not is_valid_revision_set_result(
+                daily_summaries_saved,
+                revision_set_digest,
+                daily_summary_envelope=result.get("daily_summary_envelope") is True,
             ):
                 processing_error_code = "daily_summary_revision_set_digest_invalid"
                 result["processing_error_code"] = processing_error_code

@@ -664,6 +664,48 @@ Every persisted outbox item supplies its stable UUID in the `X-Open-Wearables-Ba
 GET {host}/api/v1/sdk/users/{userId}/sync/{batchId}
 ```
 
+Protocol-v3 daily-summary syncs may advance their local checkpoint when no summary revision changed. In that case,
+send the compact envelope with all three summary collections explicitly empty and declare the SHA-256 digest of the
+empty revision set:
+
+```json
+{
+  "schema_version": "apple-health-daily-summary.v1",
+  "revision_set_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "provider": "apple",
+  "sdkVersion": "3.0.0",
+  "syncTimestamp": "2026-09-01T04:07:00Z",
+  "data": {
+    "daily_summaries": [],
+    "sleep": [],
+    "workouts": []
+  }
+}
+```
+
+The server accepts this checkpoint-only shape only through the durable batch-receipt flow. Its terminal `200` receipt
+has `daily_summaries_saved: 0` and echoes the exact empty-set `revision_set_digest`; install the new local checkpoint
+only after that receipt. Raw records, deletions, a sync-window manifest, omitted summary collections, or any other
+digest make the compact envelope invalid. The submission must authenticate as the active protocol-3 installation;
+protocol-2, legacy, and API-key callers receive `426` with `error_code: daily_summary_protocol_version_required`
+before any receipt or inbox row is queued.
+
+### Protocol-v3 rollout and rollback gate
+
+This gate is mandatory for zero-revision checkpoint receipts:
+
+1. Keep the client daily-summary feature disabled and apply database migration `a3c5e7f9b1d2` first.
+2. Deploy the new `sdk_sync` worker revision, drain or stop every old worker, restart the complete worker pool, and
+   verify that every live worker reports the new revision before continuing.
+3. Deploy the API from the same revision and verify that protocol-2 installations receive `426` without a queued
+   receipt while protocol-3 installations can enqueue the exact compact envelope.
+4. Only after those checks pass may the client feature be enabled and the protocol-3 client released.
+
+Rollback reverses traffic before code: first disable or stop new daily-summary submissions, then drain every queued or
+in-flight zero-revision job under the new worker revision. Only after the queue is empty may the API or workers roll
+back. Leave migration `a3c5e7f9b1d2` installed after any empty-set receipt has been accepted; its downgrade intentionally
+refuses to erase a receipt state the older constraint cannot represent.
+
 After all data batches in a bounded activation, archive, or post-archive catch-up window have terminal receipts, send one metadata-only `syncWindow` batch. Its header batch ID must equal `windowId`, `purpose` must be `activation`, `archive`, or `incremental`, and `windowVersion` is `2`. The manifest must cover the window with at least one accepted `batchId` or one explicitly terminal empty/no-access HealthKit type. Incremental catch-up manifests include the exact reconciliation bounds used for their anchored replay:
 
 ```json

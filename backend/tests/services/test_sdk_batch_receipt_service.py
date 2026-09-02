@@ -113,6 +113,7 @@ class TestSDKBatchReceiptService:
                 "status_code": 200,
                 "daily_summaries_saved": 3,
                 "revision_set_digest": revision_set_digest,
+                "daily_summary_envelope": True,
                 "dropped_count": 0,
             },
         )
@@ -132,6 +133,81 @@ class TestSDKBatchReceiptService:
         assert response.daily_summaries_saved == 3
         assert response.revision_set_digest == revision_set_digest
 
+    def test_empty_daily_summary_success_persists_and_idempotently_replays_empty_digest(self, db: Session) -> None:
+        user = UserFactory()
+        service = SDKBatchReceiptService()
+        batch_id = uuid4()
+        payload_digest = sha256(b"empty-daily-summary-payload").hexdigest()
+        empty_revision_set_digest = sha256(b"").hexdigest()
+        service.prepare_submission(
+            db,
+            batch_id=batch_id,
+            user_id=user.id,
+            provider="apple",
+            payload_sha256=payload_digest,
+        )
+        claim = service.claim_for_processing(db, batch_id)
+        assert claim.attempt_count is not None
+
+        service.mark_succeeded(
+            db,
+            batch_id=batch_id,
+            attempt_count=claim.attempt_count,
+            result={
+                "status_code": 200,
+                "daily_summaries_saved": 0,
+                "revision_set_digest": empty_revision_set_digest,
+                "daily_summary_envelope": True,
+                "dropped_count": 0,
+            },
+        )
+
+        replay = service.prepare_submission(
+            db,
+            batch_id=batch_id,
+            user_id=user.id,
+            provider="apple",
+            payload_sha256=payload_digest,
+        )
+        response = service.to_response(replay.receipt)
+        assert replay.http_status == 200
+        assert replay.should_dispatch is False
+        assert response.accepted is True
+        assert response.daily_summaries_saved == 0
+        assert response.revision_set_digest == empty_revision_set_digest
+
+    def test_zero_summary_result_with_nonempty_digest_fails_closed(self, db: Session) -> None:
+        user = UserFactory()
+        service = SDKBatchReceiptService()
+        batch_id = uuid4()
+        service.prepare_submission(
+            db,
+            batch_id=batch_id,
+            user_id=user.id,
+            provider="apple",
+            payload_sha256=sha256(b"invalid-empty-summary-digest").hexdigest(),
+        )
+        claim = service.claim_for_processing(db, batch_id)
+        assert claim.attempt_count is not None
+
+        service.mark_succeeded(
+            db,
+            batch_id=batch_id,
+            attempt_count=claim.attempt_count,
+            result={
+                "status_code": 200,
+                "daily_summaries_saved": 0,
+                "revision_set_digest": sha256(b"not-empty").hexdigest(),
+                "daily_summary_envelope": True,
+            },
+        )
+
+        receipt = service.crud.get(db, batch_id)
+        assert receipt is not None
+        assert receipt.status == SDKBatchReceiptStatus.FAILED
+        assert receipt.revision_set_digest is None
+        assert receipt.error_code == "daily_summary_revision_set_digest_invalid"
+
     def test_daily_summary_success_without_revision_set_digest_fails_closed(self, db: Session) -> None:
         user = UserFactory()
         service = SDKBatchReceiptService()
@@ -150,7 +226,7 @@ class TestSDKBatchReceiptService:
             db,
             batch_id=batch_id,
             attempt_count=claim.attempt_count,
-            result={"status_code": 200, "daily_summaries_saved": 1},
+            result={"status_code": 200, "daily_summaries_saved": 1, "daily_summary_envelope": True},
         )
 
         receipt = service.crud.get(db, batch_id)

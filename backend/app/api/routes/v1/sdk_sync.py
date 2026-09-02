@@ -199,6 +199,16 @@ async def sync_sdk_data(
             detail="API-key upload is disabled for a first-class mobile installation",
         )
 
+    if body.get("schema_version") == "apple-health-daily-summary.v1" and auth.protocol_version != 3:
+        raise HTTPException(
+            status_code=status.HTTP_426_UPGRADE_REQUIRED,
+            detail={
+                "error_code": "daily_summary_protocol_version_required",
+                "retryable": False,
+                "required_protocol_version": 3,
+            },
+        )
+
     # The UUID already exists in the phone's protected outbox before upload.
     batch_uuid = x_open_wearables_batch_id
 

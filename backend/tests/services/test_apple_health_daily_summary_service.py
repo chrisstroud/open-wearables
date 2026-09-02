@@ -259,6 +259,26 @@ class TestAppleHealthDailySummaryService:
     def test_empty_revision_set_uses_sha256_of_empty_bytes(self) -> None:
         assert calculate_revision_set_digest(SyncRequestData()) == sha256(b"").hexdigest()
 
+    def test_exact_zero_revision_checkpoint_envelope_is_schema_valid(self) -> None:
+        payload = daily_summary_envelope(daily_summaries=[], sleep=[], workouts=[])
+
+        request = SyncRequest.model_validate(payload)
+
+        assert request.revision_set_digest == sha256(b"").hexdigest()
+        assert request.data.daily_summaries == request.data.sleep == request.data.workouts == []
+
+    def test_zero_revision_checkpoint_envelope_requires_explicit_collections_and_empty_digest(self) -> None:
+        payload = daily_summary_envelope(daily_summaries=[], sleep=[], workouts=[])
+        missing_collection = deepcopy(payload)
+        missing_collection["data"].pop("sleep")
+        with pytest.raises(ValueError, match="must explicitly declare empty"):
+            SyncRequest.model_validate(missing_collection)
+
+        wrong_digest = deepcopy(payload)
+        wrong_digest["revision_set_digest"] = digest("not-the-empty-revision-set")
+        with pytest.raises(ValueError, match="must match the exact parsed summary revision set"):
+            SyncRequest.model_validate(wrong_digest)
+
     def test_legacy_payload_cannot_declare_the_empty_revision_set_digest(self) -> None:
         with pytest.raises(ValueError, match="requires the daily-summary envelope schema"):
             SyncRequest.model_validate(
@@ -568,6 +588,70 @@ class TestAppleHealthDailySummaryService:
         assert response.records_saved == response.sleep_saved == response.workouts_saved == 0
         assert db.query(AppleHealthDailySummary).count() == 3
         raw_sleep_projection.assert_not_called()
+
+    def test_exact_zero_revision_checkpoint_envelope_is_accepted_without_summary_mutation(self, db: Session) -> None:
+        user, installation, batch_id = authority(db)
+        db.info["health_write_authority"] = (
+            user.id,
+            user.health_evidence_generation,
+            installation.id,
+            installation.generation,
+        )
+        payload = daily_summary_envelope(daily_summaries=[], sleep=[], workouts=[])
+
+        response = ImportService(logging.getLogger("test.daily-summary.empty")).import_data_from_request(
+            db,
+            json.dumps(payload),
+            "application/json",
+            str(user.id),
+            batch_id=str(batch_id),
+            require_terminal_receipt=True,
+        )
+
+        assert response.status_code == 200
+        assert response.daily_summaries_saved == 0
+        assert response.revision_set_digest == sha256(b"").hexdigest()
+        assert response.dropped_count == 0
+        assert db.query(AppleHealthDailySummary).count() == 0
+
+    def test_repository_rejects_protocol_two_and_accepts_protocol_three_installations(self, db: Session) -> None:
+        summary = DailySummary.model_validate(summary_payload())
+        protocol_two_user = UserFactory()
+        protocol_two_installation = sdk_client_installation_service.activate(
+            db,
+            user_id=protocol_two_user.id,
+            registration=SDKClientRegistration(
+                installation_id=uuid4(),
+                bundle_id="fitness.dashboard.app",
+                app_version="1.0.0",
+                build_number="1",
+                protocol_version=2,
+            ),
+        )
+        protocol_two_batch = prepare_batch(db, protocol_two_user, protocol_two_installation)
+
+        with pytest.raises(DailySummaryConflictError, match="daily_summary_protocol_version_required"):
+            accept(
+                db,
+                protocol_two_user,
+                protocol_two_installation,
+                protocol_two_batch,
+                [summary],
+            )
+
+        protocol_three_user, protocol_three_installation, protocol_three_batch = authority(db)
+        assert (
+            accept(
+                db,
+                protocol_three_user,
+                protocol_three_installation,
+                protocol_three_batch,
+                [summary],
+            )
+            == 1
+        )
+        assert db.query(AppleHealthDailySummary).filter_by(user_id=protocol_two_user.id).count() == 0
+        assert db.query(AppleHealthDailySummary).filter_by(user_id=protocol_three_user.id).count() == 1
 
     def test_revision_set_digest_is_order_independent_and_matches_frozen_vector(self) -> None:
         second_summary = summary_payload(revision="revision-2")
