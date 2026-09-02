@@ -15,11 +15,19 @@ from uuid import UUID, uuid4
 
 from sqlalchemy.orm import Session
 
-from app.models import DataSource, EventRecord
+from app.models import DataSource, EventRecord, HealthScore
+from app.schemas.auth import ConnectionStatus
+from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.schemas.model_crud.activities import EventRecordCreate, EventRecordDetailCreate, EventRecordQueryParams
 from app.schemas.model_crud.activities.sleep import SleepStage
 from app.services.event_record_service import event_record_service
-from tests.factories import DataSourceFactory, EventRecordFactory, SleepDetailsFactory, UserFactory
+from tests.factories import (
+    DataSourceFactory,
+    EventRecordFactory,
+    SleepDetailsFactory,
+    UserConnectionFactory,
+    UserFactory,
+)
 
 
 class TestEventRecordServiceCreateDetail:
@@ -367,6 +375,60 @@ class TestCreateOrMergeSleep:
         assert result.id == record.id
         assert result.start_datetime == start
         assert result.end_datetime == end
+
+    def test_multi_source_whoop_replay_recomputes_internal_sleep_score(self, db: Session) -> None:
+        """A current WHOOP replay may derive scores alongside Apple mobile v2."""
+        user = UserFactory(
+            health_evidence_generation=1,
+            health_source_policy="multi-source",
+            health_write_state="active",
+        )
+        connection = UserConnectionFactory(
+            user=user,
+            provider="whoop",
+            status=ConnectionStatus.ACTIVE,
+        )
+        data_source = DataSourceFactory(
+            user=user,
+            provider=ProviderName.WHOOP,
+            source="whoop",
+            user_connection_id=connection.id,
+        )
+        start, end = self._dt(1, 35), self._dt(8, 51)
+        external_id = "whoop-sleep-replay"
+        existing = EventRecordFactory(
+            mapping=data_source,
+            category="sleep",
+            type_="sleep_session",
+            external_id=external_id,
+            start_datetime=start,
+            end_datetime=end,
+            duration_seconds=int((end - start).total_seconds()),
+        )
+        SleepDetailsFactory(event_record=existing)
+        record = self._record(data_source, start, end).model_copy(
+            update={
+                "external_id": external_id,
+                "provider": ProviderName.WHOOP.value,
+                "user_connection_id": connection.id,
+            }
+        )
+        detail = self._detail(record.id)
+
+        result = event_record_service.create_or_merge_sleep(db, user.id, record, detail, self.THRESHOLD)
+
+        assert result.id == existing.id
+        assert (
+            db.query(HealthScore)
+            .filter(
+                HealthScore.user_id == user.id,
+                HealthScore.provider == ProviderName.INTERNAL,
+                HealthScore.category == HealthScoreCategory.SLEEP,
+            )
+            .one_or_none()
+            is not None
+        )
+        assert "health_maintenance_authority" not in db.info
 
     def test_adjacent_within_threshold_is_merged(self, db: Session) -> None:
         """Sessions within threshold_minutes of each other are merged into one record."""

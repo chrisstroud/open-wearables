@@ -157,9 +157,10 @@ class Settings(BaseSettings):
     sleep_sync_interval_seconds: int = 3600  # Default: 1 hour (3600 seconds)
     # Re-fetch a trailing window on each *live* pull sync so late provider revisions
     # (e.g. Oura finalising a day's step count after we already moved past it) are
-    # picked up. Disabled by default. Set via a compact duration string: "2d", "20h",
-    # "90m", "1d12h". Capped per provider by max_historical_days.
-    pull_sync_lookback: timedelta | None = None
+    # picked up. Defaults to two days; set to "0m" to disable. Accepts compact
+    # duration strings such as "2d", "20h", "90m", or "1d12h" and is capped
+    # per provider by max_historical_days.
+    pull_sync_lookback: timedelta | None = timedelta(days=2)
     # Grace-period flag: auto-dispatch historical sync after OAuth connect (default: true).
     # Pre-0.4.2 behaviour. Set to false once your integration calls /sync/historical explicitly.
     # Will default to false in a future release.
@@ -213,7 +214,9 @@ class Settings(BaseSettings):
     whoop_client_id: str | None = None
     whoop_client_secret: SecretStr | None = None
     whoop_redirect_uri: str | None = None  # Deprecated: use API_BASE_URL
-    whoop_default_scope: str = "offline read:cycles read:sleep read:recovery read:workout"
+    whoop_default_scope: str = (
+        "offline read:profile read:body_measurement read:cycles read:sleep read:recovery read:workout"
+    )
 
     # SENSORBIO OAUTH SETTINGS
     sensorbio_client_id: str | None = None

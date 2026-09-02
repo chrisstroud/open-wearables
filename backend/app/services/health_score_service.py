@@ -1,10 +1,11 @@
+from datetime import datetime
 from logging import Logger, getLogger
 from uuid import UUID
 
 from app.database import DbSession
 from app.models import HealthScore
 from app.repositories import HealthScoreRepository
-from app.schemas.enums import HealthScoreCategory
+from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.schemas.model_crud.activities import HealthScoreCreate, HealthScoreQueryParams, HealthScoreUpdate
 from app.services.services import AppService
 from app.utils.exceptions import handle_exceptions
@@ -29,6 +30,26 @@ class HealthScoreService(
     @handle_exceptions
     def bulk_create(self, db_session: DbSession, scores: list[HealthScoreCreate]) -> None:
         self.crud.bulk_create(db_session, scores)
+
+    @handle_exceptions
+    def adopt_missing_data_sources(
+        self,
+        db_session: DbSession,
+        *,
+        user_id: UUID,
+        provider: ProviderName,
+        data_source_id: UUID,
+        start_datetime: datetime,
+        end_datetime: datetime,
+    ) -> int:
+        return self.crud.adopt_missing_data_sources(
+            db_session,
+            user_id=user_id,
+            provider=provider,
+            data_source_id=data_source_id,
+            start_datetime=start_datetime,
+            end_datetime=end_datetime,
+        )
 
     @handle_exceptions
     def get_latest_by_category(

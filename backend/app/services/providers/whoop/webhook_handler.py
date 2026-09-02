@@ -224,7 +224,7 @@ class WhoopWebhookHandler(BaseWebhookHandler):
         if notification.type.is_delete_type:
             result = self._handle_deleted(db, notification.type, user_id, resource_id)
         elif notification.type.is_update_type:
-            result = self._handle_updated(db, notification.type, user_id, resource_id)
+            result = self._handle_updated(db, notification.type, user_id, resource_id, connection.id)
         else:
             log_structured(
                 logger,
@@ -250,15 +250,16 @@ class WhoopWebhookHandler(BaseWebhookHandler):
         event_type: WhoopWebhookNotificationType,
         user_id: UUID,
         resource_id: str,
+        user_connection_id: UUID,
     ) -> dict[str, Any]:
         """Fetch the specific resource from the Whoop API and save it."""
         match event_type:
             case WhoopWebhookNotificationType.WORKOUT_UPDATED:
-                count = self.workouts.load_single_workout(db, user_id, resource_id)
+                count = self.workouts.load_single_workout(db, user_id, resource_id, user_connection_id)
             case WhoopWebhookNotificationType.SLEEP_UPDATED:
-                count = self.data_247.load_single_sleep(db, user_id, resource_id)
+                count = self.data_247.load_single_sleep(db, user_id, resource_id, user_connection_id)
             case WhoopWebhookNotificationType.RECOVERY_UPDATED:
-                count = self.data_247.load_single_recovery(db, user_id, resource_id)
+                count = self.data_247.load_single_recovery(db, user_id, resource_id, user_connection_id)
             case _:
                 return {"status": "ignored", "reason": f"unhandled_event_type: {event_type}"}
 

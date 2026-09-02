@@ -99,7 +99,7 @@ class UserInvitationCodeService:
                 status_code=status.HTTP_423_LOCKED,
                 detail="Health data changes are temporarily fenced",
             )
-        if client is None and user.health_source_policy == "apple-mobile-v2-only":
+        if client is None and user.health_source_policy != "legacy-mixed":
             raise HTTPException(
                 status_code=status.HTTP_426_UPGRADE_REQUIRED,
                 detail="Permanent mobile client registration is required",

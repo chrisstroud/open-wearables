@@ -57,6 +57,7 @@ class SDKHealthResetTransitionRequest(BaseModel):
     expected_health_evidence_generation: int = Field(..., ge=0)
     expected_installation_generation: int | None = Field(None, gt=0)
     expected_inventory_digest_sha256: str | None = Field(None, pattern=r"^[0-9a-f]{64}$")
+    resulting_health_source_policy: Literal["apple-mobile-v2-only", "multi-source"] = "apple-mobile-v2-only"
 
 
 class SDKHealthResetStateRead(BaseModel):
@@ -66,7 +67,8 @@ class SDKHealthResetStateRead(BaseModel):
     operation_id: UUID | None
     health_evidence_generation: int
     health_write_state: Literal["active", "fenced", "awaiting-v2-pairing", "activating"]
-    health_source_policy: Literal["legacy-mixed", "apple-mobile-v2-only"]
+    health_source_policy: Literal["legacy-mixed", "apple-mobile-v2-only", "multi-source"]
+    resulting_health_source_policy: Literal["apple-mobile-v2-only", "multi-source"] | None = None
     active_installation_id: UUID | None
     active_installation_generation: int | None
     queued_or_processing_upload_count: int

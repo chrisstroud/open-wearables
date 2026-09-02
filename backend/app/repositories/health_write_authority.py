@@ -1,4 +1,5 @@
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from uuid import UUID
 
 from app.database import DbSession
@@ -54,7 +55,12 @@ def require_health_write_authorities(
         user = users[user_id]
         if user.health_write_state not in {"active", "activating"}:
             raise HealthWriteAuthorityError("Health writes are fenced")
-        if user.health_source_policy != "apple-mobile-v2-only":
+        if user.health_source_policy == "legacy-mixed":
+            continue
+        if user.health_source_policy == "multi-source" and provider not in {
+            ProviderName.APPLE.value,
+            ProviderName.INTERNAL.value,
+        }:
             continue
 
         if (
@@ -113,6 +119,20 @@ def acquire_health_maintenance_authority(db_session: DbSession, *, user_id: UUID
 
 def clear_health_maintenance_authority(db_session: DbSession) -> None:
     db_session.info.pop("health_maintenance_authority", None)
+
+
+@contextmanager
+def scoped_health_maintenance_authority(db_session: DbSession, *, user_id: UUID) -> Iterator[User]:
+    """Grant generation-bound internal authority only for one synchronous operation."""
+    previous_authority = db_session.info.get("health_maintenance_authority")
+    user = acquire_health_maintenance_authority(db_session, user_id=user_id)
+    try:
+        yield user
+    finally:
+        if previous_authority is None:
+            clear_health_maintenance_authority(db_session)
+        else:
+            db_session.info["health_maintenance_authority"] = previous_authority
 
 
 def require_data_source_authority(

@@ -8,6 +8,7 @@ from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
+from redis.exceptions import ResponseError, WatchError
 
 from app.config import SourceResetS3Target, settings
 from app.integrations.redis_client import get_redis_client
@@ -17,6 +18,12 @@ from app.services.sdk_source_reset_external import (
     QUEUED_TASKS,
     RAW_OBJECTS,
     REDIS_COORDINATION,
+    REDIS_INVENTORY_CLIENT_BLOCKER,
+    REDIS_INVENTORY_KEY_RETRY_LIMIT,
+    REDIS_INVENTORY_KEY_REVIEW_BLOCKER,
+    REDIS_INVENTORY_KEY_UNSTABLE_BLOCKER,
+    REDIS_INVENTORY_PING_BLOCKER,
+    REDIS_INVENTORY_SCAN_BLOCKER,
     REDIS_PRIORITY_SEPARATOR,
     ProviderIdentityScope,
     SDKSourceResetExternalPlanes,
@@ -58,6 +65,7 @@ class FakeRedisClient:
     def __init__(self, queue_values: list[str], *, count_result_override: object | None = None) -> None:
         self.queue_values = queue_values
         self.count_result_override = count_result_override
+        self.watched_key_sets: list[tuple[str, ...]] = []
 
     def ping(self) -> bool:
         return True
@@ -86,7 +94,7 @@ class FakeRedisPipeline:
         self.commands: list[tuple[object, ...]] = []
 
     def watch(self, *_keys: str) -> None:
-        pass
+        self.client.watched_key_sets.append(tuple(_keys))
 
     def type(self, key: str) -> str:
         return self.client.type(key)
@@ -131,6 +139,93 @@ class FakeRedisPipeline:
 
     def reset(self) -> None:
         pass
+
+
+class ChurningRedisClient(FakeRedisClient):
+    def __init__(
+        self,
+        queue_values: list[str],
+        *,
+        watch_failures: int,
+        missing_attempts: set[int] | None = None,
+        wrongtype_attempts: set[int] | None = None,
+        disappear_during_lrange_attempts: set[int] | None = None,
+    ) -> None:
+        super().__init__(queue_values)
+        self.watch_failures = watch_failures
+        self.missing_attempts = missing_attempts or set()
+        self.wrongtype_attempts = wrongtype_attempts or set()
+        self.disappear_during_lrange_attempts = disappear_during_lrange_attempts or set()
+        self.pipeline_attempts = 0
+
+    def pipeline(self, *, transaction: bool) -> "ChurningRedisPipeline":
+        assert transaction is True
+        self.pipeline_attempts += 1
+        return ChurningRedisPipeline(self, self.pipeline_attempts)
+
+
+class ChurningRedisPipeline(FakeRedisPipeline):
+    def __init__(self, client: ChurningRedisClient, attempt: int) -> None:
+        super().__init__(client)
+        self.attempt = attempt
+
+    @property
+    def churning_client(self) -> ChurningRedisClient:
+        assert isinstance(self.client, ChurningRedisClient)
+        return self.client
+
+    def type(self, key: str) -> str:
+        if self.attempt in self.churning_client.missing_attempts:
+            return "none"
+        return super().type(key)
+
+    def lrange(self, key: str, start: int, end: int) -> list[str]:
+        if self.attempt in self.churning_client.disappear_during_lrange_attempts:
+            return []
+        if self.attempt in self.churning_client.wrongtype_attempts:
+            raise ResponseError("WRONGTYPE simulated concurrent type change")
+        return super().lrange(key, start, end)
+
+    def execute(self) -> list[object]:
+        if self.attempt <= self.churning_client.watch_failures:
+            raise WatchError("simulated watched-key mutation")
+        return super().execute()
+
+
+class ScanFailureRedisClient(FakeRedisClient):
+    def scan_iter(self, *, match: str, count: int) -> list[str]:
+        del match, count
+        raise RuntimeError("simulated scan failure")
+
+
+class LazyScanFailureRedisClient(FakeRedisClient):
+    def scan_iter(self, *, match: str, count: int) -> Iterator[str]:
+        del match, count
+        yield "webhook_sync"
+        raise RuntimeError("simulated lazy scan failure")
+
+
+class MissingUnackedRedisClient(ChurningRedisClient):
+    def scan_iter(self, *, match: str, count: int) -> list[str]:
+        del match, count
+        return ["unacked"]
+
+
+class PingFailureRedisClient(FakeRedisClient):
+    def ping(self) -> bool:
+        raise RuntimeError("simulated ping failure")
+
+
+class KeyReviewFailureRedisClient(FakeRedisClient):
+    def pipeline(self, *, transaction: bool) -> "KeyReviewFailureRedisPipeline":
+        assert transaction is True
+        return KeyReviewFailureRedisPipeline(self)
+
+
+class KeyReviewFailureRedisPipeline(FakeRedisPipeline):
+    def lrange(self, key: str, start: int, end: int) -> list[str]:
+        del key, start, end
+        raise RuntimeError("simulated key review failure")
 
 
 class FakeCeleryInspector:
@@ -508,9 +603,10 @@ def test_provider_scoped_queued_webhook_is_inventoried_without_internal_user_id(
     provider_user_id = "whoop-user-reset-target"
     target = json.dumps(["whoop", {"user_id": provider_user_id}, "trace-target"])
     other = json.dumps(["whoop", {"user_id": "other-user"}, "trace-other"])
+    client = FakeRedisClient([target, other])
     with patch(
         "app.services.sdk_source_reset_external.get_redis_client",
-        return_value=FakeRedisClient([target, other]),
+        return_value=client,
     ):
         references, blockers = service._redis_inventory(
             uuid4(),
@@ -524,6 +620,145 @@ def test_provider_scoped_queued_webhook_is_inventoried_without_internal_user_id(
     assert references[0].raw_value == target
     assert references[0].reviewed_key_type == "list"
     assert references[0].reviewed_state_digest_sha256 is not None
+    assert client.watched_key_sets == [("webhook_sync",)]
+
+
+def test_verified_disappearance_during_redis_scan_is_not_an_inventory_blocker() -> None:
+    service = SDKSourceResetExternalPlanes()
+    client = ChurningRedisClient([], watch_failures=0, missing_attempts={1})
+
+    with patch("app.services.sdk_source_reset_external.get_redis_client", return_value=client):
+        references, blockers = service._redis_inventory(uuid4())
+
+    assert references == ()
+    assert blockers == ()
+    assert client.pipeline_attempts == 1
+    assert client.watched_key_sets == [("webhook_sync",)]
+
+
+def test_unacked_inventory_watches_payload_and_paired_index_together() -> None:
+    service = SDKSourceResetExternalPlanes()
+    client = MissingUnackedRedisClient([], watch_failures=0, missing_attempts={1})
+
+    with patch("app.services.sdk_source_reset_external.get_redis_client", return_value=client):
+        references, blockers = service._redis_inventory(uuid4())
+
+    assert references == ()
+    assert blockers == ()
+    assert client.watched_key_sets == [("unacked", "unacked_index")]
+
+
+def test_key_appearing_after_scanned_disappearance_is_retried_and_inventoried() -> None:
+    service = SDKSourceResetExternalPlanes()
+    provider_user_id = "whoop-user-reset-target"
+    target = json.dumps(["whoop", {"user_id": provider_user_id}, "trace-target"])
+    client = ChurningRedisClient([target], watch_failures=1, missing_attempts={1})
+
+    with patch("app.services.sdk_source_reset_external.get_redis_client", return_value=client):
+        references, blockers = service._redis_inventory(
+            uuid4(),
+            ProviderIdentityScope.from_values({"whoop": {provider_user_id}}),
+        )
+
+    assert blockers == ()
+    assert len(references) == 1
+    assert references[0].raw_value == target
+    assert references[0].reviewed_key_type == "list"
+    assert references[0].reviewed_state_digest_sha256 is not None
+    assert client.pipeline_attempts == 2
+
+
+def test_persistently_mutating_target_key_fails_closed_after_bounded_retries() -> None:
+    service = SDKSourceResetExternalPlanes()
+    provider_user_id = "whoop-user-reset-target"
+    target = json.dumps(["whoop", {"user_id": provider_user_id}, "trace-target"])
+    client = ChurningRedisClient(
+        [target],
+        watch_failures=REDIS_INVENTORY_KEY_RETRY_LIMIT,
+    )
+
+    with patch("app.services.sdk_source_reset_external.get_redis_client", return_value=client):
+        references, blockers = service._redis_inventory(
+            uuid4(),
+            ProviderIdentityScope.from_values({"whoop": {provider_user_id}}),
+        )
+
+    assert references == ()
+    assert blockers == (REDIS_INVENTORY_KEY_UNSTABLE_BLOCKER,)
+    assert client.pipeline_attempts == REDIS_INVENTORY_KEY_RETRY_LIMIT
+
+
+def test_mid_review_disappearance_retries_then_accepts_stable_absence() -> None:
+    service = SDKSourceResetExternalPlanes()
+    client = ChurningRedisClient(
+        [json.dumps({"user_id": str(uuid4())})],
+        watch_failures=1,
+        missing_attempts={2},
+        disappear_during_lrange_attempts={1},
+    )
+
+    with patch("app.services.sdk_source_reset_external.get_redis_client", return_value=client):
+        references, blockers = service._redis_inventory(uuid4())
+
+    assert references == ()
+    assert blockers == ()
+    assert client.pipeline_attempts == 2
+    assert client.watched_key_sets == [("webhook_sync",), ("webhook_sync",)]
+
+
+def test_transient_wrongtype_churn_retries_and_captures_fresh_target_state() -> None:
+    service = SDKSourceResetExternalPlanes()
+    provider_user_id = "whoop-user-reset-target"
+    target = json.dumps(["whoop", {"user_id": provider_user_id}, "trace-target"])
+    client = ChurningRedisClient(
+        [target],
+        watch_failures=1,
+        wrongtype_attempts={1},
+    )
+
+    with patch("app.services.sdk_source_reset_external.get_redis_client", return_value=client):
+        references, blockers = service._redis_inventory(
+            uuid4(),
+            ProviderIdentityScope.from_values({"whoop": {provider_user_id}}),
+        )
+
+    assert blockers == ()
+    assert len(references) == 1
+    assert references[0].raw_value == target
+    assert references[0].reviewed_state_digest_sha256 is not None
+    assert client.pipeline_attempts == 2
+
+
+def test_persistent_wrongtype_churn_fails_closed_as_unstable() -> None:
+    service = SDKSourceResetExternalPlanes()
+    client = ChurningRedisClient(
+        [json.dumps({"user_id": str(uuid4())})],
+        watch_failures=REDIS_INVENTORY_KEY_RETRY_LIMIT,
+        wrongtype_attempts=set(range(1, REDIS_INVENTORY_KEY_RETRY_LIMIT + 1)),
+    )
+
+    with patch("app.services.sdk_source_reset_external.get_redis_client", return_value=client):
+        references, blockers = service._redis_inventory(uuid4())
+
+    assert references == ()
+    assert blockers == (REDIS_INVENTORY_KEY_UNSTABLE_BLOCKER,)
+    assert client.pipeline_attempts == REDIS_INVENTORY_KEY_RETRY_LIMIT
+
+
+def test_stable_wrongtype_failure_remains_a_structural_key_review_blocker() -> None:
+    service = SDKSourceResetExternalPlanes()
+    client = ChurningRedisClient(
+        [json.dumps({"user_id": str(uuid4())})],
+        watch_failures=0,
+        wrongtype_attempts={1},
+    )
+
+    with patch("app.services.sdk_source_reset_external.get_redis_client", return_value=client):
+        references, blockers = service._redis_inventory(uuid4())
+
+    assert references == ()
+    assert blockers == (REDIS_INVENTORY_KEY_REVIEW_BLOCKER,)
+    assert client.pipeline_attempts == 1
 
 
 @pytest.mark.parametrize("redis_type", ["string", "list", "set", "zset", "hash", "stream"])
@@ -955,7 +1190,7 @@ def test_log_raw_payload_mode_is_an_explicit_reset_blocker() -> None:
     )
 
 
-def test_unavailable_redis_inventory_fails_closed() -> None:
+def test_unavailable_redis_client_fails_closed_with_value_free_stage() -> None:
     service = SDKSourceResetExternalPlanes()
     with patch(
         "app.services.sdk_source_reset_external.get_redis_client",
@@ -964,4 +1199,57 @@ def test_unavailable_redis_inventory_fails_closed() -> None:
         references, blockers = service._redis_inventory(uuid4())
 
     assert references == ()
-    assert blockers == ("open-wearables.redis-coordination.inventory-unavailable",)
+    assert blockers == (REDIS_INVENTORY_CLIENT_BLOCKER,)
+
+
+def test_unavailable_redis_ping_fails_closed_with_value_free_stage() -> None:
+    service = SDKSourceResetExternalPlanes()
+    with patch(
+        "app.services.sdk_source_reset_external.get_redis_client",
+        return_value=PingFailureRedisClient([]),
+    ):
+        references, blockers = service._redis_inventory(uuid4())
+
+    assert references == ()
+    assert blockers == (REDIS_INVENTORY_PING_BLOCKER,)
+
+
+def test_unavailable_redis_scan_fails_closed_with_value_free_stage() -> None:
+    service = SDKSourceResetExternalPlanes()
+    with patch(
+        "app.services.sdk_source_reset_external.get_redis_client",
+        return_value=ScanFailureRedisClient([]),
+    ):
+        references, blockers = service._redis_inventory(uuid4())
+
+    assert references == ()
+    assert blockers == (REDIS_INVENTORY_SCAN_BLOCKER,)
+
+
+def test_lazy_redis_scan_failure_discards_partial_inventory_and_fails_closed() -> None:
+    service = SDKSourceResetExternalPlanes()
+    provider_user_id = "whoop-user-reset-target"
+    target = json.dumps(["whoop", {"user_id": provider_user_id}, "trace-target"])
+    client = LazyScanFailureRedisClient([target])
+
+    with patch("app.services.sdk_source_reset_external.get_redis_client", return_value=client):
+        references, blockers = service._redis_inventory(
+            uuid4(),
+            ProviderIdentityScope.from_values({"whoop": {provider_user_id}}),
+        )
+
+    assert references == ()
+    assert blockers == (REDIS_INVENTORY_SCAN_BLOCKER,)
+    assert client.watched_key_sets == [("webhook_sync",)]
+
+
+def test_unavailable_redis_key_review_fails_closed_with_value_free_stage() -> None:
+    service = SDKSourceResetExternalPlanes()
+    with patch(
+        "app.services.sdk_source_reset_external.get_redis_client",
+        return_value=KeyReviewFailureRedisClient([]),
+    ):
+        references, blockers = service._redis_inventory(uuid4())
+
+    assert references == ()
+    assert blockers == (REDIS_INVENTORY_KEY_REVIEW_BLOCKER,)

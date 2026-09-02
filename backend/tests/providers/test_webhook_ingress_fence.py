@@ -109,7 +109,10 @@ def _handler_cases() -> list[WebhookCase]:
 
 
 @pytest.mark.parametrize("case", _handler_cases(), ids=lambda case: case.provider)
-@pytest.mark.parametrize("account_state", ["active", "fenced", "revoked", "unknown", "v2-only"])
+@pytest.mark.parametrize(
+    "account_state",
+    ["active", "multi-source", "fenced", "revoked", "unknown", "v2-only"],
+)
 def test_provider_dispatch_requires_current_legacy_account_authority(
     db: Session,
     case: WebhookCase,
@@ -119,7 +122,13 @@ def test_provider_dispatch_requires_current_legacy_account_authority(
     if account_state != "unknown":
         user = UserFactory(
             health_write_state="fenced" if account_state == "fenced" else "active",
-            health_source_policy="apple-mobile-v2-only" if account_state == "v2-only" else "legacy-mixed",
+            health_source_policy=(
+                "apple-mobile-v2-only"
+                if account_state == "v2-only"
+                else "multi-source"
+                if account_state == "multi-source"
+                else "legacy-mixed"
+            ),
         )
         connection_kwargs = {
             "user": user,
@@ -139,7 +148,7 @@ def test_provider_dispatch_requires_current_legacy_account_authority(
         result = case.handler.dispatch(db, payload)
 
     assert result == {"status": "accepted"}
-    if account_state == "active":
+    if account_state in {"active", "multi-source"}:
         store_raw_payload.assert_called_once()
         celery_app.send_task.assert_called_once()
     else:
