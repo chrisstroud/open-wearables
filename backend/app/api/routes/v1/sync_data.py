@@ -15,9 +15,16 @@ from app.integrations.celery.tasks import (
     sync_vendor_data,
     trigger_garmin_backfill_for_type,
 )
+from app.repositories.whoop_sync_dispatch_repository import WhoopSyncDispatchConflictError
 from app.schemas.enums import ProviderName
+from app.schemas.whoop_sync_dispatch import (
+    WhoopFullHistorySyncCommand,
+    WhoopFullHistorySyncResponse,
+    WhoopSyncDispatchRead,
+)
 from app.services import ApiKeyDep
 from app.services.providers.factory import ProviderFactory
+from app.services.whoop_sync_dispatch_service import WhoopSyncDispatchService
 from app.utils.exceptions import UnsupportedProviderError
 from app.utils.sync_params import build_sync_params
 
@@ -26,6 +33,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 factory = ProviderFactory()
 DEFAULT_HISTORICAL_DAYS = 90
+whoop_sync_dispatch_service = WhoopSyncDispatchService()
 
 
 def _queue_pull_sync(
@@ -52,6 +60,50 @@ class SyncDataType(str, Enum):
     WORKOUTS = "workouts"
     DATA_247 = "247"  # Sleep, recovery, activity samples
     ALL = "all"
+
+
+@router.post(
+    "/whoop/users/{user_id}/connections/{connection_id}/sync/full-history",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def request_exact_whoop_full_history_sync(
+    user_id: UUID,
+    connection_id: UUID,
+    command: WhoopFullHistorySyncCommand,
+    db: DbSession,
+    _api_key: ApiKeyDep,
+) -> WhoopFullHistorySyncResponse:
+    """Durably queue one idempotent, exact-generation WHOOP history pull."""
+    try:
+        receipt = whoop_sync_dispatch_service.request_full_history(
+            db,
+            user_id=user_id,
+            connection_id=connection_id,
+            command=command,
+        )
+    except WhoopSyncDispatchConflictError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    return WhoopFullHistorySyncResponse.model_validate(receipt)
+
+
+@router.get(
+    "/whoop/users/{user_id}/sync/full-history/{dispatch_id}",
+)
+def get_exact_whoop_full_history_sync(
+    user_id: UUID,
+    dispatch_id: UUID,
+    db: DbSession,
+    _api_key: ApiKeyDep,
+) -> WhoopSyncDispatchRead:
+    """Read the durable outcome after an uncertain dispatch response."""
+    receipt = whoop_sync_dispatch_service.get(
+        db,
+        user_id=user_id,
+        dispatch_id=dispatch_id,
+    )
+    if receipt is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="WHOOP sync dispatch not found")
+    return WhoopSyncDispatchRead.model_validate(receipt)
 
 
 @router.post("/{provider}/users/{user_id}/sync")

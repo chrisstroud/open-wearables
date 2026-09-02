@@ -1,8 +1,8 @@
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import Index
-from sqlalchemy.orm import Mapped
+from sqlalchemy import CheckConstraint, Index
+from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import BaseDbModel
 from app.mappings import FKUser, PrimaryKey, str_64
@@ -13,6 +13,10 @@ class UserConnection(BaseDbModel):
     """OAuth connections to external cloud providers (Suunto, Garmin, Polar, Coros)"""
 
     __table_args__ = (
+        CheckConstraint(
+            "authorization_generation > 0",
+            name="ck_user_connection_authorization_generation",
+        ),
         Index(
             "ix_user_connection_token_expiry",
             "token_expires_at",
@@ -44,6 +48,7 @@ class UserConnection(BaseDbModel):
     scope: Mapped[str | None]
 
     # Metadata
+    authorization_generation: Mapped[int] = mapped_column(default=1, server_default="1")
     status: Mapped[ConnectionStatus]
     last_synced_at: Mapped[datetime | None]
     updated_at: Mapped[datetime]

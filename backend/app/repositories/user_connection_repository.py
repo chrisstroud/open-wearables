@@ -8,7 +8,7 @@ from sqlalchemy.orm import Query
 from sqlalchemy.orm.exc import MultipleResultsFound
 
 from app.database import DbSession
-from app.models import User, UserConnection
+from app.models import User, UserConnection, WhoopAuthorizationLease, WhoopSyncDispatchReceipt
 from app.repositories.health_write_authority import (
     HealthWriteAuthorityError,
     require_health_write_authority,
@@ -271,6 +271,145 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
             .one_or_none()
         )
 
+    def get_active_exact_whoop_authority(
+        self,
+        db_session: DbSession,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        authorization_generation: int,
+        dispatch_id: UUID,
+        lease_token: UUID,
+        for_update: bool = False,
+    ) -> UserConnection | None:
+        """Resolve credentials only when the exact running dispatch still owns them."""
+        query = (
+            db_session.query(self.model)
+            .join(User, User.id == self.model.user_id)
+            .join(
+                WhoopSyncDispatchReceipt,
+                WhoopSyncDispatchReceipt.connection_id == self.model.id,
+            )
+            .join(
+                WhoopAuthorizationLease,
+                WhoopAuthorizationLease.user_id == self.model.user_id,
+            )
+            .filter(
+                self.model.id == connection_id,
+                self.model.user_id == user_id,
+                self.model.provider == "whoop",
+                self.model.status == ConnectionStatus.ACTIVE,
+                self.model.authorization_generation == authorization_generation,
+                User.health_write_state == "active",
+                WhoopSyncDispatchReceipt.id == dispatch_id,
+                WhoopSyncDispatchReceipt.user_id == user_id,
+                WhoopSyncDispatchReceipt.authorization_generation == authorization_generation,
+                WhoopSyncDispatchReceipt.status == "running",
+                WhoopSyncDispatchReceipt.lease_token == lease_token,
+                WhoopAuthorizationLease.connection_id == connection_id,
+                WhoopAuthorizationLease.authorization_generation == authorization_generation,
+                WhoopAuthorizationLease.lease_token == lease_token,
+                WhoopAuthorizationLease.lease_kind == "full_history_sync",
+                WhoopAuthorizationLease.lease_expires_at > func.clock_timestamp(),
+            )
+            .populate_existing()
+        )
+        if for_update:
+            query = query.with_for_update()
+        return query.one_or_none()
+
+    def get_active_exact_connection(
+        self,
+        db_session: DbSession,
+        *,
+        user_id: UUID,
+        provider: str,
+        connection_id: UUID,
+        authorization_generation: int,
+    ) -> UserConnection | None:
+        """Resolve one active connection without account-level fallback."""
+        return (
+            db_session.query(self.model)
+            .join(User, User.id == self.model.user_id)
+            .filter(
+                self.model.id == connection_id,
+                self.model.user_id == user_id,
+                self.model.provider == provider,
+                self.model.authorization_generation == authorization_generation,
+                self.model.status == ConnectionStatus.ACTIVE,
+                User.health_write_state == "active",
+            )
+            .populate_existing()
+            .one_or_none()
+        )
+
+    def get_active_whoop_lease_authority(
+        self,
+        db_session: DbSession,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        authorization_generation: int,
+        lease_token: UUID,
+        lease_kind: str,
+        for_update: bool = False,
+    ) -> UserConnection | None:
+        """Resolve the active WHOOP grant held by a non-dispatch authorization lease."""
+        query = (
+            db_session.query(self.model)
+            .join(User, User.id == self.model.user_id)
+            .join(WhoopAuthorizationLease, WhoopAuthorizationLease.connection_id == self.model.id)
+            .filter(
+                self.model.id == connection_id,
+                self.model.user_id == user_id,
+                self.model.provider == "whoop",
+                self.model.status == ConnectionStatus.ACTIVE,
+                self.model.authorization_generation == authorization_generation,
+                User.health_write_state == "active",
+                WhoopAuthorizationLease.user_id == user_id,
+                WhoopAuthorizationLease.authorization_generation == authorization_generation,
+                WhoopAuthorizationLease.lease_token == lease_token,
+                WhoopAuthorizationLease.lease_kind == lease_kind,
+                WhoopAuthorizationLease.lease_expires_at > func.clock_timestamp(),
+            )
+            .populate_existing()
+        )
+        if for_update:
+            query = query.with_for_update()
+        return query.one_or_none()
+
+    @staticmethod
+    def _require_whoop_lease_authority(
+        db_session: DbSession,
+        *,
+        connection: UserConnection,
+        authorization_generation: int | None,
+        lease_token: UUID | None,
+        lease_kind: str | None,
+    ) -> None:
+        if connection.provider != "whoop":
+            return
+        if authorization_generation is None or lease_token is None or lease_kind is None:
+            raise HealthWriteAuthorityError("WHOOP credential mutation requires authorization lease")
+        if connection.authorization_generation != authorization_generation:
+            raise HealthWriteAuthorityError("WHOOP authorization generation changed")
+        lease = (
+            db_session.query(WhoopAuthorizationLease)
+            .filter(
+                WhoopAuthorizationLease.user_id == connection.user_id,
+                WhoopAuthorizationLease.connection_id == connection.id,
+                WhoopAuthorizationLease.authorization_generation == authorization_generation,
+                WhoopAuthorizationLease.lease_token == lease_token,
+                WhoopAuthorizationLease.lease_kind == lease_kind,
+                WhoopAuthorizationLease.lease_expires_at > func.clock_timestamp(),
+            )
+            .populate_existing()
+            .with_for_update()
+            .one_or_none()
+        )
+        if lease is None:
+            raise HealthWriteAuthorityError("WHOOP authorization lease changed")
+
     def _active_by_provider_external_id(
         self, db_session: DbSession, provider: str, provider_user_id: str
     ) -> Query[UserConnection]:
@@ -429,9 +568,36 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
             .all()
         )
 
-    def disconnect(self, db_session: DbSession, user_id: UUID, provider: str) -> int:
+    def disconnect(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        provider: str,
+        *,
+        expected_whoop_connection_id: UUID | None = None,
+        expected_whoop_authorization_generation: int | None = None,
+        expected_whoop_lease_token: UUID | None = None,
+        expected_connection_id: UUID | None = None,
+        expected_authorization_generation: int | None = None,
+    ) -> int:
         """Disconnect a provider in a single UPDATE query. Returns number of rows updated."""
         self._require_write_authority(db_session, user_id=user_id, provider=provider)
+        if provider == "whoop":
+            if expected_whoop_connection_id is None:
+                raise HealthWriteAuthorityError("WHOOP disconnect requires exact connection authority")
+            connection = require_user_connection_authority(
+                db_session,
+                connection_id=expected_whoop_connection_id,
+                expected_user_id=user_id,
+                expected_provider=provider,
+            )
+            self._require_whoop_lease_authority(
+                db_session,
+                connection=connection,
+                authorization_generation=expected_whoop_authorization_generation,
+                lease_token=expected_whoop_lease_token,
+                lease_kind="disconnect",
+            )
         result = cast(
             CursorResult[tuple[()]],
             db_session.execute(
@@ -441,6 +607,22 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
                         UserConnection.user_id == user_id,
                         UserConnection.provider == provider,
                         UserConnection.status != ConnectionStatus.REVOKED,
+                        *(
+                            (
+                                UserConnection.id == expected_connection_id,
+                                UserConnection.authorization_generation == expected_authorization_generation,
+                            )
+                            if expected_connection_id is not None and expected_authorization_generation is not None
+                            else ()
+                        ),
+                        *(
+                            (
+                                UserConnection.id == expected_whoop_connection_id,
+                                UserConnection.authorization_generation == expected_whoop_authorization_generation,
+                            )
+                            if provider == "whoop"
+                            else ()
+                        ),
                     ),
                 )
                 .values(
@@ -455,13 +637,28 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         db_session.commit()
         return result.rowcount
 
-    def mark_as_revoked(self, db_session: DbSession, connection: UserConnection) -> UserConnection:
+    def mark_as_revoked(
+        self,
+        db_session: DbSession,
+        connection: UserConnection,
+        *,
+        expected_whoop_authorization_generation: int | None = None,
+        expected_whoop_lease_token: UUID | None = None,
+        expected_whoop_lease_kind: str | None = None,
+    ) -> UserConnection:
         """Mark connection as revoked (when refresh token fails)."""
         connection = require_user_connection_authority(
             db_session,
             connection_id=connection.id,
             expected_user_id=connection.user_id,
             expected_provider=connection.provider,
+        )
+        self._require_whoop_lease_authority(
+            db_session,
+            connection=connection,
+            authorization_generation=expected_whoop_authorization_generation,
+            lease_token=expected_whoop_lease_token,
+            lease_kind=expected_whoop_lease_kind,
         )
         connection.status = ConnectionStatus.REVOKED
         connection.updated_at = datetime.now(timezone.utc)
@@ -492,6 +689,10 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         access_token: str,
         refresh_token: str | None,
         expires_in: int,
+        *,
+        expected_whoop_authorization_generation: int | None = None,
+        expected_whoop_lease_token: UUID | None = None,
+        expected_whoop_lease_kind: str | None = None,
     ) -> UserConnection:
         """Update connection with new tokens after refresh."""
 
@@ -500,6 +701,13 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
             connection_id=connection.id,
             expected_user_id=connection.user_id,
             expected_provider=connection.provider,
+        )
+        self._require_whoop_lease_authority(
+            db_session,
+            connection=connection,
+            authorization_generation=expected_whoop_authorization_generation,
+            lease_token=expected_whoop_lease_token,
+            lease_kind=expected_whoop_lease_kind,
         )
 
         connection.access_token = access_token
@@ -522,6 +730,7 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         provider_user_id: str | None = None,
         provider_username: str | None = None,
         scope: str | None = None,
+        expected_whoop_oauth_lease_token: UUID | None = None,
     ) -> UserConnection:
         """Update connection with new tokens and user info."""
         connection = self._lock_identity_update(
@@ -533,6 +742,13 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
             provider_user_id=provider_user_id,
             change_provider_username=bool(provider_username and not connection.provider_username),
             provider_username=provider_username,
+        )
+        self._require_whoop_lease_authority(
+            db_session,
+            connection=connection,
+            authorization_generation=connection.authorization_generation,
+            lease_token=expected_whoop_oauth_lease_token,
+            lease_kind="oauth_callback" if connection.provider == "whoop" else None,
         )
         connection.access_token = access_token
         if refresh_token:
@@ -547,6 +763,10 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
             connection.scope = scope
 
         connection.status = ConnectionStatus.ACTIVE
+        if connection.provider == "whoop":
+            if expected_whoop_oauth_lease_token is None:
+                raise HealthWriteAuthorityError("WHOOP reauthorization requires callback authority")
+            connection.authorization_generation += 1
         connection.updated_at = datetime.now(timezone.utc)
         db_session.add(connection)
         db_session.commit()

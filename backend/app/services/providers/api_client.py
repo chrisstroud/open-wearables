@@ -11,8 +11,11 @@ from fastapi import HTTPException, status
 
 from app.database import DbSession
 from app.integrations.redis_client import get_redis_client
+from app.models import UserConnection
 from app.repositories import UserConnectionRepository
+from app.repositories.whoop_sync_dispatch_repository import WhoopSyncDispatchRepository
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
+from app.services.providers.whoop.exact_sync_authority import current_exact_whoop_sync_authority
 from app.utils.structured_logging import log_structured
 
 logger = logging.getLogger(__name__)
@@ -33,7 +36,35 @@ def _get_valid_token(
 
     Private function used internally by make_authenticated_request.
     """
-    connection = connection_repo.get_by_user_and_provider(db, user_id, provider_name)
+
+    def resolve_connection() -> UserConnection | None:
+        exact_authority = current_exact_whoop_sync_authority()
+        if exact_authority is None:
+            return connection_repo.get_by_user_and_provider(db, user_id, provider_name)
+        if provider_name != "whoop" or exact_authority.user_id != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Exact WHOOP sync authority cannot be used for this provider account",
+            )
+        renewed = WhoopSyncDispatchRepository().renew_runtime_authority(
+            db,
+            user_id=user_id,
+            connection_id=exact_authority.connection_id,
+            authorization_generation=exact_authority.authorization_generation,
+            lease_token=exact_authority.lease_token,
+        )
+        if not renewed:
+            return None
+        return connection_repo.get_active_exact_whoop_authority(
+            db,
+            user_id=user_id,
+            connection_id=exact_authority.connection_id,
+            authorization_generation=exact_authority.authorization_generation,
+            dispatch_id=exact_authority.dispatch_id,
+            lease_token=exact_authority.lease_token,
+        )
+
+    connection = resolve_connection()
     if not connection:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -61,7 +92,7 @@ def _get_valid_token(
 
         with redis_client.lock(lock_key, timeout=60, blocking_timeout=10, sleep=0.2):
             # Fetch and refresh connection instance inside the lock
-            connection = connection_repo.get_by_user_and_provider(db, user_id, provider_name)
+            connection = resolve_connection()
             if not connection:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
@@ -89,7 +120,16 @@ def _get_valid_token(
                 )
 
             token_response = oauth.refresh_access_token(db, user_id, connection.refresh_token)
-            return token_response.access_token
+            exact_authority = current_exact_whoop_sync_authority()
+            if exact_authority is None:
+                return token_response.access_token
+            connection = resolve_connection()
+            if connection is None or not connection.access_token:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Exact WHOOP authorization changed during token refresh",
+                )
+            return connection.access_token
 
     return connection.access_token
 
@@ -153,6 +193,9 @@ def make_authenticated_request(
 
     for attempt in range(MAX_RETRIES + 1):
         try:
+            if attempt > 0 and current_exact_whoop_sync_authority() is not None:
+                access_token = _get_valid_token(db, user_id, provider_name, connection_repo, oauth)
+                request_headers["Authorization"] = f"Bearer {access_token}"
             with httpx.Client(http2=http2) as client:
                 response = client.request(
                     method=method,

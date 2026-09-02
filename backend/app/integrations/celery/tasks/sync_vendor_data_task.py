@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from logging import getLogger
@@ -5,15 +6,23 @@ from typing import Any, cast
 from uuid import UUID, uuid4
 
 from celery import shared_task
+from sqlalchemy import event
+from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import SessionLocal
+from app.repositories.health_write_authority import HealthWriteAuthorityError
 from app.repositories.provider_settings_repository import ProviderSettingsRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
+from app.repositories.whoop_sync_dispatch_repository import WhoopSyncDispatchRepository
 from app.schemas.auth import LiveSyncMode
 from app.schemas.responses.upload import ProviderSyncResult, SyncVendorDataResult
 from app.schemas.sync_status import SyncSource, SyncStage, SyncStatus
 from app.services.providers.factory import ProviderFactory
+from app.services.providers.whoop.exact_sync_authority import (
+    ExactWhoopSyncAuthority,
+    current_exact_whoop_sync_authority,
+)
 from app.services.sync_coordination import release_primary, release_stale_primary, try_become_primary
 from app.services.sync_status_service import completed, failed, new_run_id, progress, started
 from app.utils.config_utils import format_duration
@@ -23,6 +32,41 @@ from app.utils.structured_logging import log_structured
 from app.utils.sync_params import build_sync_params
 
 logger = getLogger(__name__)
+
+
+def _install_exact_whoop_commit_guard(
+    db: Session,
+    authority: ExactWhoopSyncAuthority,
+) -> Callable[[], None]:
+    """Hold the exact lease row across every persistence commit."""
+    repository = WhoopSyncDispatchRepository()
+
+    def validate_before_commit(session: Session) -> None:
+        if authority.lease_lost.is_set():
+            raise HealthWriteAuthorityError("Exact WHOOP sync authorization lease was lost")
+        try:
+            valid = repository.validate_runtime_authority(
+                session,
+                dispatch_id=authority.dispatch_id,
+                user_id=authority.user_id,
+                connection_id=authority.connection_id,
+                authorization_generation=authority.authorization_generation,
+                lease_token=authority.lease_token,
+                for_update=True,
+            )
+        except Exception:
+            authority.lease_lost.set()
+            raise
+        if not valid:
+            authority.lease_lost.set()
+            raise HealthWriteAuthorityError("Exact WHOOP sync authorization lease was lost")
+
+    event.listen(db, "before_commit", validate_before_commit)
+
+    def remove_guard() -> None:
+        event.remove(db, "before_commit", validate_before_commit)
+
+    return remove_guard
 
 
 def _emit_sync_status(fn: Any, /, *args: Any, **kwargs: Any) -> None:
@@ -77,6 +121,8 @@ def sync_vendor_data(
     is_historical: bool = False,
     _skip_linked_fan_out: bool = False,
     _linked_primary_user_id: str | None = None,
+    _exact_connection_id: str | None = None,
+    _exact_authorization_generation: int | None = None,
 ) -> dict[str, Any]:
     """
     Synchronize workout/exercise/activity data from all providers the user is connected to.
@@ -93,6 +139,8 @@ def sync_vendor_data(
             cursor is not clobbered by a user-initiated historical pull.
         _skip_linked_fan_out: Internal flag set to True when this task was triggered
             by another profile's fan-out.  Prevents infinite fan-out loops.
+        _exact_connection_id: Internal exact-dispatch connection selector.
+        _exact_authorization_generation: Internal exact-dispatch generation selector.
 
     Returns:
         dict with sync results per provider
@@ -134,8 +182,38 @@ def sync_vendor_data(
     sync_window_end, effective_end = _resolve_sync_window_end(end_date)
 
     with SessionLocal() as db:
+        remove_exact_commit_guard: Callable[[], None] | None = None
         try:
-            connections = user_connection_repo.get_all_active_by_user(db, user_uuid)
+            if _exact_connection_id is not None or _exact_authorization_generation is not None:
+                if _exact_connection_id is None or _exact_authorization_generation is None or providers != ["whoop"]:
+                    result.errors["authority"] = "Invalid exact WHOOP sync authority"
+                    return result.model_dump()
+                try:
+                    exact_connection_uuid = UUID(_exact_connection_id)
+                except ValueError:
+                    result.errors["authority"] = "Invalid exact WHOOP connection ID"
+                    return result.model_dump()
+                exact_authority = current_exact_whoop_sync_authority()
+                if (
+                    exact_authority is None
+                    or exact_authority.user_id != user_uuid
+                    or exact_authority.connection_id != exact_connection_uuid
+                    or exact_authority.authorization_generation != _exact_authorization_generation
+                ):
+                    result.errors["authority"] = "Missing exact WHOOP dispatch authority"
+                    return result.model_dump()
+                remove_exact_commit_guard = _install_exact_whoop_commit_guard(db, exact_authority)
+                exact_connection = user_connection_repo.get_active_exact_whoop_authority(
+                    db,
+                    user_id=user_uuid,
+                    connection_id=exact_connection_uuid,
+                    authorization_generation=_exact_authorization_generation,
+                    dispatch_id=exact_authority.dispatch_id,
+                    lease_token=exact_authority.lease_token,
+                )
+                connections = [exact_connection] if exact_connection is not None else []
+            else:
+                connections = user_connection_repo.get_all_active_by_user(db, user_uuid)
 
             if providers:
                 connections = [c for c in connections if c.provider in providers]
@@ -581,3 +659,6 @@ def sync_vendor_data(
             )
             result.errors["general"] = str(e)
             return result.model_dump()
+        finally:
+            if remove_exact_commit_guard is not None:
+                remove_exact_commit_guard()
