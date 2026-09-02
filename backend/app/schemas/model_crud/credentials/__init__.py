@@ -19,6 +19,7 @@ from .oauth import (
 )
 from .sdk_client_installation import (
     SDKClientInstallationRead,
+    SDKClientInstallationRevocationRead,
     SDKClientInstallationRevokeRequest,
     SDKClientRegistration,
     SDKHealthResetStateRead,
@@ -59,6 +60,7 @@ __all__ = [
     "UserInvitationActivationPolicy",
     "SDKClientRegistration",
     "SDKClientInstallationRead",
+    "SDKClientInstallationRevocationRead",
     "SDKClientInstallationRevokeRequest",
     "SDKHealthResetStateRead",
     "SDKHealthResetTransitionRequest",

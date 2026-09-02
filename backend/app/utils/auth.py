@@ -3,7 +3,7 @@ from uuid import UUID
 
 from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError, jwt
+from jose import ExpiredSignatureError, JWTError, jwt
 
 from app.config import settings
 from app.database import DbSession
@@ -200,8 +200,24 @@ async def get_sdk_revocation_auth(
     )
     if not token:
         raise credentials_exception
+    expired = False
     try:
         payload = jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
+    except ExpiredSignatureError:
+        # This dependency is used only by the self-revoke route. A phone that
+        # lost the terminal 200 response cannot refresh after revocation, so
+        # allow its expired, still signature-verified JWT to recover only the
+        # exact terminal receipt for an installation already marked revoked.
+        try:
+            payload = jwt.decode(
+                token,
+                settings.secret_key,
+                algorithms=[settings.algorithm],
+                options={"verify_exp": False},
+            )
+        except JWTError as exc:
+            raise credentials_exception from exc
+        expired = True
     except JWTError as exc:
         raise credentials_exception from exc
     if payload.get("scope") != "sdk":
@@ -222,6 +238,7 @@ async def get_sdk_revocation_auth(
         installation is None
         or user is None
         or installation.user_id != user_id
+        or (expired and (installation.status != "revoked" or installation.revoked_at is None))
         or payload.get("installation_generation") != installation.generation
         or payload.get("bundle_id") != installation.bundle_id
         or payload.get("app_version") != installation.app_version

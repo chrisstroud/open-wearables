@@ -8,6 +8,7 @@ from app.models import SDKClientInstallation
 from app.repositories.sdk_client_installation_repository import sdk_client_installation_repository
 from app.schemas.model_crud.credentials import (
     SDKClientInstallationRead,
+    SDKClientInstallationRevocationRead,
     SDKClientInstallationRevokeRequest,
     SDKHealthResetStateRead,
     SDKHealthResetTransitionRequest,
@@ -134,7 +135,7 @@ def revoke_current_sdk_client_installation(
     user_id: UUID,
     db: DbSession,
     auth: SDKRevocationAuthDep,
-) -> SDKClientInstallationRead:
+) -> SDKClientInstallationRevocationRead:
     """Allow an active phone to disconnect only its own installation."""
     if (
         auth.auth_type != "sdk_token"
@@ -154,4 +155,13 @@ def revoke_current_sdk_client_installation(
         expected_generation=auth.installation_generation,
         expected_health_evidence_generation=auth.health_evidence_generation,
     )
-    return _installation_read(db, row)
+    if row.status != "revoked" or row.revoked_at is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Mobile installation revocation did not become terminal",
+        )
+    return SDKClientInstallationRevocationRead(
+        installation_id=row.id,
+        status="revoked",
+        revoked_at=row.revoked_at,
+    )

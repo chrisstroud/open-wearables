@@ -39,6 +39,14 @@ class SDKClientInstallationRead(BaseModel):
     revoked_at: datetime | None
 
 
+class SDKClientInstallationRevocationRead(BaseModel):
+    """Terminal projection consumed by the exact phone installation."""
+
+    installation_id: UUID
+    status: Literal["revoked"]
+    revoked_at: datetime
+
+
 class SDKClientInstallationRevokeRequest(BaseModel):
     """Optimistic authority required for dashboard-initiated revocation."""
 
