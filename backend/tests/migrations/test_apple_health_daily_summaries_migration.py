@@ -39,6 +39,12 @@ def _load_migration() -> Any:
     return module
 
 
+def test_daily_summary_migration_extends_the_applied_multi_source_head() -> None:
+    migration = _load_migration()
+
+    assert migration.down_revision == "f7a9b1c3d5e7"
+
+
 @pytest.fixture
 def migration_connection() -> Iterator[Connection]:
     engine = sa.create_engine("sqlite://")

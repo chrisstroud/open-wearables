@@ -1,7 +1,7 @@
 """apple health daily summaries
 
 Revision ID: f1a2b3c4d5e6
-Revises: e6f8a0b2c4d5
+Revises: f7a9b1c3d5e7
 """
 
 from collections.abc import Sequence
@@ -11,7 +11,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "f1a2b3c4d5e6"
-down_revision: str | None = "e6f8a0b2c4d5"
+down_revision: str | None = "f7a9b1c3d5e7"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
