@@ -135,18 +135,48 @@ class GoogleWebhookHandler(BaseWebhookHandler):
             return {"status": "verified"}
 
         trace_id = str(uuid4())[:8]
+        items = payload if isinstance(payload, list) else [payload]
+        item_identities: list[tuple[Any, str]] = []
+        for item in items:
+            data = item.get("data") if isinstance(item, dict) else None
+            health_user_id = data.get("healthUserId") if isinstance(data, dict) else None
+            if health_user_id is not None:
+                item_identities.append((item, str(health_user_id)))
+        authority = self.authorize_webhook_ingress(
+            db,
+            provider_user_ids={identity for _, identity in item_identities},
+        )
+        authorized_items = [item for item, identity in item_identities if identity in authority.provider_user_ids]
+        if not authorized_items:
+            log_structured(
+                logger,
+                "info",
+                "Acknowledged Google webhook without dispatch",
+                provider="google",
+                trace_id=trace_id,
+                candidate_user_count=len(item_identities),
+                action="webhook_ingress_fenced",
+            )
+            return {"status": "accepted"}
+
+        authorized_payload: dict[str, Any] | list[Any]
+        authorized_payload = authorized_items if isinstance(payload, list) else authorized_items[0]
         log_structured(
             logger,
             "info",
             "Received Google webhook",
             provider="google",
             trace_id=trace_id,
-            notifications=len(payload) if isinstance(payload, list) else 1,
+            notifications=len(authorized_items),
         )
 
-        store_raw_payload(source="webhook", provider="google", payload=payload, trace_id=trace_id)
+        store_raw_payload(source="webhook", provider="google", payload=authorized_payload, trace_id=trace_id)
 
-        task = celery_app.send_task(_PROCESS_PUSH_TASK, args=["google", payload, trace_id], queue="webhook_sync")
+        task = celery_app.send_task(
+            _PROCESS_PUSH_TASK,
+            args=["google", authorized_payload, trace_id],
+            queue="webhook_sync",
+        )
         log_structured(
             logger,
             "info",

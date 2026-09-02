@@ -10,12 +10,26 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models.user_invitation_code import UserInvitationCode
+from app.schemas.model_crud.credentials import UserInvitationActivationPolicy
 from app.services.user_invitation_code_service import (
     CODE_ALPHABET,
     CODE_LENGTH,
     user_invitation_code_service,
 )
 from tests.factories import DeveloperFactory, UserFactory
+
+
+def activation_policy() -> UserInvitationActivationPolicy:
+    return UserInvitationActivationPolicy.model_validate(
+        {
+            "purpose": "activation",
+            "window_version": 2,
+            "lower_bound_inclusive": "2026-07-26T04:00:00Z",
+            "upper_bound_exclusive": "2026-08-25T04:00:00Z",
+            "timezone": "America/Toronto",
+            "completed_day_count": 30,
+        }
+    )
 
 
 class TestGenerate:
@@ -61,6 +75,23 @@ class TestGenerate:
         assert db_code.created_by_id == developer.id
         assert db_code.redeemed_at is None
         assert db_code.revoked_at is None
+        assert db_code.activation_policy is None
+
+    def test_generate_stores_validated_activation_policy(self, db: Session) -> None:
+        developer = DeveloperFactory()
+        user = UserFactory()
+        policy = activation_policy()
+
+        result = user_invitation_code_service.generate(
+            db,
+            user.id,
+            developer.id,
+            activation_policy=policy,
+        )
+
+        assert result.activation_policy == policy
+        db_code = db.query(UserInvitationCode).filter(UserInvitationCode.id == result.id).one()
+        assert db_code.activation_policy == policy.storage_value()
 
     def test_generate_nonexistent_user_raises(self, db: Session) -> None:
         # Arrange
@@ -118,6 +149,22 @@ class TestRedeem:
         assert result.refresh_token.startswith("rt-")
         assert result.token_type == "bearer"
         assert result.expires_in == settings.access_token_expire_minutes * 60
+        assert result.activation_policy is None
+
+    def test_redeem_returns_bound_activation_policy(self, db: Session) -> None:
+        developer = DeveloperFactory()
+        user = UserFactory()
+        policy = activation_policy()
+        generated = user_invitation_code_service.generate(
+            db,
+            user.id,
+            developer.id,
+            activation_policy=policy,
+        )
+
+        result = user_invitation_code_service.redeem(db, generated.code)
+
+        assert result.activation_policy == policy
 
     def test_redeem_returns_sdk_scoped_token(self, db: Session) -> None:
         # Arrange

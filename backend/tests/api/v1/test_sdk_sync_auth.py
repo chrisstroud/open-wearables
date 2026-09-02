@@ -2,13 +2,14 @@
 
 from collections.abc import Generator
 from unittest.mock import MagicMock, patch
+from uuid import UUID
 
 import pytest
 from sqlalchemy.orm import Session
 from starlette.testclient import TestClient
 
 from app.services.sdk_token_service import create_sdk_user_token
-from tests.factories import ApiKeyFactory, DeveloperFactory
+from tests.factories import ApiKeyFactory, DeveloperFactory, UserFactory
 from tests.utils import developer_auth_headers
 
 
@@ -28,6 +29,7 @@ class TestSDKSyncWithSDKToken:
     ) -> None:
         """SDK token should be accepted for apple-health-sdk sync."""
         user_id = "123e4567-e89b-12d3-a456-426614174000"
+        UserFactory(id=UUID(user_id))
         token = create_sdk_user_token("app_123", user_id)
 
         response = client.post(
@@ -44,9 +46,10 @@ class TestSDKSyncWithSDKToken:
             },
         )
 
-        # Should not be 401 (auth should pass)
-        # May be 400/422 if data format is wrong, but auth should pass
-        assert response.status_code != 401
+        # Authentication succeeds, then the backend-first receipt guard keeps
+        # a legacy headerless client from treating a queued 2xx as delivery.
+        assert response.status_code == 425
+        assert response.json()["detail"]["error_code"] == "batch_id_required"
 
     def test_apple_health_sdk_still_accepts_api_key(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
         """API key should still work for apple-health-sdk (backwards compatibility)."""
@@ -67,8 +70,9 @@ class TestSDKSyncWithSDKToken:
             },
         )
 
-        # Should not be 401
-        assert response.status_code != 401
+        # API-key authentication succeeds and reaches the same receipt guard.
+        assert response.status_code == 425
+        assert response.json()["detail"]["error_code"] == "batch_id_required"
 
     def test_no_auth_returns_401(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
         """No authentication should return 401."""

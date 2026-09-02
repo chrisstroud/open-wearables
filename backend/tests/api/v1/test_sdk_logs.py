@@ -1,6 +1,7 @@
 """Tests for SDK logs endpoint."""
 
 from unittest.mock import MagicMock, patch
+from uuid import UUID
 
 from sqlalchemy.orm import Session
 from starlette.testclient import TestClient
@@ -9,7 +10,7 @@ from app.api.routes.v1.sdk_logs import _event_fields
 from app.schemas.enums import SeriesType
 from app.schemas.providers.mobile_sdk import SDKLogRequest
 from app.services.sdk_token_service import create_sdk_user_token
-from tests.factories import ApiKeyFactory
+from tests.factories import ApiKeyFactory, UserFactory
 
 USER_ID = "123e4567-e89b-12d3-a456-426614174000"
 ENDPOINT = "/api/v1/sdk/users/{user_id}/logs"
@@ -215,6 +216,7 @@ class TestSDKLogsEventFields:
 class TestSDKLogsAuth:
     @patch("app.api.routes.v1.sdk_logs.store_raw_payload")
     def test_sdk_token_accepted(self, mock_store: MagicMock, client: TestClient, db: Session) -> None:
+        UserFactory(id=UUID(USER_ID))
         token = create_sdk_user_token("app_123", USER_ID)
         response = client.post(
             _url(),
@@ -242,7 +244,9 @@ class TestSDKLogsAuth:
 
     @patch("app.api.routes.v1.sdk_logs.store_raw_payload")
     def test_token_user_id_mismatch_returns_403(self, mock_store: MagicMock, client: TestClient, db: Session) -> None:
-        token = create_sdk_user_token("app_123", "00000000-0000-0000-0000-000000000000")
+        token_user_id = "00000000-0000-0000-0000-000000000000"
+        UserFactory(id=UUID(token_user_id))
+        token = create_sdk_user_token("app_123", token_user_id)
         response = client.post(
             _url(),
             headers={"Authorization": f"Bearer {token}"},

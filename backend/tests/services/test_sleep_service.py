@@ -31,6 +31,7 @@ from app.services.apple.healthkit.sleep_service import (
     finish_sleep,
     handle_sleep_data,
 )
+from tests.factories import UserFactory
 
 
 def _dt(iso: str) -> datetime:
@@ -640,7 +641,8 @@ class TestSDKSyncEndpointSleep:
         """Endpoint should validate payload with 'sleeping' stage (older Apple Watch)."""
         from app.services.sdk_token_service import create_sdk_user_token
 
-        user_id = str(uuid4())
+        user_id = str(UserFactory().id)
+        batch_id = uuid4()
         token = create_sdk_user_token("test_app", user_id)
 
         with patch("app.api.routes.v1.sdk_sync.process_sdk_upload") as mock_task:
@@ -648,14 +650,21 @@ class TestSDKSyncEndpointSleep:
 
             response = client.post(
                 "/api/v1/sdk/users/" + user_id + "/sync/",
-                headers={"Authorization": f"Bearer {token}"},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "X-Open-Wearables-Batch-ID": str(batch_id),
+                },
                 json=OLD_WATCH_PAYLOAD,
             )
 
         assert response.status_code == 202
         data = response.json()
-        assert data["status_code"] == 202
+        assert data["batch_id"] == str(batch_id)
+        assert data["status"] == "queued"
+        assert data["terminal"] is False
+        assert data["accepted"] is False
         mock_task.delay.assert_called_once()
+        assert mock_task.delay.call_args.kwargs["require_terminal_receipt"] is True
 
     def test_sync_endpoint_accepts_detailed_stages(
         self,
@@ -665,7 +674,8 @@ class TestSDKSyncEndpointSleep:
         """Endpoint should validate payload with detailed sleep stages."""
         from app.services.sdk_token_service import create_sdk_user_token
 
-        user_id = str(uuid4())
+        user_id = str(UserFactory().id)
+        batch_id = uuid4()
         token = create_sdk_user_token("test_app", user_id)
 
         with patch("app.api.routes.v1.sdk_sync.process_sdk_upload") as mock_task:
@@ -673,13 +683,21 @@ class TestSDKSyncEndpointSleep:
 
             response = client.post(
                 "/api/v1/sdk/users/" + user_id + "/sync/",
-                headers={"Authorization": f"Bearer {token}"},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "X-Open-Wearables-Batch-ID": str(batch_id),
+                },
                 json=DETAILED_STAGES_PAYLOAD,
             )
 
         assert response.status_code == 202
         data = response.json()
-        assert data["status_code"] == 202
+        assert data["batch_id"] == str(batch_id)
+        assert data["status"] == "queued"
+        assert data["terminal"] is False
+        assert data["accepted"] is False
+        mock_task.delay.assert_called_once()
+        assert mock_task.delay.call_args.kwargs["require_terminal_receipt"] is True
 
 
 class TestNoIntermediateRedisSaves:

@@ -1,4 +1,5 @@
 from .api_key import ApiKey
+from .apple_health_daily_summary import AppleHealthDailySummary
 from .application import Application
 from .archival_setting import ArchivalSetting
 from .data_point_series import DataPointSeries
@@ -15,6 +16,12 @@ from .personal_record import PersonalRecord
 from .provider_priority import ProviderPriority
 from .provider_setting import ProviderSetting
 from .refresh_token import RefreshToken
+from .sdk_batch_receipt import SDKBatchReceipt
+from .sdk_client_installation import SDKClientInstallation
+from .sdk_sleep_inbox import SDKSleepInbox
+from .sdk_source_reset_seal import SDKSourceResetSeal
+from .sdk_sync_window_receipt import SDKSyncWindowReceipt
+from .sdk_upload_inbox import SDKUploadInbox
 from .series_type_definition import SeriesTypeDefinition
 from .sleep_details import SleepDetails
 from .user import User
@@ -31,6 +38,7 @@ DETAIL_MODELS: dict[DetailType, type[EventRecordDetail]] = {
 
 __all__ = [
     "ApiKey",
+    "AppleHealthDailySummary",
     "Application",
     "ArchivalSetting",
     "Developer",
@@ -52,6 +60,12 @@ __all__ = [
     "PersonalRecord",
     "DataPointSeries",
     "SeriesTypeDefinition",
+    "SDKBatchReceipt",
+    "SDKClientInstallation",
+    "SDKSleepInbox",
+    "SDKSourceResetSeal",
+    "SDKSyncWindowReceipt",
+    "SDKUploadInbox",
     "HealthScore",
     "DetailType",
     "DETAIL_MODELS",

@@ -5,6 +5,7 @@ from fastapi import APIRouter, status
 from app.database import DbSession
 from app.schemas.model_crud.credentials import (
     InvitationCodeRedeemResponse,
+    UserInvitationCodeGenerate,
     UserInvitationCodeRead,
     UserInvitationCodeRedeem,
 )
@@ -22,6 +23,7 @@ def generate_invitation_code(
     user_id: UUID,
     db: DbSession,
     developer: DeveloperDep,
+    payload: UserInvitationCodeGenerate | None = None,
 ) -> UserInvitationCodeRead:
     """Generate a single-use invitation code for standalone SDK onboarding.
 
@@ -38,7 +40,12 @@ def generate_invitation_code(
 
     Requires developer authentication.
     """
-    return user_invitation_code_service.generate(db, user_id, developer.id)
+    return user_invitation_code_service.generate(
+        db,
+        user_id,
+        developer.id,
+        activation_policy=payload.activation_policy if payload is not None else None,
+    )
 
 
 @router.post(
@@ -59,4 +66,4 @@ def redeem_invitation_code(
     has its own backend, mint and forward a token with
     `POST /api/v1/users/{user_id}/token` instead of redeeming codes on the client.
     """
-    return user_invitation_code_service.redeem(db, payload.code)
+    return user_invitation_code_service.redeem(db, payload.code, client=payload.client)

@@ -28,6 +28,11 @@ from sqlalchemy.orm import Query, selectinload
 from app.database import DbSession
 from app.models import DataPointSeries, DataSource, EventRecord, SleepDetails, WorkoutDetails
 from app.repositories.data_source_repository import DataSourceRepository
+from app.repositories.health_write_authority import (
+    require_data_source_authority,
+    require_event_record_authorities,
+    require_health_write_authorities,
+)
 from app.repositories.repositories import CrudRepository
 from app.schemas.enums import ProviderName, SeriesType, get_series_type_id
 from app.schemas.model_crud.activities import (
@@ -52,7 +57,16 @@ class EventRecordRepository(
     def _build_creation(self, db_session: DbSession, creator: EventRecordCreate) -> tuple[UUID, EventRecord]:
         """Resolve the data source and build the ORM object without touching the session."""
         if creator.data_source_id:
-            data_source_id = creator.data_source_id
+            expected_provider: ProviderName | None = None
+            if creator.provider:
+                with contextlib.suppress(ValueError):
+                    expected_provider = ProviderName(creator.provider)
+            data_source = require_data_source_authority(
+                db_session,
+                data_source_id=creator.data_source_id,
+                expected_user_id=creator.user_id,
+                expected_provider=expected_provider,
+            )
         else:
             provider = self.data_source_repo.infer_provider_from_source(creator.source)
             if creator.provider:
@@ -67,7 +81,16 @@ class EventRecordRepository(
                 source=creator.source,
                 software_version=creator.software_version,
             )
-            data_source_id = data_source.id
+            # ensure_data_source() commits when it creates a new row. Re-lock
+            # and revalidate before the event insert so reset cannot win in the
+            # commit gap and leave a post-fence event behind.
+            data_source = require_data_source_authority(
+                db_session,
+                data_source_id=data_source.id,
+                expected_user_id=creator.user_id,
+                expected_provider=provider,
+            )
+        data_source_id = data_source.id
 
         creation_data = creator.model_dump()
         creation_data["data_source_id"] = data_source_id
@@ -131,6 +154,12 @@ class EventRecordRepository(
         if provider is not None:
             source_ids_query = source_ids_query.filter(DataSource.provider == provider)
 
+        authority_targets = source_ids_query.with_entities(DataSource.user_id, DataSource.provider).distinct().all()
+        require_health_write_authorities(
+            db_session,
+            ((row.user_id, row.provider) for row in authority_targets),
+        )
+
         deleted = (
             db_session.query(self.model)
             .filter(
@@ -175,6 +204,18 @@ class EventRecordRepository(
                 return existing
             raise
 
+    def update(self, db_session: DbSession, originator: EventRecord, updater: EventRecordUpdate) -> EventRecord:
+        require_event_record_authorities(db_session, (originator.id,))
+        return super().update(db_session, originator, updater)
+
+    def delete(self, db_session: DbSession, originator: EventRecord) -> EventRecord:
+        require_event_record_authorities(db_session, (originator.id,))
+        return super().delete(db_session, originator)
+
+    def delete_flush(self, db_session: DbSession, originator: EventRecord) -> None:
+        require_event_record_authorities(db_session, (originator.id,))
+        super().delete_flush(db_session, originator)
+
     @handle_exceptions
     def bulk_create(
         self,
@@ -184,9 +225,27 @@ class EventRecordRepository(
         if not creators:
             return []
 
-        # Group by provider for batch processing
+        direct_source_ids: dict[UUID, UUID] = {}
+        for creator in creators:
+            if creator.data_source_id is None:
+                continue
+            expected_provider: ProviderName | None = None
+            if creator.provider:
+                with contextlib.suppress(ValueError):
+                    expected_provider = ProviderName(creator.provider)
+            source = require_data_source_authority(
+                db_session,
+                data_source_id=creator.data_source_id,
+                expected_user_id=creator.user_id,
+                expected_provider=expected_provider,
+            )
+            direct_source_ids[creator.id] = source.id
+
+        # Group creators without a direct source by provider for batch processing.
         by_provider: dict[ProviderName, list[EventRecordCreate]] = {}
         for c in creators:
+            if c.data_source_id is not None:
+                continue
             provider = self.data_source_repo.infer_provider_from_source(c.source)
             if c.provider:
                 with contextlib.suppress(ValueError):
@@ -209,7 +268,7 @@ class EventRecordRepository(
         values_list = []
         for creator in creators:
             identity: DataSourceIdentity = (creator.user_id, creator.device_model, creator.source)
-            source_id = identity_to_source_id.get(identity)
+            source_id = direct_source_ids.get(creator.id) or identity_to_source_id.get(identity)
 
             if not source_id:
                 continue

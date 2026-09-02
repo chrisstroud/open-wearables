@@ -1,7 +1,9 @@
-from uuid import UUID
 from datetime import datetime
+from typing import Any
+from uuid import UUID
 
-from sqlalchemy.orm import Mapped
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import BaseDbModel
 from app.mappings import FKDeveloper, FKUser, Indexed, PrimaryKey, Unique, str_10
@@ -23,3 +25,5 @@ class UserInvitationCode(BaseDbModel):
     expires_at: Mapped[datetime]
     redeemed_at: Mapped[datetime | None]
     revoked_at: Mapped[datetime | None]
+    activation_policy: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    health_evidence_generation: Mapped[int] = mapped_column(default=0, server_default="0")

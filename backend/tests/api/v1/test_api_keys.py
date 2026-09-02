@@ -121,6 +121,7 @@ class TestCreateApiKey:
         assert "id" in data
         assert data["id"].startswith("sk-")
         assert data["created_by"] == str(developer.id)
+        assert data["scopes"] == []
         assert "created_at" in data
 
         # Verify in database
@@ -129,6 +130,24 @@ class TestCreateApiKey:
         api_key = api_key_service.get(db, data["id"])
         assert api_key is not None
         assert api_key.name == "Production API Key"
+
+    def test_create_api_key_with_source_reset_scope(
+        self,
+        client: TestClient,
+        db: Session,
+        api_v1_prefix: str,
+    ) -> None:
+        developer = DeveloperFactory(email="reset@example.com", password="test123")
+        headers = developer_auth_headers(developer.id)
+
+        response = client.post(
+            f"{api_v1_prefix}/developer/api-keys",
+            json={"name": "Reset operator", "scopes": ["source-reset"]},
+            headers=headers,
+        )
+
+        assert response.status_code == 201
+        assert response.json()["scopes"] == ["source-reset"]
 
     def test_create_api_key_default_name(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
         """Test creating API key with default name."""

@@ -20,4 +20,7 @@ class SDKAuthContext(BaseModel):
     auth_type: Literal["sdk_token", "api_key"]
     user_id: UUID | None = None  # From SDK token (sub claim)
     app_id: str | None = None  # From SDK token
+    installation_id: UUID | None = None  # First-class mobile installation, when present
+    installation_generation: int | None = None
+    health_evidence_generation: int | None = None
     api_key_id: str | None = None  # From API key

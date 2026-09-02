@@ -10,11 +10,19 @@ from .sleep_state import (
     SleepStateStage,
 )
 from .sync_request import (
+    AppleHealthSleepSummary,
+    AppleHealthWorkoutSummary,
+    DailySummary,
+    DailySummaryContributor,
+    DailySummaryStatistic,
+    DeletedObject,
     OSVersion,
     SleepRecord,
+    SleepSummaryDuration,
     SourceInfo,
     SyncRequest,
     SyncRequestData,
+    SyncWindowManifest,
     WorkoutStatistic,
 )
 
@@ -31,6 +39,14 @@ __all__ = [
     # SyncRequest
     "SyncRequest",
     "SyncRequestData",
+    "SyncWindowManifest",
+    "DailySummary",
+    "DailySummaryContributor",
+    "DailySummaryStatistic",
+    "AppleHealthSleepSummary",
+    "AppleHealthWorkoutSummary",
+    "SleepSummaryDuration",
+    "DeletedObject",
     "SleepRecord",
     "WorkoutStatistic",
     "SourceInfo",

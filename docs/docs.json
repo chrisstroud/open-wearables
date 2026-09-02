@@ -139,8 +139,9 @@
           {
             "group": "Deployment",
             "pages": [
-              "deployment/docker",
-              "deployment/railway"
+              "deployment/docker-images",
+              "deployment/railway",
+              "deployment/mobile-v2-reliability-runbook"
             ]
           },
           {
@@ -270,6 +271,9 @@
             "group": "Mobile SDK",
             "pages": [
               "POST /api/v1/sdk/users/{user_id}/sync",
+              "GET /api/v1/sdk/users/{user_id}/sync/{batch_id}",
+              "GET /api/v1/sdk/users/{user_id}/sync-windows",
+              "GET /api/v1/sdk/users/{user_id}/sync-windows/{window_id}",
               "POST /api/v1/users/{user_id}/token",
               "POST /api/v1/users/{user_id}/invitation-code",
               "POST /api/v1/invitation-code/redeem"

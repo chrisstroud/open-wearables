@@ -13,6 +13,12 @@ class UploadDataResponse(BaseModel):
     user_id: str | None = Field(None, description="User ID associated with the import operation")
     dropped_count: int = Field(0, description="Number of individual records dropped by per-record validation")
     records_saved: int = Field(0, description="Time-series samples saved")
+    daily_summaries_saved: int = Field(0, description="Daily summary revisions durably accepted")
+    revision_set_digest: str | None = Field(
+        None,
+        pattern=r"^[0-9a-f]{64}$",
+        description="Canonical identity digest for an accepted Apple daily-summary revision set",
+    )
     types: list[str] = Field(
         default_factory=list,
         description=(
@@ -22,3 +28,12 @@ class UploadDataResponse(BaseModel):
     )
     workouts_saved: int = Field(0, description="Workouts saved")
     sleep_saved: int = Field(0, description="Sleep records saved")
+    tombstones_received: int = Field(0, description="HealthKit tombstones received in this batch")
+    tombstones_applied: int = Field(0, description="Tombstones durably applied or already absent")
+    tombstones_unresolved: int = Field(0, description="Tombstones quarantined without advancing the client anchor")
+    tombstone_rows_deleted: int = Field(0, description="Stored rows removed while applying tombstones")
+    tombstone_error_code: str | None = Field(None, description="Typed reason when tombstones cannot be applied safely")
+    processing_error_code: str | None = Field(
+        None,
+        description="Typed terminal reason when an otherwise valid SDK item cannot be durably processed",
+    )

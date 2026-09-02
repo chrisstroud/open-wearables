@@ -7,7 +7,7 @@ from jose import JWTError, jwt
 
 from app.config import settings
 from app.database import DbSession
-from app.models import Developer
+from app.models import Developer, User
 from app.repositories.developer_repository import DeveloperRepository
 from app.schemas.auth import SDKAuthContext
 
@@ -120,10 +120,51 @@ async def get_sdk_auth(
             )
             if payload.get("scope") == "sdk":
                 sub = payload.get("sub")
+                try:
+                    user_id = UUID(sub) if sub else None
+                except (TypeError, ValueError):
+                    user_id = None
+                if user_id is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Could not validate credentials",
+                        headers={"WWW-Authenticate": "Bearer"},
+                    )
+                app_id = payload.get("app_id")
+                if not isinstance(app_id, str):
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Could not validate credentials",
+                        headers={"WWW-Authenticate": "Bearer"},
+                    )
+                if db.get(User, user_id) is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Could not validate credentials",
+                        headers={"WWW-Authenticate": "Bearer"},
+                    )
+                from app.services.sdk_client_installation_service import sdk_client_installation_service
+
+                installation = sdk_client_installation_service.require_active(
+                    db,
+                    user_id=user_id,
+                    app_id=app_id,
+                    generation=payload.get("installation_generation"),
+                    bundle_id=payload.get("bundle_id"),
+                    app_version=payload.get("app_version"),
+                    build_number=payload.get("build_number"),
+                    protocol_version=payload.get("protocol_version"),
+                    health_evidence_generation=payload.get("health_evidence_generation"),
+                )
                 return SDKAuthContext(
                     auth_type="sdk_token",
-                    user_id=UUID(sub) if sub else None,
-                    app_id=payload.get("app_id"),
+                    user_id=user_id,
+                    app_id=app_id,
+                    installation_id=installation.id if installation is not None else None,
+                    installation_generation=installation.generation if installation is not None else None,
+                    health_evidence_generation=(
+                        payload.get("health_evidence_generation") if installation is not None else None
+                    ),
                 )
         except JWTError:
             pass  # Fall through to API key check
@@ -140,3 +181,63 @@ async def get_sdk_auth(
 
 
 SDKAuthDep = Annotated[SDKAuthContext, Depends(get_sdk_auth)]
+
+
+async def get_sdk_revocation_auth(
+    db: DbSession,
+    token: Annotated[str | None, Depends(oauth2_scheme)] = None,
+) -> SDKAuthContext:
+    """Authenticate an exact first-class install for idempotent self-revocation.
+
+    Unlike normal SDK authentication, the exact matching installation may
+    already be revoked so a client can safely retry after losing the 200
+    response. This dependency is intentionally used by only the revoke route.
+    """
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate installation credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    if not token:
+        raise credentials_exception
+    try:
+        payload = jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
+    except JWTError as exc:
+        raise credentials_exception from exc
+    if payload.get("scope") != "sdk":
+        raise credentials_exception
+    try:
+        user_id = UUID(payload["sub"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise credentials_exception from exc
+    app_id = payload.get("app_id")
+    if not isinstance(app_id, str) or not app_id.startswith("dfi:"):
+        raise credentials_exception
+
+    from app.repositories.sdk_client_installation_repository import sdk_client_installation_repository
+
+    installation = sdk_client_installation_repository.get_by_app_id(db, app_id)
+    user = db.get(User, user_id)
+    if (
+        installation is None
+        or user is None
+        or installation.user_id != user_id
+        or payload.get("installation_generation") != installation.generation
+        or payload.get("bundle_id") != installation.bundle_id
+        or payload.get("app_version") != installation.app_version
+        or payload.get("build_number") != installation.build_number
+        or payload.get("protocol_version") != installation.protocol_version
+        or payload.get("health_evidence_generation") != user.health_evidence_generation
+    ):
+        raise credentials_exception
+    return SDKAuthContext(
+        auth_type="sdk_token",
+        user_id=user_id,
+        app_id=app_id,
+        installation_id=installation.id,
+        installation_generation=installation.generation,
+        health_evidence_generation=payload.get("health_evidence_generation"),
+    )
+
+
+SDKRevocationAuthDep = Annotated[SDKAuthContext, Depends(get_sdk_revocation_auth)]

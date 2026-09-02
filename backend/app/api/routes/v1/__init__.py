@@ -6,6 +6,7 @@ from .archival import router as archival_router
 from .auth import router as auth_router
 from .config import router as config_router
 from .connections import router as connections_router
+from .daily_summaries import router as daily_summaries_router
 from .dashboard import router as dashboard_router
 from .data_sources import router as data_sources_router
 from .deprecated_webhooks import router as deprecated_webhooks_router
@@ -19,6 +20,7 @@ from .oauth import router as oauth_router
 from .oura_webhooks import router as oura_webhooks_router
 from .outgoing_webhooks import router as outgoing_webhooks_router
 from .priorities import router as priorities_router
+from .sdk_client_installations import router as sdk_client_installations_router
 from .sdk_logs import router as sdk_logs_router
 from .sdk_sync import router as sdk_sync_router
 from .sdk_token import router as sdk_token_router
@@ -50,11 +52,13 @@ v1_router.include_router(sync_status_router, tags=["External: Sync Status"])
 v1_router.include_router(vendor_workouts_router, prefix="/providers", tags=["System: Vendor Workouts"])
 v1_router.include_router(import_xml_router, tags=["External: Apple Health Import"])
 v1_router.include_router(sdk_logs_router, tags=["External: Mobile SDK"])
+v1_router.include_router(sdk_client_installations_router, tags=["External: Mobile SDK"])
 v1_router.include_router(sdk_sync_router, tags=["External: Mobile SDK"])
 v1_router.include_router(sdk_token_router, tags=["External: Mobile SDK"])
 v1_router.include_router(user_invitation_code_router, tags=["External: Mobile SDK"])
 v1_router.include_router(token_router, tags=["External: Token"])
 v1_router.include_router(data_sources_router, tags=["External: Data Sources"])
+v1_router.include_router(daily_summaries_router, tags=["External: Daily Summaries"])
 v1_router.include_router(outgoing_webhooks_router, prefix="/webhooks", tags=["External: Webhooks"])
 
 # --- Internal: dashboard endpoints ---

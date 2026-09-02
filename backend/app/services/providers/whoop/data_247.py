@@ -1,10 +1,9 @@
 """Whoop 247 Data implementation for sleep, recovery, and activity samples."""
 
-from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from app.config import settings
 from app.database import DbSession
@@ -29,6 +28,13 @@ from app.services.raw_payload_storage import store_raw_payload
 from app.services.timeseries_service import timeseries_service
 from app.utils.dates import to_rfc3339
 from app.utils.structured_logging import log_structured
+
+
+def _whoop_sleep_event_record_id(user_id: UUID, sleep_id: str | None) -> UUID:
+    """Return a stable, OW-user-scoped primary key for a WHOOP sleep record."""
+    if sleep_id is None:
+        return uuid4()
+    return uuid5(user_id, f"whoop:sleep:{sleep_id}")
 
 
 class Whoop247Data(Base247DataTemplate):
@@ -231,11 +237,11 @@ class Whoop247Data(Base247DataTemplate):
         # Efficiency percentage
         efficiency = score.get("sleep_efficiency_percentage")
 
-        # Generate UUID for our internal ID (use Whoop ID if it's a valid UUID string)
-        internal_id = uuid4()
-        if sleep_id:
-            with suppress(ValueError, TypeError):
-                internal_id = UUID(sleep_id)
+        # WHOOP IDs identify provider records, not Open Wearables records. The
+        # same WHOOP account can be connected to multiple OW users, so scope the
+        # global EventRecord primary key by OW user. Persistence still matches
+        # legacy rows by source, time, and external_id during replay.
+        internal_id = _whoop_sleep_event_record_id(user_id, str(sleep_id) if sleep_id else None)
 
         normalized = {
             "id": internal_id,

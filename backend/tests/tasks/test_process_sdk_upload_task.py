@@ -98,6 +98,39 @@ class TestProcessSDKUploadTask:
         assert result["status_code"] == 200
         mock_hk_import_service.import_data_from_request.assert_called_once()
 
+    @patch("app.integrations.celery.tasks.process_sdk_upload_task.sdk_import_service")
+    @patch("app.integrations.celery.tasks.process_sdk_upload_task.SessionLocal")
+    @patch("app.integrations.celery.tasks.process_sdk_upload_task.UserRepository")
+    def test_pre_receipt_queued_message_keeps_legacy_semantics(
+        self,
+        mock_user_repo_class: MagicMock,
+        mock_session_local: MagicMock,
+        mock_hk_import_service: MagicMock,
+        db: Session,
+    ) -> None:
+        user = UserFactory()
+        mock_session_local.return_value.__enter__ = MagicMock(return_value=db)
+        mock_session_local.return_value.__exit__ = MagicMock(return_value=None)
+        mock_user_repo_class.return_value.get.return_value = user
+        mock_response = MagicMock()
+        mock_response.model_dump.return_value = {"status_code": 200, "response": "Import successful"}
+        mock_hk_import_service.import_data_from_request.return_value = mock_response
+
+        with (
+            patch("app.integrations.celery.tasks.process_sdk_upload_task.started"),
+            patch("app.integrations.celery.tasks.process_sdk_upload_task.completed"),
+        ):
+            result = process_sdk_upload(
+                content='{"data":{"workouts":[],"records":[]}}',
+                content_type="application/json",
+                user_id=str(user.id),
+                provider="apple",
+                batch_id="legacy-non-uuid-run-id",
+            )
+
+        assert result["status_code"] == 200
+        assert mock_hk_import_service.import_data_from_request.call_args.kwargs["require_terminal_receipt"] is False
+
     @patch("app.integrations.celery.tasks.process_sdk_upload_task.SessionLocal")
     @patch("app.integrations.celery.tasks.process_sdk_upload_task.UserRepository")
     def test_process_sdk_upload_user_check_uses_correct_uuid(

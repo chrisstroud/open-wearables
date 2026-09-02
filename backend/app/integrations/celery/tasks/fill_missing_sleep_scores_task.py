@@ -8,6 +8,11 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.database import SessionLocal
+from app.repositories.health_write_authority import (
+    HealthWriteAuthorityError,
+    acquire_health_maintenance_authority,
+    clear_health_maintenance_authority,
+)
 from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.schemas.model_crud.activities.health_score import HealthScoreCreate, ScoreComponent
 from app.services.health_score_service import health_score_service
@@ -87,8 +92,16 @@ def fill_missing_sleep_scores() -> dict:
             local_end_by_id: dict[UUID, datetime] = {rid: le for rid, _, _, le in record_wakes_extended}
             data_source_by_id: dict[UUID, UUID] = {rid: dsid for rid, dsid, _, _ in record_wakes_extended}
             try:
+                acquire_health_maintenance_authority(db, user_id=uid)
                 scores_by_record = sleep_score_service.get_sleep_scores_for_records(db, uid, record_wakes)
+            except HealthWriteAuthorityError:
+                db.rollback()
+                clear_health_maintenance_authority(db)
+                total_skipped += len(record_wakes)
+                continue
             except Exception as e:
+                db.rollback()
+                clear_health_maintenance_authority(db)
                 total_skipped += len(record_wakes)
                 log_and_capture_error(
                     e,
@@ -99,6 +112,8 @@ def fill_missing_sleep_scores() -> dict:
                 continue
 
             if not scores_by_record:
+                db.rollback()
+                clear_health_maintenance_authority(db)
                 total_skipped += len(record_wakes)
                 continue
 
@@ -125,10 +140,12 @@ def fill_missing_sleep_scores() -> dict:
             try:
                 health_score_service.bulk_create(db, scores_to_save)
                 db.commit()
+                clear_health_maintenance_authority(db)
                 total_saved += len(scores_to_save)
                 total_skipped += len(record_wakes) - len(scores_to_save)
             except Exception as e:
                 db.rollback()
+                clear_health_maintenance_authority(db)
                 total_skipped += len(record_wakes)
                 log_and_capture_error(
                     e,

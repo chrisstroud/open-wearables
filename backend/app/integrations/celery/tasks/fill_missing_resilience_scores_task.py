@@ -9,6 +9,11 @@ from sqlalchemy import text
 from app.algorithms.config_algorithms import resilience_config
 from app.config import settings
 from app.database import SessionLocal
+from app.repositories.health_write_authority import (
+    HealthWriteAuthorityError,
+    acquire_health_maintenance_authority,
+    clear_health_maintenance_authority,
+)
 from app.schemas.enums import HealthScoreCategory, ProviderName, SeriesType, get_series_type_id
 from app.schemas.model_crud.activities.health_score import HealthScoreCreate, ScoreComponent
 from app.services.health_score_service import health_score_service
@@ -94,8 +99,16 @@ def fill_missing_resilience_scores() -> dict[str, int]:
 
         for uid, reference_dates in dates_by_user.items():
             try:
+                acquire_health_maintenance_authority(db, user_id=uid)
                 scores_by_date = resilience_score_service.get_hrv_cv_scores_for_date_range(db, uid, reference_dates)
+            except HealthWriteAuthorityError:
+                db.rollback()
+                clear_health_maintenance_authority(db)
+                total_skipped += len(reference_dates)
+                continue
             except Exception as e:
+                db.rollback()
+                clear_health_maintenance_authority(db)
                 total_skipped += len(reference_dates)
                 log_and_capture_error(
                     e,
@@ -128,14 +141,18 @@ def fill_missing_resilience_scores() -> dict[str, int]:
             total_skipped += len(reference_dates) - len(scores_to_save)
 
             if not scores_to_save:
+                db.rollback()
+                clear_health_maintenance_authority(db)
                 continue
 
             try:
                 health_score_service.bulk_create(db, scores_to_save)
                 db.commit()
+                clear_health_maintenance_authority(db)
                 total_saved += len(scores_to_save)
             except Exception as e:
                 db.rollback()
+                clear_health_maintenance_authority(db)
                 total_skipped += len(scores_to_save)
                 log_and_capture_error(
                     e,

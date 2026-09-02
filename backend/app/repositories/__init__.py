@@ -1,4 +1,9 @@
 from .api_key_repository import ApiKeyRepository
+from .apple_health_daily_summary_repository import (
+    AppleHealthDailySummaryRepository,
+    DailySummaryConflictError,
+    apple_health_daily_summary_repository,
+)
 from .archival_repository import ArchivalSettingRepository, DataPointSeriesArchiveRepository
 from .data_point_series_repository import DataPointSeriesRepository
 from .data_source_repository import DataSourceRepository
@@ -10,12 +15,23 @@ from .invitation_repository import InvitationRepository
 from .provider_priority_repository import ProviderPriorityRepository
 from .refresh_token_repository import RefreshTokenRepository, refresh_token_repository
 from .repositories import CrudRepository
+from .sdk_batch_receipt_repository import SDKBatchReceiptRepository
+from .sdk_client_installation_repository import (
+    SDKClientInstallationRepository,
+    sdk_client_installation_repository,
+)
+from .sdk_sleep_inbox_repository import SDKSleepInboxRepository
+from .sdk_sync_window_receipt_repository import SDKSyncWindowReceiptRepository
+from .sdk_upload_inbox_repository import SDKUploadInboxRepository, sdk_upload_inbox_repository
 from .user_connection_repository import UserConnectionRepository
 from .user_repository import UserRepository
 
 __all__ = [
     "UserRepository",
     "ApiKeyRepository",
+    "AppleHealthDailySummaryRepository",
+    "DailySummaryConflictError",
+    "apple_health_daily_summary_repository",
     "ArchivalSettingRepository",
     "DataPointSeriesArchiveRepository",
     "EventRecordRepository",
@@ -24,6 +40,13 @@ __all__ = [
     "DataSourceRepository",
     "ProviderPriorityRepository",
     "RefreshTokenRepository",
+    "SDKBatchReceiptRepository",
+    "SDKClientInstallationRepository",
+    "sdk_client_installation_repository",
+    "SDKSleepInboxRepository",
+    "SDKSyncWindowReceiptRepository",
+    "SDKUploadInboxRepository",
+    "sdk_upload_inbox_repository",
     "refresh_token_repository",
     "UserConnectionRepository",
     "DeveloperRepository",

@@ -13,6 +13,7 @@ from app.models import (
     EventRecordDetail,
     WorkoutDetails,
 )
+from app.repositories.health_write_authority import require_event_record_authorities
 from app.repositories.repositories import CrudRepository
 from app.schemas.model_crud.activities import (
     EventRecordDetailCreate,
@@ -50,6 +51,7 @@ class EventRecordDetailRepository(
 
         Idempotent on record_id: returns the existing row on duplicate insert.
         """
+        require_event_record_authorities(db_session, (creator.record_id,))
         detail = self._build_detail(creator, detail_type)
         try:
             db_session.add(detail)
@@ -76,6 +78,7 @@ class EventRecordDetailRepository(
         Uses a savepoint for IntegrityError handling so a conflict rolls back only
         the INSERT and leaves the outer transaction intact.
         """
+        require_event_record_authorities(db_session, (creator.record_id,))
         detail = self._build_detail(creator, detail_type)
         nested = db_session.begin_nested()
         try:
@@ -101,6 +104,8 @@ class EventRecordDetailRepository(
         """Bulk create detail records using batch insert."""
         if not creators:
             return
+
+        require_event_record_authorities(db_session, (creator.record_id for creator in creators))
 
         model = DETAIL_MODELS.get(detail_type)
         if model is None:
@@ -158,6 +163,7 @@ class EventRecordDetailRepository(
     ) -> None:
         """Delete the detail row for a given record, flushing immediately so the
         slot is free for a replacement insert in the same transaction."""
+        require_event_record_authorities(db_session, (record_id,))
         detail = self.get_by_record_id(db_session, record_id, detail_type)
         if detail is not None:
             db_session.delete(detail)
@@ -175,4 +181,22 @@ class EventRecordDetailRepository(
         written separately from the initial bulk insert.
         NOTE: Caller is responsible for committing or flushing the transaction.
         """
+        require_event_record_authorities(db_session, (record_id,))
         db_session.execute(update(WorkoutDetails).where(WorkoutDetails.record_id == record_id).values(**fields))
+
+    def update(
+        self,
+        db_session: DbSession,
+        originator: EventRecordDetail,
+        updater: EventRecordDetailUpdate,
+    ) -> EventRecordDetail:
+        require_event_record_authorities(db_session, (originator.record_id,))
+        return super().update(db_session, originator, updater)
+
+    def delete(self, db_session: DbSession, originator: EventRecordDetail) -> EventRecordDetail:
+        require_event_record_authorities(db_session, (originator.record_id,))
+        return super().delete(db_session, originator)
+
+    def delete_flush(self, db_session: DbSession, originator: EventRecordDetail) -> None:
+        require_event_record_authorities(db_session, (originator.record_id,))
+        super().delete_flush(db_session, originator)

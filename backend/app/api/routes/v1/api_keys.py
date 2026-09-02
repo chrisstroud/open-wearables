@@ -4,6 +4,7 @@ from fastapi import APIRouter, Body, status
 
 from app.database import DbSession
 from app.schemas.model_crud.credentials import ApiKeyRead, ApiKeyUpdate
+from app.schemas.model_crud.credentials.api_key import ApiKeyScope
 from app.services import DeveloperDep, api_key_service
 
 router = APIRouter()
@@ -20,9 +21,13 @@ def create_api_key(
     db: DbSession,
     _developer: DeveloperDep,
     name: Annotated[str, Body(embed=True, description="Name for the API key")] = "Default",
+    scopes: Annotated[
+        list[ApiKeyScope] | None,
+        Body(embed=True, description="Explicit capabilities for this key"),
+    ] = None,
 ):
     """Generate new API key."""
-    return api_key_service.create_api_key(db, _developer.id, name)
+    return api_key_service.create_api_key(db, _developer.id, name, scopes=scopes)
 
 
 @router.delete("/api-keys/{key_id}", response_model=ApiKeyRead)

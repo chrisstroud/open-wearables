@@ -1,0 +1,228 @@
+---
+title: "Mobile v2 Reliability Runbook"
+sidebarTitle: "Mobile v2"
+description: "Deploy, verify, and operate the receipt-backed dashboard.fitness Apple Health transport."
+---
+
+This runbook covers the private dashboard.fitness mobile v2 contract. It is an
+operator document: never include health values, upload bodies, credentials, or
+refresh tokens in deployment notes, logs, screenshots, or support tickets.
+
+## Safety properties
+
+- A queued `202` is not delivery. The phone advances only after the batch
+  receipt is terminal `succeeded` with no dropped records.
+- Every mobile write is bound to `user_id`, `installation_id`, installation
+  `generation`, and `health_evidence_generation`.
+- Re-pairing, revocation, and reset fence older JWTs, refresh tokens, queued
+  work, sleep projections, and window receipts.
+- The 30-completed-day activation receipt is distinct from archive completion.
+  Archive coverage expands backward without making the dashboard unavailable.
+- The dashboard server's immutable activation job supplies the exact account-
+  local 30-day policy. Open Wearables binds that policy to the installation
+  generation and validates it against its reviewed 28-type Apple Health
+  registry; the phone cannot substitute a different interval or type subset.
+- A window is ready only when every referenced successful batch has worker-
+  derived type identifiers and content timestamps inside the manifest bounds.
+  Activation and each adjacent archive window must cover the exact registry
+  through the disjoint union of observed and empty/no-access types.
+- Raw values are never emitted by the receipt, installation, reset, or prune
+  control-plane logs.
+
+## Deployment order
+
+Use one reviewed source revision for the API, Celery worker, and Celery beat.
+
+1. Back up PostgreSQL and record the current Alembic revision.
+2. Apply migrations in order:
+   `8e3f1a9c2b47 -> a2c4e6f8b0d1 -> c4d6e8f0a2b3 -> e6f8a0b2c4d5`.
+3. Deploy the API and require its health check to pass. The container binds
+   `${PORT:-${API_PORT:-8000}}` so Railway's injected port is authoritative.
+4. Deploy the Celery worker from the same revision.
+5. Deploy Celery beat from the same revision.
+6. Confirm the inbox-prune schedule is registered for `02:30 UTC`.
+7. Run synthetic receipt canaries before enabling a signed mobile build.
+
+Migration `e6f8a0b2c4d5` may be downgraded only while all v2/reset state remains
+empty. Its downgrade deliberately refuses after any first-class installation,
+scoped receipt, inbox row, quarantined sleep row, generation transition, or
+generation-scoped credential exists. After population, rollback means deploying
+a compatible forward fix, not removing the schema.
+
+## Canary checks
+
+Use a synthetic user only.
+
+1. Redeem one v2 invitation with bundle `fitness.dashboard.app`, protocol `2`,
+   and a permanent installation UUID.
+2. Submit a bounded, value-free synthetic batch with a unique batch UUID.
+3. Confirm the upload response is queued and the durable receipt progresses
+   through `queued`/`processing` to terminal `succeeded`.
+4. Confirm a digest-conflicting replay returns a conflict and an identical
+   replay returns the same receipt.
+5. Confirm the upload inbox row disappears only after terminal success.
+6. Publish a 30-day activation window and confirm the exact installation
+   projection reports `recent_history_ready_at`.
+7. Publish one adjacent archive window and confirm
+   `archive_earliest_confirmed_at` moves backward.
+8. Revoke the installation using both its expected installation generation and
+   expected health-evidence generation, then confirm its old access and refresh
+   credentials fail.
+
+`GET /api/v1/users/{user_id}/sdk-installations` is API-key protected and
+returns privacy-safe device control metadata. Readiness must be taken from
+`recent_history_ready_at` and `archive_earliest_confirmed_at` on a row whose
+`id`, `generation`, and `health_evidence_generation` match the current active
+installation. Do not infer readiness from account-wide legacy records or only
+from `last_terminal_receipt_at`.
+
+## Protected all-source reset
+
+Reset preserves the Open Wearables `User` and profile identity needed to pair
+again. It deletes all user-bound health and provider state, including Apple and
+WHOOP connections, credentials, normalized/source rows, mobile controls,
+queues/results, Redis coordination, and governed raw/FIT objects. It fails
+closed when an external plane cannot be inventoried or verified.
+
+All five endpoints require an Open Wearables API key carrying the explicit
+`source-reset` scope. A generic API key or developer JWT is insufficient:
+
+```text
+POST /api/v1/internal/source-resets/{user_id}/inventory
+POST /api/v1/internal/source-resets/{user_id}/fence
+POST /api/v1/internal/source-resets/{user_id}/drain
+POST /api/v1/internal/source-resets/{user_id}/apply
+POST /api/v1/internal/source-resets/{user_id}/verify
+```
+
+Every request contains a stable `operation_id`, the reviewed
+`expected_health_evidence_generation`, optional
+`expected_installation_generation`, and, after inventory, the exact
+`expected_inventory_digest_sha256`. Inventory, fence, and drain for the same
+operation return the stored pre-fence resource counts and digest. Apply returns
+those same counts as deleted counts and advances the health-evidence generation
+exactly once. Verify returns zero remaining counts while retaining the reviewed
+pre-delete digest.
+
+The response resource catalog is exact and closed:
+
+```text
+open-wearables.connections
+open-wearables.normalized-records
+open-wearables.sdk-batch-receipts
+open-wearables.sdk-window-receipts
+open-wearables.sleep-inbox
+open-wearables.invitations
+open-wearables.installations
+open-wearables.refresh-tokens
+open-wearables.source-mappings
+open-wearables.queued-tasks
+open-wearables.result-backend
+open-wearables.raw-payload-objects
+open-wearables.fit-objects
+open-wearables.provider-credentials
+open-wearables.redis-coordination
+open-wearables.user-record
+```
+
+`open-wearables.user-record` means deletable health payload stored directly on
+the user row. It is zero in this schema; it does not represent the preserved
+identity/profile row.
+
+External inventory does not rely on current raw/FIT feature toggles. It scans
+every configured historical S3 target, including the native/fallback endpoint,
+and refuses reset when storage history or versioned objects cannot be proven
+erasable. Provider webhook identities and internal v2 batch locators are kept
+only as keyed fingerprints in the reset proof, allowing queued tasks and result
+rows to be found after connection and receipt rows are deleted without
+persisting raw provider identifiers.
+
+Before enabling protected reset, maintain the bounded external-storage history
+registry:
+
+```text
+SOURCE_RESET_S3_TARGET_HISTORY_COMPLETE=true
+SOURCE_RESET_RETIRED_S3_TARGETS=[...]
+```
+
+`SOURCE_RESET_RETIRED_S3_TARGETS` is a JSON array of at most 32 objects. Each
+object declares `bucket`, optional `endpoint_url`, and the exact historical
+`raw_prefix`, `fit_prefix`, and optional `apple_xml_prefix`; use `null` for a
+plane that was never stored at that target and `apple_xml_prefix: ""` for
+root-level `{user_id}/` Apple XML keys. Endpoint URLs must not contain
+credentials. The runtime uses its normal `AWS_*` credentials or IAM role and
+must be able to inspect versioning and list, read, and delete every declared
+target.
+
+Keep `SOURCE_RESET_S3_TARGET_HISTORY_COMPLETE=false` until deployment records
+have been audited back to the first raw/FIT/Apple object write. Before changing
+a bucket, endpoint, or prefix, append its old non-secret location metadata to
+the retired registry and deploy that registry before changing the writer.
+Remove an entry only after the target and its governed retention history have
+been independently verified empty or destroyed. A missing attestation,
+unreachable target, unreadable `_unknown` object, or enabled/suspended S3
+version history blocks reset rather than returning a false zero.
+
+Each inventory also returns a schema-versioned configuration digest over the
+history attestation, normalized current and retired S3 targets, raw/FIT
+selection settings, and the privacy-safe Redis/Celery selection topology. That
+digest is bound into the inventory manifest even when every external resource
+count is zero. Reordering equivalent retired entries is a no-op; changing a
+bucket, endpoint, prefix, attestation, or governed Redis topology requires a
+fresh inventory and immutable drain seal.
+
+Provider identifiers must also be unique to the Open Wearables user being
+reset. If another user connection has the same provider-side identity, reset
+blocks before provider-only S3, Redis, or Celery references are selected;
+internal-user-UUID references remain unambiguous. Every selected Redis string,
+list, set, sorted set, hash, or stream entry carries its exact Redis type and a
+keyed digest of the full reviewed serialized key state. Deletion watches every
+affected key, rechecks type and content before the transaction, validates exact
+mutation result counts, and removes only reviewed members, fields, entries, or
+list positions. Any duplicate insertion, replacement, reordering, score change,
+or equal-count substitution requires a fresh inventory.
+
+After apply, the account is `awaiting-v2-pairing` with source policy
+`apple-mobile-v2-only`. Legacy invitation redemption, API-key health uploads,
+and legacy SDK token minting remain fenced. Resolve the preserved identity for
+retry with:
+
+```text
+GET /api/v1/users?external_user_id={subject}&page=1&limit=2
+```
+
+Require exactly one returned item whose `external_user_id` exactly matches the
+subject before continuing.
+
+## Retention and deletion truth
+
+| Plane | Implemented behavior |
+| --- | --- |
+| Durable upload inbox | Hard maximum 10 MiB per payload; 7 days by default, configurable from 1–30 days; removed immediately after terminal success; daily expiry prune at 02:30 UTC. |
+| Celery result backend | Expires after 3 days. |
+| Batch/window receipts and installations | No automatic TTL; retained as control/audit state until protected reset or user deletion. |
+| Normalized health records | No automatic TTL; retained until protected reset or user deletion. |
+| Optional raw S3/FIT objects | No automatic object TTL in Open Wearables. Protected reset inventories and deletes user-bound objects synchronously; operators must separately configure storage lifecycle where required. |
+| Raw payload log mode | Not eligible for a provable reset. Reset inventory blocks rather than claiming deletion. Keep raw payload storage disabled in production. |
+| Redis/Celery queues and results | Reset inventories exact user references, fences work, drains or quarantines it, deletes references/results, and verifies absence. |
+| Application logs and infrastructure backups | Governed by the hosting/provider retention policy, not by this repository. Do not promise a deletion deadline until those production policies are configured and verified. |
+
+Under normal operation an expired inbox row is removed by the next daily prune,
+and each run loops over bounded transactions until the expired set is empty, so
+the scheduling bound is its configured TTL plus 24 hours. An infrastructure
+outage can extend that bound. The reset API provides synchronous verification
+for the active governed planes, but it does not establish deletion timing for
+provider logs or backups.
+
+## Incident rules
+
+- Never retry a failed worker by changing a terminal receipt to success.
+- Never copy a payload or health value into logs while diagnosing a digest,
+  scope, or processing error.
+- Treat `409` generation/digest conflicts as an authority change; re-inventory
+  or re-pair instead of forcing the write.
+- Treat a reset response with any blocker, nonzero pending writer count, missing
+  resource key, or nonzero verify count as incomplete.
+- Do not downgrade `e6f8a0b2c4d5` after v2 state is populated.
+- Do not enable a phone until API, worker, and beat are confirmed on the same
+  receipt-capable revision.

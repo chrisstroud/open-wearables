@@ -13,6 +13,7 @@ from .sdk_auth import (
 )
 from .token import (
     RefreshTokenRequest,
+    SDKClientMetadataRefresh,
     TokenResponse,
     TokenType,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "SDKTokenRequest",
     # Token
     "RefreshTokenRequest",
+    "SDKClientMetadataRefresh",
     "TokenResponse",
     "TokenType",
     # Connection status

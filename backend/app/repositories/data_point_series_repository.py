@@ -11,6 +11,7 @@ from app.database import DbSession
 from app.models import DataPointSeries, DataPointSeriesArchive, DataSource, DeviceTypePriority, ProviderPriority
 from app.models.series_type_definition import SeriesTypeDefinition
 from app.repositories.data_source_repository import DataSourceRepository
+from app.repositories.health_write_authority import require_data_source_authority
 from app.repositories.repositories import CrudRepository
 from app.schemas.enums import (
     ProviderName,
@@ -33,6 +34,10 @@ from app.utils.pagination import decode_cursor
 
 # Identity tuple: (user_id, device_model, source)
 DataSourceIdentity = tuple[UUID, str | None, str | None]
+
+
+class DataPointSourcePayloadConflictError(RuntimeError):
+    """One stable upstream sample ID carried contradictory payloads in a batch."""
 
 
 class WriteCounts(int):
@@ -79,6 +84,12 @@ class DataPointSeriesRepository(
         returning the existing record instead.
         """
         data_source = self.create_data_source(db_session, creator)
+        data_source = require_data_source_authority(
+            db_session,
+            data_source_id=data_source.id,
+            expected_user_id=creator.user_id,
+            expected_provider=data_source.provider,
+        )
 
         creation_data = creator.model_dump()
 
@@ -86,6 +97,7 @@ class DataPointSeriesRepository(
         for redundant_key in (
             "user_id",
             "source",
+            "original_source_name",
             "device_model",
             "provider",
             "user_connection_id",
@@ -118,42 +130,63 @@ class DataPointSeriesRepository(
             return WriteCounts(0, 0)
 
         # 1. Resolve all data sources in batch
-        identity_to_source_id = self._resolve_data_sources(db_session, creators)
+        creator_to_source_id = self._resolve_data_sources(db_session, creators)
 
         # 2. Build and execute data point batch insert
-        return self._insert_data_points(db_session, creators, identity_to_source_id)
+        return self._insert_data_points(db_session, creators, creator_to_source_id)
 
-    def _resolve_data_sources(
-        self, db_session: DbSession, creators: list[TimeSeriesSampleCreate]
-    ) -> dict[DataSourceIdentity, UUID]:
+    def _resolve_data_sources(self, db_session: DbSession, creators: list[TimeSeriesSampleCreate]) -> dict[UUID, UUID]:
+        creator_to_source_id: dict[UUID, UUID] = {}
         by_provider: dict[ProviderName, list[TimeSeriesSampleCreate]] = {}
         for c in creators:
+            if c.data_source_id is not None:
+                expected_provider: ProviderName | None = None
+                if c.provider:
+                    with contextlib.suppress(ValueError):
+                        expected_provider = ProviderName(c.provider)
+                source = require_data_source_authority(
+                    db_session,
+                    data_source_id=c.data_source_id,
+                    expected_user_id=c.user_id,
+                    expected_provider=expected_provider,
+                )
+                creator_to_source_id[c.id] = source.id
+                continue
             provider = self.data_source_repo.infer_provider_from_source(c.source)
             if c.provider:
                 with contextlib.suppress(ValueError):
                     provider = ProviderName(c.provider)
             by_provider.setdefault(provider, []).append(c)
 
-        identity_to_source_id: dict[DataSourceIdentity, UUID] = {}
-
         for provider, provider_creators in by_provider.items():
             unique_identities: set[DataSourceIdentity] = set()
+            identity_metadata: dict[DataSourceIdentity, tuple[str | None, str | None]] = {}
             user_connection_id = provider_creators[0].user_connection_id if provider_creators else None
             for c in provider_creators:
-                unique_identities.add((c.user_id, c.device_model, c.source))
+                identity = (c.user_id, c.device_model, c.source)
+                unique_identities.add(identity)
+                identity_metadata.setdefault(identity, (c.software_version, c.original_source_name))
 
             batch_result = self.data_source_repo.batch_ensure_data_sources(
-                db_session, provider, user_connection_id, unique_identities
+                db_session,
+                provider,
+                user_connection_id,
+                unique_identities,
+                identity_metadata=identity_metadata,
             )
-            identity_to_source_id.update(batch_result)
+            for creator in provider_creators:
+                identity = (creator.user_id, creator.device_model, creator.source)
+                source_id = batch_result.get(identity)
+                if source_id is not None:
+                    creator_to_source_id[creator.id] = source_id
 
-        return identity_to_source_id
+        return creator_to_source_id
 
     def _insert_data_points(
         self,
         db_session: DbSession,
         creators: list[TimeSeriesSampleCreate],
-        source_map: dict[DataSourceIdentity, UUID],
+        source_map: dict[UUID, UUID],
     ) -> WriteCounts:
         """Batch insert data points.
 
@@ -167,8 +200,7 @@ class DataPointSeriesRepository(
         """
         values_list = []
         for creator in creators:
-            identity: DataSourceIdentity = (creator.user_id, creator.device_model, creator.source)
-            source_id = source_map.get(identity)
+            source_id = source_map.get(creator.id)
 
             if not source_id:
                 # Should not happen if resolve logic is correct, but safe skip
@@ -188,35 +220,64 @@ class DataPointSeriesRepository(
             )
 
         if values_list:
-            # Deduplicate within the batch: PostgreSQL cannot upsert the same row
-            # twice in one INSERT. Keep the last value for each conflict key.
+            # PostgreSQL cannot upsert one conflict target twice in a statement.
+            # Exact duplicate source UUIDs coalesce, while contradictory payloads
+            # for the same UUID fail closed instead of depending on input order.
             deduped: dict[tuple, dict] = {}
             for v in values_list:
-                key = (v["data_source_id"], v["series_type_definition_id"], v["recorded_at"])
+                external_id = v["external_id"]
+                key = (
+                    ("external", v["data_source_id"], v["series_type_definition_id"], external_id)
+                    if external_id is not None
+                    else ("legacy", v["data_source_id"], v["series_type_definition_id"], v["recorded_at"])
+                )
+                prior = deduped.get(key)
+                if prior is not None and external_id is not None:
+                    comparable_fields = ("recorded_at", "zone_offset", "value", "is_daily_total")
+                    if any(prior[field] != v[field] for field in comparable_fields):
+                        raise DataPointSourcePayloadConflictError(
+                            "Stable external sample ID has contradictory payloads in one batch"
+                        )
                 deduped[key] = v
             values_list = list(deduped.values())
 
             inserted = 0
             updated = 0
-            for i in range(0, len(values_list), self.BATCH_INSERT_CHUNK_SIZE):
-                chunk = values_list[i : i + self.BATCH_INSERT_CHUNK_SIZE]
-                stmt = insert(self.model).values(chunk)
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=["data_source_id", "series_type_definition_id", "recorded_at"],
-                    set_={
-                        "value": stmt.excluded.value,
-                        "external_id": stmt.excluded.external_id,
-                        "zone_offset": stmt.excluded.zone_offset,
-                        "is_daily_total": stmt.excluded.is_daily_total,
-                    },
-                    # RETURNING (xmax = 0): true = row freshly inserted, false = hit a
-                    # conflict and was updated in place. Same statement, no extra round-trip.
-                ).returning(literal_column("(xmax = 0)"))
-                for is_insert in db_session.execute(stmt).scalars():
-                    if is_insert:
-                        inserted += 1
+            external_values = [value for value in values_list if value["external_id"] is not None]
+            legacy_values = [value for value in values_list if value["external_id"] is None]
+            for values, identity_kind in ((external_values, "external"), (legacy_values, "legacy")):
+                for i in range(0, len(values), self.BATCH_INSERT_CHUNK_SIZE):
+                    chunk = values[i : i + self.BATCH_INSERT_CHUNK_SIZE]
+                    stmt = insert(self.model).values(chunk)
+                    if identity_kind == "external":
+                        stmt = stmt.on_conflict_do_update(
+                            index_elements=["data_source_id", "series_type_definition_id", "external_id"],
+                            index_where=self.model.external_id.is_not(None),
+                            set_={
+                                "recorded_at": stmt.excluded.recorded_at,
+                                "value": stmt.excluded.value,
+                                "zone_offset": stmt.excluded.zone_offset,
+                                "is_daily_total": stmt.excluded.is_daily_total,
+                            },
+                        )
                     else:
-                        updated += 1
+                        stmt = stmt.on_conflict_do_update(
+                            index_elements=["data_source_id", "series_type_definition_id", "recorded_at"],
+                            index_where=self.model.external_id.is_(None),
+                            set_={
+                                "value": stmt.excluded.value,
+                                "zone_offset": stmt.excluded.zone_offset,
+                                "is_daily_total": stmt.excluded.is_daily_total,
+                            },
+                        )
+                    # RETURNING (xmax = 0): true = freshly inserted, false =
+                    # the same stable source identity was explicitly corrected.
+                    stmt = stmt.returning(literal_column("(xmax = 0)"))
+                    for is_insert in db_session.execute(stmt).scalars():
+                        if is_insert:
+                            inserted += 1
+                        else:
+                            updated += 1
             # NOTE: Caller should commit - allows batching multiple operations
             return WriteCounts(inserted, updated)
 
@@ -237,7 +298,11 @@ class DataPointSeriesRepository(
                     .filter(
                         self.model.data_source_id == creation.data_source_id,
                         self.model.series_type_definition_id == creation.series_type_definition_id,
-                        self.model.recorded_at == creation.recorded_at,
+                        (
+                            self.model.external_id == creation.external_id
+                            if creation.external_id is not None
+                            else self.model.recorded_at == creation.recorded_at
+                        ),
                     )
                     .first()
                 )
@@ -248,6 +313,17 @@ class DataPointSeriesRepository(
             raise
 
     def create_data_source(self, db_session: DbSession, creator: TimeSeriesSampleCreate) -> DataSource:
+        if creator.data_source_id is not None:
+            expected_provider: ProviderName | None = None
+            if creator.provider:
+                with contextlib.suppress(ValueError):
+                    expected_provider = ProviderName(creator.provider)
+            return require_data_source_authority(
+                db_session,
+                data_source_id=creator.data_source_id,
+                expected_user_id=creator.user_id,
+                expected_provider=expected_provider,
+            )
         provider = self.data_source_repo.infer_provider_from_source(creator.source)
         if creator.provider:
             with contextlib.suppress(ValueError):
@@ -261,7 +337,25 @@ class DataPointSeriesRepository(
             device_model=creator.device_model,
             software_version=creator.software_version,
             source=creator.source,
+            original_source_name=creator.original_source_name,
         )
+
+    def update(
+        self,
+        db_session: DbSession,
+        originator: DataPointSeries,
+        updater: TimeSeriesSampleUpdate,
+    ) -> DataPointSeries:
+        require_data_source_authority(db_session, data_source_id=originator.data_source_id)
+        return super().update(db_session, originator, updater)
+
+    def delete(self, db_session: DbSession, originator: DataPointSeries) -> DataPointSeries:
+        require_data_source_authority(db_session, data_source_id=originator.data_source_id)
+        return super().delete(db_session, originator)
+
+    def delete_flush(self, db_session: DbSession, originator: DataPointSeries) -> None:
+        require_data_source_authority(db_session, data_source_id=originator.data_source_id)
+        super().delete_flush(db_session, originator)
 
     def get_samples(
         self,
