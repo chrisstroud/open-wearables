@@ -20,6 +20,7 @@ from app.schemas.model_crud.activities import (
 )
 from app.schemas.providers.mobile_sdk import (
     SLEEP_START_STATES,
+    SleepRecord,
     SleepState,
     SleepStateStage,
 )
@@ -253,7 +254,13 @@ def handle_sleep_data(
         unique_data = []
 
         # Sort first by startDate to ensure chronological processing
-        sorted_raw = sorted(request.data.sleep, key=lambda x: x.startDate)
+        # Compact protocol-v3 sleep summaries are persisted by the dedicated
+        # daily-summary transaction and must never enter the legacy raw-stage
+        # state machine. Narrow at this boundary even though the envelope
+        # validator and import service already keep the payload families
+        # separate, so direct callers remain fail-closed too.
+        raw_sleep = [item for item in request.data.sleep if isinstance(item, SleepRecord)]
+        sorted_raw = sorted(raw_sleep, key=lambda item: item.startDate)
 
         for item in sorted_raw:
             # Create a unique key for deduplication

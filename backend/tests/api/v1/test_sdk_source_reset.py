@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from threading import Event
+from typing import cast
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
@@ -12,6 +13,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from starlette.testclient import TestClient
 
 from app.models import (
+    AppleHealthDailySummary,
     DataPointSeries,
     DataSource,
     EventRecord,
@@ -388,6 +390,79 @@ def _seed_all_provider_state(db: Session) -> tuple[User, SDKClientInstallation]:
     )
     db.commit()
     return user, installation
+
+
+def _seed_daily_summary_state(
+    db: Session,
+    *,
+    external_user_id: str,
+) -> tuple[User, SDKClientInstallation, UUID, UUID]:
+    user = cast(User, UserFactory(external_user_id=external_user_id))
+    installation = sdk_client_installation_service.activate(
+        db,
+        user_id=user.id,
+        registration=SDKClientRegistration(
+            installation_id=uuid4(),
+            bundle_id="fitness.dashboard.app",
+            app_version="1.0.0",
+            build_number="1",
+            protocol_version=2,
+        ),
+    )
+    batch_id = uuid4()
+    batch_service = SDKBatchReceiptService()
+    batch_service.prepare_submission(
+        db,
+        batch_id=batch_id,
+        user_id=user.id,
+        installation_id=installation.id,
+        installation_generation=installation.generation,
+        health_evidence_generation=user.health_evidence_generation,
+        provider="apple",
+        payload_sha256=sha256(f"daily-summary-payload:{batch_id}".encode()).hexdigest(),
+    )
+    claim = batch_service.claim_for_processing(db, batch_id)
+    assert claim.attempt_count is not None
+    revision_set_digest = sha256(f"daily-summary-revisions:{batch_id}".encode()).hexdigest()
+    batch_service.mark_succeeded(
+        db,
+        batch_id=batch_id,
+        attempt_count=claim.attempt_count,
+        result={
+            "status_code": 200,
+            "daily_summaries_saved": 1,
+            "revision_set_digest": revision_set_digest,
+        },
+    )
+
+    now = datetime.now(timezone.utc)
+    summary_id = uuid4()
+    db.add(
+        AppleHealthDailySummary(
+            id=summary_id,
+            user_id=user.id,
+            installation_id=installation.id,
+            installation_generation=installation.generation,
+            health_evidence_generation=user.health_evidence_generation,
+            batch_id=batch_id,
+            summary_kind="metric",
+            stable_key=sha256(f"daily-summary-key:{batch_id}".encode()).hexdigest(),
+            schema_version="apple-health-daily-summary.v1",
+            revision_id=sha256(f"daily-summary-revision:{batch_id}".encode()).hexdigest(),
+            supersedes_revision_id=None,
+            local_date=now.date(),
+            timezone="UTC",
+            timezone_boundary_version="tzdb-test",
+            series_type="HKQuantityTypeIdentifierStepCount",
+            contributor_set_digest=sha256(f"daily-summary-contributors:{batch_id}".encode()).hexdigest(),
+            input_set_digest=sha256(f"daily-summary-inputs:{batch_id}".encode()).hexdigest(),
+            computed_at=now,
+            payload={"value": 1},
+            is_current=True,
+        )
+    )
+    db.commit()
+    return user, installation, batch_id, summary_id
 
 
 def test_external_identity_scope_uses_only_provider_webhook_authorities(db: Session) -> None:
@@ -1069,6 +1144,68 @@ def test_all_provider_reset_is_manifest_bound_idempotent_and_preserves_profile(d
     assert db.query(SDKClientInstallation).filter(SDKClientInstallation.user_id == user.id).count() == 0
     assert db.query(RefreshToken).filter(RefreshToken.user_id == user.id).count() == 0
     assert db.query(UserInvitationCode).filter(UserInvitationCode.user_id == user.id).count() == 0
+
+
+def test_reset_inventory_and_erasure_include_only_target_apple_daily_summaries(db: Session) -> None:
+    fake_external = FakeExternalPlanes()
+    fake_external.counts = {key: 0 for key in fake_external.counts}
+    fake_provider_fence = FakeProviderFence()
+    target, target_installation, target_batch_id, target_summary_id = _seed_daily_summary_state(
+        db,
+        external_user_id="daily-summary-reset-target",
+    )
+    other, other_installation, other_batch_id, other_summary_id = _seed_daily_summary_state(
+        db,
+        external_user_id="daily-summary-reset-other",
+    )
+    target_installation_id = target_installation.id
+    target_installation_generation = target_installation.generation
+    other_installation_id = other_installation.id
+    operation_id = uuid4()
+
+    with (
+        patch(
+            "app.services.sdk_source_reset_service.sdk_source_reset_external_planes",
+            fake_external,
+        ),
+        patch(
+            "app.services.sdk_source_reset_service.sdk_source_reset_provider_fence",
+            fake_provider_fence,
+        ),
+    ):
+        reviewed = sdk_source_reset_service.inspect(
+            db,
+            user_id=target.id,
+            request=_transition(operation_id),
+        )
+        expected_counts = {key: 0 for key in RESOURCE_KEYS}
+        expected_counts.update(
+            {
+                "open-wearables.normalized-records": 1,
+                "open-wearables.sdk-batch-receipts": 1,
+                "open-wearables.installations": 1,
+            }
+        )
+        assert reviewed.resource_counts == expected_counts
+
+        request = _transition(
+            operation_id,
+            installation_generation=target_installation_generation,
+            digest=reviewed.inventory_digest_sha256,
+        )
+        sdk_source_reset_service.fence(db, user_id=target.id, request=request)
+        drained = sdk_source_reset_service.drain(db, user_id=target.id, request=request)
+        assert drained.drained is True
+        applied = sdk_source_reset_service.apply(db, user_id=target.id, request=request)
+        assert applied.verified_empty is True
+
+    assert db.get(AppleHealthDailySummary, target_summary_id) is None
+    assert db.get(SDKBatchReceipt, target_batch_id) is None
+    assert db.get(SDKClientInstallation, target_installation_id) is None
+    assert db.get(AppleHealthDailySummary, other_summary_id) is not None
+    assert db.get(SDKBatchReceipt, other_batch_id) is not None
+    assert db.get(SDKClientInstallation, other_installation_id) is not None
+    assert db.get(User, other.id) is not None
 
 
 @pytest.mark.parametrize("drift", ["credential-substitution", "normalized-addition"])

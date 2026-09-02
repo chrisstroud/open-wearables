@@ -13,6 +13,7 @@ from app.config import settings
 from app.database import DbSession
 from app.models import (
     DETAIL_MODELS,
+    AppleHealthDailySummary,
     DataPointSeries,
     DataPointSeriesArchive,
     DataSource,
@@ -315,11 +316,15 @@ class SDKSourceResetService:
             .filter(DataSource.user_id == user_id)
         )
         health_scores = db_session.query(HealthScore.id).filter(HealthScore.user_id == user_id)
+        daily_summaries = db_session.query(AppleHealthDailySummary.id).filter(
+            AppleHealthDailySummary.user_id == user_id
+        )
         normalized_queries: list[tuple[str, Any]] = [
             ("data-point-series", data_points),
             ("data-point-series-archive", archive_points),
             ("event-record", events),
             ("health-score", health_scores),
+            ("apple-health-daily-summary", daily_summaries),
         ]
         for detail_type, model in sorted(DETAIL_MODELS.items()):
             normalized_queries.append(
@@ -803,6 +808,10 @@ class SDKSourceResetService:
             synchronize_session=False
         )
         db_session.query(SDKSleepInbox).filter(SDKSleepInbox.user_id == user_id).delete(synchronize_session=False)
+        # Both summary parents use restrictive foreign keys, so erase child rows first.
+        db_session.query(AppleHealthDailySummary).filter(AppleHealthDailySummary.user_id == user_id).delete(
+            synchronize_session=False
+        )
         db_session.query(SDKBatchReceipt).filter(SDKBatchReceipt.user_id == user_id).delete(synchronize_session=False)
         db_session.query(RefreshToken).filter(RefreshToken.user_id == user_id).delete(synchronize_session=False)
         db_session.query(UserInvitationCode).filter(UserInvitationCode.user_id == user_id).delete(

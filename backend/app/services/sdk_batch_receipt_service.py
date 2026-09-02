@@ -14,6 +14,11 @@ from app.services.sdk_client_installation_service import sdk_client_installation
 
 logger = getLogger(__name__)
 MAX_COVERED_TYPE_IDENTIFIERS = 256
+LOWERCASE_HEX_DIGITS = frozenset("0123456789abcdef")
+
+
+def is_revision_set_digest(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(character in LOWERCASE_HEX_DIGITS for character in value)
 
 
 @dataclass(frozen=True)
@@ -75,6 +80,8 @@ class SDKBatchReceiptService:
                 attempt_count=0,
                 dropped_count=0,
                 records_saved=0,
+                daily_summaries_saved=0,
+                revision_set_digest=None,
                 workouts_saved=0,
                 sleep_saved=0,
                 tombstones_received=0,
@@ -127,6 +134,7 @@ class SDKBatchReceiptService:
         receipt.status = SDKBatchReceiptStatus.QUEUED
         receipt.retryable = False
         receipt.error_code = None
+        receipt.revision_set_digest = None
         receipt.updated_at = now
         receipt.processing_started_at = None
         receipt.completed_at = None
@@ -196,6 +204,25 @@ class SDKBatchReceiptService:
             )
             return
 
+        daily_summaries_saved = int(result.get("daily_summaries_saved", 0) or 0)
+        revision_set_digest = result.get("revision_set_digest")
+        if (daily_summaries_saved > 0 and not is_revision_set_digest(revision_set_digest)) or (
+            daily_summaries_saved == 0 and revision_set_digest is not None
+        ):
+            # The importer and receipt publication share a transaction. Roll it
+            # back before fencing the receipt so a digest regression cannot
+            # commit summary rows under a failed acknowledgement.
+            db_session.rollback()
+            self.mark_failed(
+                db_session,
+                batch_id=batch_id,
+                attempt_count=attempt_count,
+                error_code="daily_summary_revision_set_digest_invalid",
+                retryable=False,
+                commit=commit,
+            )
+            return
+
         receipt = self.crud.get_for_update(db_session, batch_id)
         if receipt is None:
             db_session.rollback()
@@ -231,6 +258,7 @@ class SDKBatchReceiptService:
 
         self._copy_counts(receipt, result)
         self._copy_content_coverage(receipt, result)
+        receipt.revision_set_digest = revision_set_digest if isinstance(revision_set_digest, str) else None
         receipt.status = SDKBatchReceiptStatus.SUCCEEDED
         receipt.retryable = False
         receipt.error_code = None
@@ -276,6 +304,10 @@ class SDKBatchReceiptService:
             return
         if result:
             self._copy_counts(receipt, result)
+        # Compact summary acceptance is all-or-nothing; failed receipts never
+        # claim that summary rows were durably accepted.
+        receipt.daily_summaries_saved = 0
+        receipt.revision_set_digest = None
         now = self._now()
         receipt.status = SDKBatchReceiptStatus.FAILED
         receipt.retryable = retryable
@@ -289,6 +321,7 @@ class SDKBatchReceiptService:
         for field in (
             "dropped_count",
             "records_saved",
+            "daily_summaries_saved",
             "workouts_saved",
             "sleep_saved",
             "tombstones_received",
@@ -332,6 +365,7 @@ class SDKBatchReceiptService:
             status == SDKBatchReceiptStatus.SUCCEEDED
             and receipt.dropped_count == 0
             and receipt.tombstones_unresolved == 0
+            and (receipt.daily_summaries_saved == 0 or is_revision_set_digest(receipt.revision_set_digest))
         )
         return SDKBatchReceiptResponse(
             batch_id=receipt.id,
@@ -341,6 +375,8 @@ class SDKBatchReceiptService:
             retryable=receipt.retryable,
             dropped_count=receipt.dropped_count,
             records_saved=receipt.records_saved,
+            daily_summaries_saved=receipt.daily_summaries_saved,
+            revision_set_digest=receipt.revision_set_digest,
             workouts_saved=receipt.workouts_saved,
             sleep_saved=receipt.sleep_saved,
             tombstones_received=receipt.tombstones_received,

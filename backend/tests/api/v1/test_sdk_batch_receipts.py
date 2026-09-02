@@ -191,6 +191,48 @@ class TestSDKBatchReceiptRoutes:
         assert status_response.status_code == 200
         assert status_response.json()["accepted"] is True
 
+    def test_daily_summary_digest_round_trips_on_duplicate_post_and_get(
+        self,
+        client: TestClient,
+        db: Session,
+        api_v1_prefix: str,
+        mock_sdk_worker: MagicMock,
+    ) -> None:
+        user = UserFactory()
+        batch_id = uuid4()
+        url = f"{api_v1_prefix}/sdk/users/{user.id}/sync"
+        headers = auth_headers(user.id, batch_id)
+        body = payload()
+        revision_set_digest = "d" * 64
+
+        # The API intentionally stores the body opaquely for its worker. The
+        # daily-summary parser is covered in service tests; this proves the
+        # terminal receipt field survives both public replay surfaces.
+        assert client.post(url, headers=headers, json=body).status_code == 202
+        claim = sdk_batch_receipt_service.claim_for_processing(db, batch_id)
+        assert claim.attempt_count is not None
+        sdk_batch_receipt_service.mark_succeeded(
+            db,
+            batch_id=batch_id,
+            attempt_count=claim.attempt_count,
+            result={
+                "status_code": 200,
+                "daily_summaries_saved": 1,
+                "revision_set_digest": revision_set_digest,
+            },
+        )
+
+        duplicate = client.post(url, headers=headers, json=body)
+        assert duplicate.status_code == 200
+        assert duplicate.json()["revision_set_digest"] == revision_set_digest
+        assert duplicate.json()["accepted"] is True
+
+        status_response = client.get(f"{url}/{batch_id}", headers=headers)
+        assert status_response.status_code == 200
+        assert status_response.json()["revision_set_digest"] == revision_set_digest
+        assert status_response.json()["accepted"] is True
+        mock_sdk_worker.delay.assert_called_once()
+
     def test_terminal_drop_returns_409_and_never_redispatches(
         self,
         client: TestClient,

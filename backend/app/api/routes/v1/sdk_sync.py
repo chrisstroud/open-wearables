@@ -209,10 +209,12 @@ async def sync_sdk_data(
     workouts = data.get("workouts")
     sleep = data.get("sleep")
     deletions = data.get("deletions")
+    daily_summaries = data.get("daily_summaries")
     records_count = len(records) if isinstance(records, list) else 0
     workouts_count = len(workouts) if isinstance(workouts, list) else 0
     sleep_count = len(sleep) if isinstance(sleep, list) else 0
     deletions_count = len(deletions) if isinstance(deletions, list) else 0
+    daily_summaries_count = len(daily_summaries) if isinstance(daily_summaries, list) else 0
 
     # Log initial batch receipt with counts
     log_structured(
@@ -227,7 +229,8 @@ async def sync_sdk_data(
         workouts_count=workouts_count,
         sleep_count=sleep_count,
         deletions_count=deletions_count,
-        total_items=records_count + workouts_count + sleep_count + deletions_count,
+        daily_summaries_count=daily_summaries_count,
+        total_items=records_count + workouts_count + sleep_count + deletions_count + daily_summaries_count,
     )
 
     content_str = json.dumps(body, separators=(",", ":"), sort_keys=True)

@@ -20,7 +20,7 @@ from app.services.apple.healthkit.import_service import (
     import_service as sdk_import_service,
 )
 from app.services.apple.healthkit.import_service import validated_content_coverage
-from app.services.sdk_batch_receipt_service import sdk_batch_receipt_service
+from app.services.sdk_batch_receipt_service import is_revision_set_digest, sdk_batch_receipt_service
 from app.services.sdk_client_installation_service import sdk_client_installation_service
 from app.services.sdk_sleep_inbox_service import sdk_sleep_inbox_service
 from app.services.sync_status_service import completed, failed, started
@@ -263,6 +263,18 @@ def process_sdk_upload(
                 require_terminal_receipt=require_terminal_receipt,
             ).model_dump()
 
+            preliminary_terminal_success = (
+                result.get("status_code", 200) == 200
+                and int(result.get("dropped_count", 0) or 0) == 0
+                and int(result.get("tombstones_unresolved", 0) or 0) == 0
+                and not result.get("processing_error_code")
+            )
+            if receipt_exists and preliminary_terminal_success:
+                # Re-parse the durable inbox content before publication. This
+                # independently supplies the canonical compact revision digest
+                # that is persisted on the terminal receipt.
+                result.update(validated_content_coverage(content))
+
             # Log processing completion with results
             log_structured(
                 logger,
@@ -276,6 +288,8 @@ def process_sdk_upload(
                 response=result.get("response"),
                 # Include counts from result if available
                 records_saved=result.get("records_saved", 0),
+                daily_summaries_saved=result.get("daily_summaries_saved", 0),
+                revision_set_digest=result.get("revision_set_digest"),
                 workouts_saved=result.get("workouts_saved", 0),
                 sleep_saved=result.get("sleep_saved", 0),
                 tombstones_applied=result.get("tombstones_applied", 0),
@@ -284,13 +298,20 @@ def process_sdk_upload(
 
             status_code = result.get("status_code", 200)
             records_saved = int(result.get("records_saved", 0) or 0)
+            daily_summaries_saved = int(result.get("daily_summaries_saved", 0) or 0)
+            revision_set_digest = result.get("revision_set_digest")
             workouts_saved = int(result.get("workouts_saved", 0) or 0)
             sleep_saved = int(result.get("sleep_saved", 0) or 0)
             dropped_count = int(result.get("dropped_count", 0) or 0)
             tombstones_unresolved = int(result.get("tombstones_unresolved", 0) or 0)
             processing_error_code = result.get("processing_error_code")
+            if (daily_summaries_saved > 0 and not is_revision_set_digest(revision_set_digest)) or (
+                daily_summaries_saved == 0 and revision_set_digest is not None
+            ):
+                processing_error_code = "daily_summary_revision_set_digest_invalid"
+                result["processing_error_code"] = processing_error_code
             types = result.get("types") or []
-            items_total = records_saved + workouts_saved + sleep_saved
+            items_total = records_saved + daily_summaries_saved + workouts_saved + sleep_saved
             terminal_success = (
                 status_code == 200 and dropped_count == 0 and tombstones_unresolved == 0 and not processing_error_code
             )
@@ -299,7 +320,6 @@ def process_sdk_upload(
                 if receipt_exists:
                     assert receipt_attempt is not None
                     assert batch_uuid is not None
-                    result.update(validated_content_coverage(content))
                     sdk_batch_receipt_service.mark_succeeded(
                         db,
                         batch_id=batch_uuid,
@@ -321,6 +341,8 @@ def process_sdk_upload(
                     metadata={
                         "batch_id": batch_id,
                         "records_saved": records_saved,
+                        "daily_summaries_saved": daily_summaries_saved,
+                        "revision_set_digest": revision_set_digest,
                         "workouts_saved": workouts_saved,
                         "sleep_saved": sleep_saved,
                         "types": types,
@@ -350,6 +372,11 @@ def process_sdk_upload(
                 if receipt_exists:
                     assert receipt_attempt is not None
                     assert batch_uuid is not None
+                    if error_code == "daily_summary_revision_set_digest_invalid":
+                        # The importer may already have flushed compact rows in
+                        # this transaction. Discard them before publishing the
+                        # failed receipt in a fresh transaction.
+                        db.rollback()
                     sdk_batch_receipt_service.mark_failed(
                         db,
                         batch_id=batch_uuid,

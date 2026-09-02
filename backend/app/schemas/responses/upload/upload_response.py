@@ -13,6 +13,12 @@ class UploadDataResponse(BaseModel):
     user_id: str | None = Field(None, description="User ID associated with the import operation")
     dropped_count: int = Field(0, description="Number of individual records dropped by per-record validation")
     records_saved: int = Field(0, description="Time-series samples saved")
+    daily_summaries_saved: int = Field(0, description="Daily summary revisions durably accepted")
+    revision_set_digest: str | None = Field(
+        None,
+        pattern=r"^[0-9a-f]{64}$",
+        description="Canonical identity digest for an accepted Apple daily-summary revision set",
+    )
     types: list[str] = Field(
         default_factory=list,
         description=(

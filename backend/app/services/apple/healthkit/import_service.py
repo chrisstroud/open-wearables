@@ -3,7 +3,7 @@ import time
 from datetime import datetime
 from decimal import Decimal
 from logging import Logger, getLogger
-from typing import Iterable, TypedDict
+from typing import Iterable, NotRequired, TypedDict, cast
 from uuid import UUID, uuid4
 
 import sentry_sdk
@@ -17,6 +17,10 @@ from app.constants.series_types.sdk import (
 )
 from app.constants.workout_types import get_unified_apple_workout_type_sdk
 from app.database import DbSession
+from app.repositories.apple_health_daily_summary_repository import (
+    DailySummaryConflictError,
+    apple_health_daily_summary_repository,
+)
 from app.repositories.data_point_series_repository import DataPointSourcePayloadConflictError
 from app.repositories.data_source_repository import DataSourceProvenanceConflictError
 from app.repositories.user_connection_repository import UserConnectionRepository
@@ -36,11 +40,14 @@ from app.schemas.providers.mobile_sdk import (
     WorkoutStatistic,
 )
 from app.schemas.providers.mobile_sdk.sync_request import (
+    AppleHealthSleepSummary,
+    AppleHealthWorkoutSummary,
     DeletedObject,
     MetricRecord,
     SleepRecord,
     SyncRequestData,
     Workout,
+    calculate_revision_set_digest,
 )
 from app.schemas.responses.upload import UploadDataResponse
 from app.services.event_record_service import event_record_service
@@ -87,6 +94,8 @@ class InvalidRecord(TypedDict):
 class LoadDataResult(TypedDict):
     workouts_saved: int
     records_saved: int
+    daily_summaries_saved: NotRequired[int]
+    revision_set_digest: NotRequired[str | None]
     types: list[str]  # series types written
     sleep_saved: int
     dropped: list[InvalidRecord]
@@ -108,24 +117,46 @@ def _content_coverage(request: SDKSyncRequest) -> tuple[list[str], str | None, s
     if request.data.workouts:
         type_identifiers.add("HKWorkoutType")
 
-    records = [*request.data.records, *request.data.sleep, *request.data.workouts]
-    if not records:
+    type_identifiers.update(summary.healthkit_type for summary in request.data.daily_summaries)
+
+    lower_values = [record.startDate for record in request.data.records]
+    upper_values = [record.endDate for record in request.data.records]
+    for sleep in request.data.sleep:
+        if isinstance(sleep, AppleHealthSleepSummary):
+            lower_values.append(sleep.day_start_inclusive)
+            upper_values.append(sleep.day_end_exclusive)
+        else:
+            lower_values.append(sleep.startDate)
+            upper_values.append(sleep.endDate)
+    for workout in request.data.workouts:
+        if isinstance(workout, AppleHealthWorkoutSummary):
+            lower_values.append(workout.start)
+            upper_values.append(workout.end)
+        else:
+            lower_values.append(workout.startDate)
+            upper_values.append(workout.endDate)
+    lower_values.extend(summary.day_start_inclusive for summary in request.data.daily_summaries)
+    upper_values.extend(summary.day_end_exclusive for summary in request.data.daily_summaries)
+    if not lower_values:
         return sorted(type_identifiers), None, None
-    lower = min(record.startDate for record in records)
-    upper = max(record.endDate for record in records)
+    lower = min(lower_values)
+    upper = max(upper_values)
     return sorted(type_identifiers), lower.isoformat(), upper.isoformat()
 
 
 def validated_content_coverage(request_content: str) -> dict[str, list[str] | str | None]:
-    """Return privacy-safe bounds/types from a terminal-success JSON payload."""
+    """Return privacy-safe bounds/types and any exact compact revision-set digest."""
     raw = json.loads(request_content)
     request = SDKSyncRequest.model_validate(raw)
     covered_types, content_lower, content_upper = _content_coverage(request)
-    return {
+    result: dict[str, list[str] | str | None] = {
         "covered_type_identifiers": covered_types,
         "content_lower_bound_inclusive": content_lower,
         "content_upper_bound_exclusive": content_upper,
     }
+    if request.schema_version == "apple-health-daily-summary.v1":
+        result["revision_set_digest"] = calculate_revision_set_digest(request.data)
+    return result
 
 
 def _parse_sync_request(raw: dict) -> tuple[SDKSyncRequest, list[InvalidRecord]]:
@@ -138,7 +169,11 @@ def _parse_sync_request(raw: dict) -> tuple[SDKSyncRequest, list[InvalidRecord]]
     try:
         return SDKSyncRequest(**raw), []
     except ValidationError:
-        pass  # fall through to per-item validation
+        if raw.get("schema_version") == "apple-health-daily-summary.v1":
+            # The daily-summary envelope is one exact revision set. Never
+            # salvage siblings around an invalid metric, sleep day, or workout.
+            return SDKSyncRequest.model_validate(raw), []
+        pass  # fall through to legacy per-item validation
 
     # Only individual records are salvageable. A malformed container shape (data not a dict,
     # or a collection not a list) is not — re-validate to re-raise the real ValidationError.
@@ -176,6 +211,7 @@ def _parse_sync_request(raw: dict) -> tuple[SDKSyncRequest, list[InvalidRecord]]
                 sleep=kept["sleep"],
                 workouts=kept["workouts"],
                 deletions=kept["deletions"],
+                daily_summaries=[],
             ),
         }
     )
@@ -216,7 +252,7 @@ class ImportService:
         user_uuid = UUID(user_id)
         provider = request.provider
 
-        for wjson in request.data.workouts:
+        for wjson in cast(list[Workout], request.data.workouts):
             workout_id = uuid4()
             external_id = wjson.id if wjson.id else None
 
@@ -432,6 +468,7 @@ class ImportService:
         workouts_saved = 0
         records_saved = 0
         sleep_saved = 0
+        daily_summaries_saved = 0
         types: set[str] = set()
 
         if request.syncWindow is not None:
@@ -457,6 +494,7 @@ class ImportService:
                     request.data.sleep,
                     request.data.workouts,
                     request.data.deletions,
+                    request.data.daily_summaries,
                 )
             ):
                 return {
@@ -598,6 +636,152 @@ class ImportService:
                 "processing_error_code": "validation_failed",
             }
 
+        if request.schema_version == "apple-health-daily-summary.v1":
+            compact_sleep = [item for item in request.data.sleep if isinstance(item, AppleHealthSleepSummary)]
+            compact_workouts = [item for item in request.data.workouts if isinstance(item, AppleHealthWorkoutSummary)]
+            summary_items = [*request.data.daily_summaries, *compact_sleep, *compact_workouts]
+            summary_count = len(summary_items)
+            revision_set_digest = calculate_revision_set_digest(request.data)
+            if request.provider != "apple":
+                return {
+                    "workouts_saved": 0,
+                    "records_saved": 0,
+                    "types": [],
+                    "sleep_saved": 0,
+                    "dropped": dropped,
+                    "validation_ms": validation_ms,
+                    "tombstones_received": 0,
+                    "tombstones_applied": 0,
+                    "tombstones_unresolved": 0,
+                    "tombstone_rows_deleted": 0,
+                    "tombstone_error_code": None,
+                    "unprocessed_count": summary_count,
+                    "processing_error_code": "daily_summary_provider_invalid",
+                }
+            if request.data.records or request.data.deletions:
+                return {
+                    "workouts_saved": 0,
+                    "records_saved": 0,
+                    "types": [],
+                    "sleep_saved": 0,
+                    "dropped": dropped,
+                    "validation_ms": validation_ms,
+                    "tombstones_received": 0,
+                    "tombstones_applied": 0,
+                    "tombstones_unresolved": 0,
+                    "tombstone_rows_deleted": 0,
+                    "tombstone_error_code": None,
+                    "unprocessed_count": summary_count,
+                    "processing_error_code": "mixed_daily_summary_payload_unsupported",
+                }
+            authority = db_session.info.get("health_write_authority")
+            if (
+                not require_terminal_receipt
+                or batch_id is None
+                or not isinstance(authority, tuple)
+                or len(authority) != 4
+            ):
+                return {
+                    "workouts_saved": 0,
+                    "records_saved": 0,
+                    "types": [],
+                    "sleep_saved": 0,
+                    "dropped": dropped,
+                    "validation_ms": validation_ms,
+                    "tombstones_received": 0,
+                    "tombstones_applied": 0,
+                    "tombstones_unresolved": 0,
+                    "tombstone_rows_deleted": 0,
+                    "tombstone_error_code": None,
+                    "unprocessed_count": summary_count,
+                    "processing_error_code": "daily_summary_installation_receipt_required",
+                }
+            authority_user_id, health_evidence_generation, installation_id, installation_generation = authority
+            try:
+                parsed_batch_id = UUID(batch_id)
+            except ValueError:
+                return {
+                    "workouts_saved": 0,
+                    "records_saved": 0,
+                    "types": [],
+                    "sleep_saved": 0,
+                    "dropped": dropped,
+                    "validation_ms": validation_ms,
+                    "tombstones_received": 0,
+                    "tombstones_applied": 0,
+                    "tombstones_unresolved": 0,
+                    "tombstone_rows_deleted": 0,
+                    "tombstone_error_code": None,
+                    "unprocessed_count": summary_count,
+                    "processing_error_code": "batch_id_invalid",
+                }
+            if authority_user_id != UUID(user_id):
+                return {
+                    "workouts_saved": 0,
+                    "records_saved": 0,
+                    "types": [],
+                    "sleep_saved": 0,
+                    "dropped": dropped,
+                    "validation_ms": validation_ms,
+                    "tombstones_received": 0,
+                    "tombstones_applied": 0,
+                    "tombstones_unresolved": 0,
+                    "tombstone_rows_deleted": 0,
+                    "tombstone_error_code": None,
+                    "unprocessed_count": summary_count,
+                    "processing_error_code": "daily_summary_authority_mismatch",
+                }
+            try:
+                daily_summaries_saved = apple_health_daily_summary_repository.accept_batch(
+                    db_session,
+                    user_id=authority_user_id,
+                    installation_id=installation_id,
+                    installation_generation=installation_generation,
+                    health_evidence_generation=health_evidence_generation,
+                    batch_id=parsed_batch_id,
+                    summaries=summary_items,
+                )
+                if daily_summaries_saved != summary_count:
+                    raise DailySummaryConflictError("daily_summary_receipt_count_mismatch")
+            except DailySummaryConflictError as exc:
+                return {
+                    "workouts_saved": 0,
+                    "records_saved": 0,
+                    "types": [],
+                    "sleep_saved": 0,
+                    "dropped": dropped,
+                    "validation_ms": validation_ms,
+                    "tombstones_received": 0,
+                    "tombstones_applied": 0,
+                    "tombstones_unresolved": 0,
+                    "tombstone_rows_deleted": 0,
+                    "tombstone_error_code": None,
+                    "unprocessed_count": summary_count,
+                    "processing_error_code": exc.error_code,
+                }
+            # All compact summary families share the same transaction and
+            # receipt counter. Do not fall through to raw sleep/workout writers.
+            db_session.flush()
+            return {
+                "workouts_saved": 0,
+                "records_saved": 0,
+                "daily_summaries_saved": daily_summaries_saved,
+                "revision_set_digest": revision_set_digest,
+                "types": sorted(summary.series_type for summary in request.data.daily_summaries),
+                "sleep_saved": 0,
+                "dropped": [],
+                "validation_ms": validation_ms,
+                "tombstones_received": 0,
+                "tombstones_applied": 0,
+                "tombstones_unresolved": 0,
+                "tombstone_rows_deleted": 0,
+                "tombstone_error_code": None,
+                "unprocessed_count": 0,
+                "processing_error_code": None,
+            }
+
+        raw_workouts = [item for item in request.data.workouts if isinstance(item, Workout)]
+        raw_sleep = [item for item in request.data.sleep if isinstance(item, SleepRecord)]
         records_without_source_id = [record for record in request.data.records if not record.id]
         if require_terminal_receipt and records_without_source_id:
             return {
@@ -616,7 +800,7 @@ class ImportService:
                 "processing_error_code": "metric_source_id_required",
             }
 
-        workouts_without_source_id = [workout for workout in request.data.workouts if not workout.id]
+        workouts_without_source_id = [workout for workout in raw_workouts if not workout.id]
         if require_terminal_receipt and workouts_without_source_id:
             return {
                 "workouts_saved": 0,
@@ -661,7 +845,7 @@ class ImportService:
 
         unsupported_workout_statistics = [
             statistic
-            for workout in request.data.workouts
+            for workout in raw_workouts
             for statistic in workout.values or []
             if not _is_supported_workout_statistic(statistic)
         ]
@@ -683,7 +867,7 @@ class ImportService:
             }
 
         user_uuid = UUID(user_id)
-        if require_terminal_receipt and request.data.sleep:
+        if require_terminal_receipt and raw_sleep:
             if batch_id is None:
                 return {
                     "workouts_saved": 0,
@@ -697,7 +881,7 @@ class ImportService:
                     "tombstones_unresolved": 0,
                     "tombstone_rows_deleted": 0,
                     "tombstone_error_code": None,
-                    "unprocessed_count": len(request.data.sleep),
+                    "unprocessed_count": len(raw_sleep),
                     "processing_error_code": "batch_id_invalid",
                 }
             try:
@@ -715,7 +899,7 @@ class ImportService:
                     "tombstones_unresolved": 0,
                     "tombstone_rows_deleted": 0,
                     "tombstone_error_code": None,
-                    "unprocessed_count": len(request.data.sleep),
+                    "unprocessed_count": len(raw_sleep),
                     "processing_error_code": "batch_id_invalid",
                 }
             sleep_stage = sdk_sleep_inbox_service.stage(
@@ -723,7 +907,7 @@ class ImportService:
                 user_id=user_uuid,
                 provider=request.provider,
                 batch_id=sleep_batch_id,
-                records=request.data.sleep,
+                records=raw_sleep,
             )
             if sleep_stage.error_code:
                 return {
@@ -738,7 +922,7 @@ class ImportService:
                     "tombstones_unresolved": 0,
                     "tombstone_rows_deleted": 0,
                     "tombstone_error_code": None,
-                    "unprocessed_count": len(request.data.sleep),
+                    "unprocessed_count": len(raw_sleep),
                     "processing_error_code": sleep_stage.error_code,
                 }
             sleep_saved = sleep_stage.staged_count
@@ -805,9 +989,9 @@ class ImportService:
             db_session.commit()
 
         # Process sleep (count sleep segments from input)
-        if request.data.sleep and not require_terminal_receipt:
+        if raw_sleep and not require_terminal_receipt:
             handle_sleep_data(db_session, request, user_id)
-            sleep_saved = len(request.data.sleep)
+            sleep_saved = len(raw_sleep)
             db_session.commit()
         # Receipt-backed sleep projection is scheduled by the worker only
         # after its atomic write + terminal-receipt transaction commits.
@@ -815,6 +999,7 @@ class ImportService:
         return {
             "workouts_saved": workouts_saved,
             "records_saved": records_saved,
+            "daily_summaries_saved": daily_summaries_saved,
             "types": sorted(types),
             "sleep_saved": sleep_saved,
             "dropped": dropped,
@@ -870,6 +1055,8 @@ class ImportService:
             incoming_workouts = len(workouts) if isinstance(workouts, list) else 0
             incoming_sleep = len(sleep) if isinstance(sleep, list) else 0
             incoming_deletions = len(deletions) if isinstance(deletions, list) else 0
+            daily_summaries = inner_data.get("daily_summaries")
+            incoming_daily_summaries = len(daily_summaries) if isinstance(daily_summaries, list) else 0
 
             # Load data and get saved counts
             saved_counts = self.load_data(
@@ -926,7 +1113,9 @@ class ImportService:
                 incoming_workouts=incoming_workouts,
                 incoming_sleep=incoming_sleep,
                 incoming_deletions=incoming_deletions,
+                incoming_daily_summaries=incoming_daily_summaries,
                 records_saved=saved_counts["records_saved"],
+                daily_summaries_saved=saved_counts.get("daily_summaries_saved", 0),
                 workouts_saved=saved_counts["workouts_saved"],
                 sleep_saved=saved_counts["sleep_saved"],
                 tombstones_applied=saved_counts["tombstones_applied"],
@@ -978,6 +1167,8 @@ class ImportService:
                 user_id=user_id,
                 dropped_count=len(dropped) + saved_counts["unprocessed_count"],
                 records_saved=saved_counts["records_saved"],
+                daily_summaries_saved=saved_counts.get("daily_summaries_saved", 0),
+                revision_set_digest=saved_counts.get("revision_set_digest"),
                 types=saved_counts["types"],
                 workouts_saved=saved_counts["workouts_saved"],
                 sleep_saved=saved_counts["sleep_saved"],

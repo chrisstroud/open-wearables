@@ -1,4 +1,5 @@
 from .api_key import ApiKey
+from .apple_health_daily_summary import AppleHealthDailySummary
 from .application import Application
 from .archival_setting import ArchivalSetting
 from .data_point_series import DataPointSeries
@@ -37,6 +38,7 @@ DETAIL_MODELS: dict[DetailType, type[EventRecordDetail]] = {
 
 __all__ = [
     "ApiKey",
+    "AppleHealthDailySummary",
     "Application",
     "ArchivalSetting",
     "Developer",

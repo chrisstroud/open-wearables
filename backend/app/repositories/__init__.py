@@ -1,4 +1,9 @@
 from .api_key_repository import ApiKeyRepository
+from .apple_health_daily_summary_repository import (
+    AppleHealthDailySummaryRepository,
+    DailySummaryConflictError,
+    apple_health_daily_summary_repository,
+)
 from .archival_repository import ArchivalSettingRepository, DataPointSeriesArchiveRepository
 from .data_point_series_repository import DataPointSeriesRepository
 from .data_source_repository import DataSourceRepository
@@ -24,6 +29,9 @@ from .user_repository import UserRepository
 __all__ = [
     "UserRepository",
     "ApiKeyRepository",
+    "AppleHealthDailySummaryRepository",
+    "DailySummaryConflictError",
+    "apple_health_daily_summary_repository",
     "ArchivalSettingRepository",
     "DataPointSeriesArchiveRepository",
     "EventRecordRepository",

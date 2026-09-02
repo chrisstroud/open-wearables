@@ -30,7 +30,7 @@ class SDKClientMetadataRefresh(BaseModel):
     bundle_id: Literal["fitness.dashboard.app"]
     app_version: str = Field(..., min_length=1, max_length=32, pattern=r"^[0-9]+(?:\.[0-9]+){0,2}$")
     build_number: str = Field(..., min_length=1, max_length=32, pattern=r"^[0-9]+$")
-    protocol_version: Literal[2]
+    protocol_version: Literal[2, 3]
 
 
 class RefreshTokenRequest(BaseModel):

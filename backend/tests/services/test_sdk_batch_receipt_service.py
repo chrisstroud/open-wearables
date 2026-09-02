@@ -87,6 +87,77 @@ class TestSDKBatchReceiptService:
         assert response.terminal is True
         assert response.accepted is True
         assert response.records_saved == 12
+        assert response.revision_set_digest is None
+
+    def test_daily_summary_success_persists_and_replays_exact_revision_set_digest(self, db: Session) -> None:
+        user = UserFactory()
+        service = SDKBatchReceiptService()
+        batch_id = uuid4()
+        payload_digest = sha256(b"daily-summary-payload").hexdigest()
+        revision_set_digest = sha256(b"canonical-revision-set").hexdigest()
+        service.prepare_submission(
+            db,
+            batch_id=batch_id,
+            user_id=user.id,
+            provider="apple",
+            payload_sha256=payload_digest,
+        )
+        claim = service.claim_for_processing(db, batch_id)
+        assert claim.attempt_count is not None
+
+        service.mark_succeeded(
+            db,
+            batch_id=batch_id,
+            attempt_count=claim.attempt_count,
+            result={
+                "status_code": 200,
+                "daily_summaries_saved": 3,
+                "revision_set_digest": revision_set_digest,
+                "dropped_count": 0,
+            },
+        )
+
+        replay = service.prepare_submission(
+            db,
+            batch_id=batch_id,
+            user_id=user.id,
+            provider="apple",
+            payload_sha256=payload_digest,
+        )
+        response = service.to_response(replay.receipt)
+        assert replay.http_status == 200
+        assert replay.should_dispatch is False
+        assert response.status == SDKBatchReceiptStatus.SUCCEEDED
+        assert response.accepted is True
+        assert response.daily_summaries_saved == 3
+        assert response.revision_set_digest == revision_set_digest
+
+    def test_daily_summary_success_without_revision_set_digest_fails_closed(self, db: Session) -> None:
+        user = UserFactory()
+        service = SDKBatchReceiptService()
+        batch_id = uuid4()
+        service.prepare_submission(
+            db,
+            batch_id=batch_id,
+            user_id=user.id,
+            provider="apple",
+            payload_sha256=sha256(b"missing-revision-set-digest").hexdigest(),
+        )
+        claim = service.claim_for_processing(db, batch_id)
+        assert claim.attempt_count is not None
+
+        service.mark_succeeded(
+            db,
+            batch_id=batch_id,
+            attempt_count=claim.attempt_count,
+            result={"status_code": 200, "daily_summaries_saved": 1},
+        )
+
+        receipt = service.crud.get(db, batch_id)
+        assert receipt is not None
+        assert receipt.status == SDKBatchReceiptStatus.FAILED
+        assert receipt.revision_set_digest is None
+        assert receipt.error_code == "daily_summary_revision_set_digest_invalid"
 
     @pytest.mark.parametrize(
         ("result", "error_code"),

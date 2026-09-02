@@ -28,8 +28,23 @@ class SDKBatchReceipt(BaseDbModel):
             name="ck_sdk_batch_receipt_nonnegative_counts",
         ),
         CheckConstraint(
+            "daily_summaries_saved >= 0",
+            name="ck_sdk_batch_receipt_daily_summaries_saved",
+        ),
+        CheckConstraint(
             "status <> 'succeeded' OR (dropped_count = 0 AND tombstones_unresolved = 0 AND retryable = false)",
             name="ck_sdk_batch_receipt_success_is_accepted",
+        ),
+        CheckConstraint(
+            "revision_set_digest IS NULL OR revision_set_digest ~ '^[0-9a-f]{64}$'",
+            name="ck_sdk_batch_receipt_revision_set_digest_format",
+        ),
+        CheckConstraint(
+            "(revision_set_digest IS NULL OR "
+            "(provider = 'apple' AND status = 'succeeded' AND daily_summaries_saved > 0)) "
+            "AND (daily_summaries_saved = 0 OR "
+            "(provider = 'apple' AND status = 'succeeded' AND revision_set_digest IS NOT NULL))",
+            name="ck_sdk_batch_receipt_revision_set_digest_state",
         ),
         CheckConstraint(
             "(installation_id IS NULL AND installation_generation IS NULL "
@@ -64,6 +79,8 @@ class SDKBatchReceipt(BaseDbModel):
     attempt_count: Mapped[int]
     dropped_count: Mapped[int]
     records_saved: Mapped[int]
+    daily_summaries_saved: Mapped[int]
+    revision_set_digest: Mapped[str_64 | None]
     workouts_saved: Mapped[int]
     sleep_saved: Mapped[int]
     tombstones_received: Mapped[int]

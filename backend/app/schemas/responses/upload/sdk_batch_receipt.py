@@ -22,6 +22,8 @@ class SDKBatchReceiptResponse(BaseModel):
     retryable: bool = False
     dropped_count: int = Field(0, ge=0)
     records_saved: int = Field(0, ge=0)
+    daily_summaries_saved: int = Field(0, ge=0)
+    revision_set_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     workouts_saved: int = Field(0, ge=0)
     sleep_saved: int = Field(0, ge=0)
     tombstones_received: int = Field(0, ge=0)
