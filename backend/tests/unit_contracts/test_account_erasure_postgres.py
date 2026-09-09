@@ -13,7 +13,7 @@ from unittest.mock import Mock
 from uuid import UUID, uuid4
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.engine import make_url
@@ -26,6 +26,7 @@ from app.database import BaseDbModel, _get_db_dependency
 from app.models import AccountErasureOperation, ApiKey, PersonalRecord, User, UserConnection, WhoopAuthorizationLease
 from app.repositories.account_erasure_repository import account_erasure_repository
 from app.schemas.auth import ConnectionStatus
+from app.services.account_erasure_service import _transition
 from app.services.sdk_source_reset_external import (
     FIT_OBJECTS,
     QUEUED_TASKS,
@@ -34,6 +35,7 @@ from app.services.sdk_source_reset_external import (
     RESULT_BACKEND,
     ExternalResetInventory,
 )
+from app.services.sdk_source_reset_service import sdk_source_reset_service
 from tests.unit_contracts.test_account_erasure import plan_payload
 
 
@@ -75,7 +77,7 @@ def harness(database: object, monkeypatch: pytest.MonkeyPatch) -> dict:
     )
     monkeypatch.setattr(reset_module, "sdk_source_reset_external_planes", external)
     deregister = Mock()
-    monkeypatch.setattr(reset_module.sdk_source_reset_provider_fence, "deregister", deregister)
+    monkeypatch.setattr(reset_module.account_erasure_provider_fence, "deregister", deregister)
     payload = plan_payload()
     user_id = UUID(payload["account"]["openWearablesUserId"])
     peer_id = uuid4()
@@ -232,6 +234,12 @@ def test_provider_failure_leaves_durable_fence_and_retries_exact_operation(harne
         user = db.get(User, harness["user_id"])
         assert user.health_write_state == "fenced"
         assert user.account_erasure_operation_id is not None
+        assert user.account_erasure_provider_fence_verified is False
+        transition = _transition(db.scalar(select(AccountErasureOperation)))
+        with pytest.raises(HTTPException, match="Account provider fence is not verified"):
+            sdk_source_reset_service.apply(db, user_id=harness["user_id"], request=transition)
+        db.rollback()
+        user = db.get(User, harness["user_id"])
         user.health_write_state = "active"
         with pytest.raises(IntegrityError):
             db.commit()

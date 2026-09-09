@@ -221,6 +221,7 @@ class AccountErasureService:
             or user is None
             or (
                 user.health_write_state != "fenced"
+                or not user.account_erasure_provider_fence_verified
                 or user.account_erasure_operation_id != row.operation_id
                 or user.health_reset_operation_id != row.operation_id
                 or user.health_evidence_generation != row.health_evidence_generation + 1

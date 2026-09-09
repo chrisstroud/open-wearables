@@ -28,6 +28,13 @@ All three endpoints require `X-Open-Wearables-API-Key` with the distinct
 sessions do not confer this authority. Keep this credential server-side only.
 Key provisioning and runtime enablement are separate protected release actions.
 
+Whole-account cloud revocation currently supports WHOOP only. It first checks
+the credential's exact WHOOP profile identity, then requires HTTP 204 from the
+revocation endpoint. Other cloud providers fail closed; offline Apple records
+with no cloud credentials can still be erased. This does not enable Apple in
+Dashboard's product. Expired/invalid credentials, 401/404 responses, redirects,
+asynchronous acceptance, and unknown outcomes are not revocation proof.
+
 ## Exact requests
 
 `POST /api/v1/users/{user_id}/account-erasure/plan` accepts:
@@ -75,6 +82,13 @@ external outage. Whole-account deletion never reopens syncing. User/profile
 removal and terminal receipt insertion commit together. Verify is read-only: it
 checks the durable receipt, absent account and owned rows, and all current
 external planes. It never removes later state to make a historical receipt pass.
+
+Provider verification and local credential clearing commit together on the
+fenced User. A retry may skip provider I/O only when this durable proof exists
+and credentials remain cleared. Direct source-reset apply cannot bypass an
+unverified whole-account provider fence. A process crash after WHOOP revokes but
+before local proof commits remains uncertain and needs reconciliation; never
+invent a successful receipt or manually clear the fence to make it pass.
 
 Receipts retain operation UUID, upstream UUID, keyed bindings, reviewed digests,
 keyed locator proof, state and timestamp—not names, email, tokens, raw health

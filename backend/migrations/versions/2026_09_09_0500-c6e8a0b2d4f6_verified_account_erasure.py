@@ -18,6 +18,15 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     op.add_column("user", sa.Column("account_erasure_operation_id", sa.UUID(), nullable=True))
+    op.add_column(
+        "user",
+        sa.Column("account_erasure_provider_fence_verified", sa.Boolean(), server_default="false", nullable=False),
+    )
+    op.create_check_constraint(
+        "ck_user_account_erasure_provider_fence",
+        "user",
+        "NOT account_erasure_provider_fence_verified OR account_erasure_operation_id IS NOT NULL",
+    )
     op.create_check_constraint(
         "ck_user_account_erasure_fence",
         "user",
@@ -64,4 +73,6 @@ def downgrade() -> None:
         raise RuntimeError("Account-erasure recovery records require explicit disposition before downgrade")
     op.drop_table("account_erasure_operation")
     op.drop_constraint("ck_user_account_erasure_fence", "user", type_="check")
+    op.drop_constraint("ck_user_account_erasure_provider_fence", "user", type_="check")
+    op.drop_column("user", "account_erasure_provider_fence_verified")
     op.drop_column("user", "account_erasure_operation_id")

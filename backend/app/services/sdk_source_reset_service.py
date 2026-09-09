@@ -32,6 +32,7 @@ from app.models import (
 )
 from app.repositories.account_erasure_repository import account_erasure_repository
 from app.schemas.model_crud.credentials import SDKHealthResetStateRead, SDKHealthResetTransitionRequest
+from app.services.account_erasure_provider_fence import account_erasure_provider_fence
 from app.services.provider_identity_authority import (
     ProviderIdentityFingerprint,
     acquire_provider_identity_locks,
@@ -708,7 +709,15 @@ class SDKSourceResetService:
             .all()
         )
         try:
-            sdk_source_reset_provider_fence.deregister(connections)
+            if user.account_erasure_operation_id is not None:
+                account_erasure_provider_fence.deregister(
+                    connections, already_verified=user.account_erasure_provider_fence_verified
+                )
+                # This proof commits with credential clearing below, so replay
+                # can distinguish our successful revoke from a legacy empty token.
+                user.account_erasure_provider_fence_verified = True
+            else:
+                sdk_source_reset_provider_fence.deregister(connections)
         except RuntimeError as exc:
             db_session.rollback()
             raise HTTPException(
@@ -869,6 +878,11 @@ class SDKSourceResetService:
         request: SDKHealthResetTransitionRequest,
     ) -> SDKHealthResetStateRead:
         observed_user = self._require_user(db_session, user_id, for_update=False)
+        if (
+            observed_user.account_erasure_operation_id is not None
+            and not observed_user.account_erasure_provider_fence_verified
+        ):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Account provider fence is not verified")
         self._require_resulting_source_policy(observed_user, request)
         terminal_state = self._terminal_write_state(request.resulting_health_source_policy)
         observed_database_applied = (
