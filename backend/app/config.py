@@ -309,6 +309,8 @@ class Settings(BaseSettings):
     # Reset is intentionally unavailable until operators attest that this
     # bounded registry covers every retired bucket, endpoint, and prefix that
     # may still contain governed objects. Credentials remain in AWS_* settings.
+    account_erasure_enabled: bool = False
+    account_erasure_worker_names: list[str] = Field(default_factory=list, max_length=32)
     source_reset_s3_target_history_complete: bool = False
     source_reset_retired_s3_targets: list[SourceResetS3Target] = Field(default_factory=list, max_length=32)
 

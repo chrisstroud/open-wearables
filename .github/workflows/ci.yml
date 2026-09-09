@@ -123,6 +123,55 @@ jobs:
         working-directory: backend
         run: uv run pytest -v --cov=app --cov-report=xml --cov-report=term-missing
 
+  account-erasure-contract:
+    needs: changes
+    if: ${{ needs.changes.outputs.backend == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: erasure_test
+          POSTGRES_PASSWORD: synthetic-ci-only
+          POSTGRES_DB: ow_account_erasure_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      ENV: test
+      SECRET_KEY: synthetic-account-erasure-contract-only
+      MASTER_KEY: dGVzdC1tYXN0ZXIta2V5LWZvci10ZXN0aW5nLW9ubHk=
+      DB_HOST: 127.0.0.1
+      DB_PORT: 5432
+      DB_NAME: ow_account_erasure_test
+      DB_USER: erasure_test
+      DB_PASSWORD: synthetic-ci-only
+      ACCOUNT_ERASURE_TEST_DATABASE_URL: postgresql+psycopg://erasure_test:synthetic-ci-only@127.0.0.1:5432/ow_account_erasure_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: Install test dependencies
+        working-directory: backend
+        run: $HOME/.local/bin/uv sync --group dev
+      - name: Verify fresh schema and empty rollback
+        working-directory: backend
+        run: |
+          $HOME/.local/bin/uv run alembic upgrade head
+          $HOME/.local/bin/uv run alembic downgrade b5d7f9a1c3e4
+          $HOME/.local/bin/uv run alembic upgrade head
+      - name: Verify isolated whole-account recovery contract
+        working-directory: backend
+        run: $HOME/.local/bin/uv run pytest --confcutdir=tests/unit_contracts tests/unit_contracts -q
+
   mcp-build:
     needs: changes
     if: ${{ needs.changes.outputs.mcp == 'true' }}

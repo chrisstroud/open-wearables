@@ -189,7 +189,11 @@
               "POST /api/v1/users",
               "GET /api/v1/users/{user_id}",
               "PATCH /api/v1/users/{user_id}",
-              "DELETE /api/v1/users/{user_id}"
+              "DELETE /api/v1/users/{user_id}",
+              "api-reference/guides/verified-account-erasure",
+              "POST /api/v1/users/{user_id}/account-erasure/plan",
+              "POST /api/v1/users/{user_id}/account-erasure/erase",
+              "POST /api/v1/users/{user_id}/account-erasure/verify"
             ]
           },
           {

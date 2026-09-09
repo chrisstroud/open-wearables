@@ -4,7 +4,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-ApiKeyScope = Literal["source-reset"]
+ApiKeyScope = Literal["source-reset", "account-erasure"]
 
 
 class ApiKeyRead(BaseModel):

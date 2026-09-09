@@ -1,3 +1,4 @@
+from .account_erasure_operation import AccountErasureOperation
 from .api_key import ApiKey
 from .apple_health_daily_summary import AppleHealthDailySummary
 from .application import Application
@@ -39,6 +40,7 @@ DETAIL_MODELS: dict[DetailType, type[EventRecordDetail]] = {
 }
 
 __all__ = [
+    "AccountErasureOperation",
     "ApiKey",
     "AppleHealthDailySummary",
     "Application",

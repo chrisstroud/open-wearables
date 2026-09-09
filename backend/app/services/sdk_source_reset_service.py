@@ -30,7 +30,9 @@ from app.models import (
     UserConnection,
     UserInvitationCode,
 )
+from app.repositories.account_erasure_repository import account_erasure_repository
 from app.schemas.model_crud.credentials import SDKHealthResetStateRead, SDKHealthResetTransitionRequest
+from app.services.account_erasure_provider_fence import account_erasure_provider_fence
 from app.services.provider_identity_authority import (
     ProviderIdentityFingerprint,
     acquire_provider_identity_locks,
@@ -596,8 +598,13 @@ class SDKSourceResetService:
         *,
         user_id: UUID,
         request: SDKHealthResetTransitionRequest,
+        account_erasure: bool = False,
     ) -> SDKHealthResetStateRead:
         user = self._require_user(db_session, user_id, for_update=True)
+        if user.account_erasure_operation_id not in {None, request.operation_id}:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Account erasure authority changed")
+        if account_erasure and account_erasure_repository.has_authorization_writer(db_session, user_id):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Provider authorization has not drained")
         self._require_resulting_source_policy(user, request)
         resuming = (
             user.health_write_state == "fenced"
@@ -634,6 +641,8 @@ class SDKSourceResetService:
                 resulting_health_source_policy=request.resulting_health_source_policy,
                 commit=False,
             )
+            if account_erasure:
+                user.account_erasure_operation_id = request.operation_id
             user.health_reset_manifest_sha256 = inventory.inventory_digest_sha256
             user.health_reset_manifest_counts = inventory.counts
             user.health_reset_deleted_counts = cast(
@@ -700,7 +709,15 @@ class SDKSourceResetService:
             .all()
         )
         try:
-            sdk_source_reset_provider_fence.deregister(connections)
+            if user.account_erasure_operation_id is not None:
+                account_erasure_provider_fence.deregister(
+                    connections, already_verified=user.account_erasure_provider_fence_verified
+                )
+                # This proof commits with credential clearing below, so replay
+                # can distinguish our successful revoke from a legacy empty token.
+                user.account_erasure_provider_fence_verified = True
+            else:
+                sdk_source_reset_provider_fence.deregister(connections)
         except RuntimeError as exc:
             db_session.rollback()
             raise HTTPException(
@@ -861,6 +878,11 @@ class SDKSourceResetService:
         request: SDKHealthResetTransitionRequest,
     ) -> SDKHealthResetStateRead:
         observed_user = self._require_user(db_session, user_id, for_update=False)
+        if (
+            observed_user.account_erasure_operation_id is not None
+            and not observed_user.account_erasure_provider_fence_verified
+        ):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Account provider fence is not verified")
         self._require_resulting_source_policy(observed_user, request)
         terminal_state = self._terminal_write_state(request.resulting_health_source_policy)
         observed_database_applied = (
@@ -1018,7 +1040,9 @@ class SDKSourceResetService:
                 },
             )
         deleted_counts = self._public_counts(user.health_reset_deleted_counts)
-        user.health_write_state = terminal_state
+        # Whole-account erasure reuses cleanup, not source-reset reactivation.
+        # The database constraint independently prevents accidentally reopening it.
+        user.health_write_state = "fenced" if user.account_erasure_operation_id is not None else terminal_state
         response = self._response(
             db_session,
             user,

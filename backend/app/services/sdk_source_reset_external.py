@@ -1089,12 +1089,26 @@ class SDKSourceResetExternalPlanes:
         try:
             inspector = current_celery_app.control.inspect(timeout=CELERY_INSPECTION_TIMEOUT_SECONDS)
             ping = inspector.ping()
-            if not ping:
+            if not isinstance(ping, dict) or not ping or any(value != {"ok": "pong"} for value in ping.values()):
                 return (), ("open-wearables.queued-tasks.worker-inspection-unavailable",)
+            configured = settings.account_erasure_worker_names
+            expected = set(configured) if configured else set(ping)
+            if (
+                (settings.account_erasure_enabled and not configured)
+                or len(configured) != len(set(configured))
+                or set(ping) != expected
+            ):
+                return (), ("open-wearables.queued-tasks.worker-inspection-incomplete",)
             matches: set[str] = set()
             for collection_name in CELERY_INSPECTION_COLLECTIONS:
                 collection = getattr(inspector, collection_name)()
-                if collection is None:
+                # Completeness and target-task detection must use these same
+                # responses. A later complete probe cannot certify this scan.
+                if (
+                    not isinstance(collection, dict)
+                    or set(collection) != expected
+                    or any(not isinstance(tasks, list) for tasks in collection.values())
+                ):
                     return (), ("open-wearables.queued-tasks.worker-inspection-incomplete",)
                 for tasks in collection.values():
                     for task in tasks:
