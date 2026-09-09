@@ -23,6 +23,11 @@ active, reserved and scheduled inspection. Extra or missing workers fail closed.
 The set is bound to the operation and terminal receipt. Reconcile it with all
 deployment services; a guessed list or one responding worker is insufficient.
 
+The cleanup task inventory must validate that complete worker set on the very
+same active/reserved/scheduled responses used to detect target work. A separate
+later successful probe cannot turn a partial task scan into proof of an empty
+queue. Target tasks reported by any worker prevent terminal verification.
+
 All three endpoints require `X-Open-Wearables-API-Key` with the distinct
 `account-erasure` scope. Ordinary API keys, source-reset keys, and developer
 sessions do not confer this authority. Keep this credential server-side only.
