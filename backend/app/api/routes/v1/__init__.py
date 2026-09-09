@@ -1,5 +1,6 @@
 from fastapi import APIRouter
 
+from .account_erasure import router as account_erasure_router
 from .api_keys import router as api_keys_router
 from .applications import router as applications_router
 from .archival import router as archival_router
@@ -41,6 +42,7 @@ v1_router = APIRouter()
 # --- External: 3rd party integration endpoints ---
 v1_router.include_router(meta_router, tags=["External: Meta"])
 v1_router.include_router(users_router, tags=["External: Users"])
+v1_router.include_router(account_erasure_router, tags=["External: Users"])
 v1_router.include_router(connections_router, tags=["External: Connections"])
 v1_router.include_router(summaries_router, tags=["External: Summaries"])
 v1_router.include_router(timeseries_router, tags=["External: Timeseries"])

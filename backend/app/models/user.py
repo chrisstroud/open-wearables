@@ -14,6 +14,10 @@ class User(BaseDbModel):
 
     __table_args__ = (
         CheckConstraint(
+            "account_erasure_operation_id IS NULL OR health_write_state = 'fenced'",
+            name="ck_user_account_erasure_fence",
+        ),
+        CheckConstraint(
             "health_write_state IN ('active', 'fenced', 'awaiting-v2-pairing', 'activating')",
             name="ck_user_health_write_state",
         ),
@@ -41,6 +45,8 @@ class User(BaseDbModel):
     external_user_id: Mapped[Unique[str_255] | None]
     health_evidence_generation: Mapped[int] = mapped_column(default=0, server_default="0")
     health_reset_operation_id: Mapped[UUID | None]
+    # A whole-account operation must never reopen the source-reset write fence.
+    account_erasure_operation_id: Mapped[UUID | None]
     health_reset_manifest_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     health_reset_manifest_counts: Mapped[dict[str, int] | None] = mapped_column(JSONB, nullable=True)
     health_reset_deleted_counts: Mapped[dict[str, int] | None] = mapped_column(JSONB, nullable=True)

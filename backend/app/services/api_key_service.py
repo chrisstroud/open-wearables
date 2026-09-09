@@ -97,3 +97,19 @@ async def _require_source_reset_api_key(
 
 
 SourceResetApiKeyDep = Annotated[str, Depends(_require_source_reset_api_key)]
+
+
+async def _require_account_erasure_api_key(
+    db: DbSession,
+    x_open_wearables_api_key: str | None = Header(None, alias="X-Open-Wearables-API-Key"),
+) -> str:
+    """Whole-account authority is distinct from ordinary and source-reset keys."""
+    if not x_open_wearables_api_key:
+        raise HTTPException(status_code=401, detail="An account-erasure scoped API key is required")
+    api_key = api_key_service.validate_api_key(db, x_open_wearables_api_key)
+    if "account-erasure" not in api_key.scopes:
+        raise HTTPException(status_code=403, detail="API key is not authorized for account erasure")
+    return api_key.id
+
+
+AccountErasureApiKeyDep = Annotated[str, Depends(_require_account_erasure_api_key)]
