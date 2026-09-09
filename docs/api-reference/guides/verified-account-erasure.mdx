@@ -23,6 +23,13 @@ active, reserved and scheduled inspection. Extra or missing workers fail closed.
 The set is bound to the operation and terminal receipt. Reconcile it with all
 deployment services; a guessed list or one responding worker is insufficient.
 
+The worker startup script accepts optional `CELERY_WORKER_NAME` (for example,
+`ow-worker-1@production`). Give each worker instance a unique stable name and put
+the same complete set in `ACCOUNT_ERASURE_WORKER_NAMES`. Without that optional
+setting, existing hostname-based Celery behavior is unchanged. The inventory
+setting alone does not rename a worker. Verify replacement overlap has ended
+before admitting deletion; two processes must not share one declared name.
+
 The cleanup task inventory must validate that complete worker set on the very
 same active/reserved/scheduled responses used to detect target work. A separate
 later successful probe cannot turn a partial task scan into proof of an empty
