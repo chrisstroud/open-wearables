@@ -1,14 +1,91 @@
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from uuid import UUID
 
 from app.database import DbSession
-from app.models import DataSource, EventRecord, SDKClientInstallation, User, UserConnection
+from app.models import DataSource, EventRecord, SDKClientInstallation, User, UserConnection, WhoopHistoryDispatch
+from app.schemas.auth import ConnectionStatus
 from app.schemas.enums import ProviderName
 
 
 class HealthWriteAuthorityError(RuntimeError):
     """A health writer does not hold the account's current write authority."""
+
+
+@dataclass(frozen=True)
+class WhoopHistoryAuthority:
+    user_id: UUID
+    connection_id: UUID
+    authorization_generation: int
+    health_evidence_generation: int
+    dispatch_id: UUID
+
+
+def _require_history_authority(db: DbSession, users: dict[UUID, User]) -> None:
+    """Recheck a worker's captured authority under the same locks as every write.
+
+    Lock order: account, connection, dispatch. Never infer authority from a
+    refreshed ORM object or replace the captured tuple after a commit.
+    """
+    authority = db.info.get("whoop_history_authority")
+    if not isinstance(authority, WhoopHistoryAuthority):
+        return
+    user = users.get(authority.user_id)
+    if len(users) != 1 or user is None or user.health_evidence_generation != authority.health_evidence_generation:
+        raise HealthWriteAuthorityError("History account generation changed")
+    connection = (
+        db.query(UserConnection)
+        .filter_by(id=authority.connection_id)
+        .populate_existing()
+        .with_for_update()
+        .one_or_none()
+    )
+    if (
+        connection is None
+        or connection.user_id != authority.user_id
+        or connection.provider != "whoop"
+        or connection.authorization_generation != authority.authorization_generation
+        or connection.status not in {ConnectionStatus.ACTIVE, ConnectionStatus.EXPIRED}
+    ):
+        raise HealthWriteAuthorityError("History provider authorization changed")
+    dispatch = (
+        db.query(WhoopHistoryDispatch)
+        .filter_by(id=authority.dispatch_id)
+        .populate_existing()
+        .with_for_update()
+        .one_or_none()
+    )
+    if (
+        dispatch is None
+        or dispatch.status != "running"
+        or dispatch.expires_at is None
+        or dispatch.expires_at <= datetime.now(timezone.utc)
+        or (
+            dispatch.user_id,
+            dispatch.connection_id,
+            dispatch.authorization_generation,
+            dispatch.health_evidence_generation,
+        )
+        != (
+            authority.user_id,
+            authority.connection_id,
+            authority.authorization_generation,
+            authority.health_evidence_generation,
+        )
+    ):
+        raise HealthWriteAuthorityError("History worker no longer has authority")
+
+
+def check_history_provider_request(db: DbSession, user_id: UUID, provider: str) -> None:
+    """Fence each provider read/retry and release locks before network I/O."""
+    if "whoop_history_authority" not in db.info:
+        return
+    if provider != "whoop":
+        raise HealthWriteAuthorityError("History worker cannot read another provider")
+    require_health_write_authority(db, user_id=user_id, provider=provider)
+    db.commit()
 
 
 def _provider_value(provider: ProviderName | str) -> str:
@@ -48,6 +125,7 @@ def require_health_write_authorities(
     """
     normalized_targets = {(user_id, _provider_value(provider)) for user_id, provider in targets}
     users = _locked_users(db_session, (user_id for user_id, _ in normalized_targets))
+    _require_history_authority(db_session, users)
     mobile_authority = db_session.info.get("health_write_authority")
     maintenance_authority = db_session.info.get("health_maintenance_authority")
 

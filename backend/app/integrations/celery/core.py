@@ -126,6 +126,10 @@ def create_celery() -> Celery:
     celery_app.autodiscover_tasks(["app.integrations.celery.tasks", "app.integrations.celery.tasks.garmin"])
 
     celery_app.conf.beat_schedule = {
+        "recover-whoop-history": {
+            "task": "app.integrations.celery.tasks.whoop_history_task.recover_whoop_history",
+            "schedule": 60.0,
+        },
         "sync-all-users-periodic": {
             "task": "app.integrations.celery.tasks.periodic_sync_task.sync_all_users",
             "schedule": float(settings.sync_interval_seconds),

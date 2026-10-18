@@ -79,9 +79,9 @@ must disable exact disconnect and drain new requests before restoring old writer
 Retain both generation columns and receipts. The migration deliberately refuses a
 destructive downgrade that would erase that recovery state.
 
-This change does not implement Dashboard's full-history dispatch/receipt protocol,
-which is also absent from the previously pinned fork. Do not claim complete source
-API compatibility or deploy a new pin on the strength of disconnect tests alone.
+The same branch now also implements the [exact WHOOP history contract](exact-whoop-history).
+Both protocols remain absent from Dashboard's previously pinned fork. Local
+client/backend parity does not authorize a pin update or production rollout.
 
 ## Local verification receipt
 

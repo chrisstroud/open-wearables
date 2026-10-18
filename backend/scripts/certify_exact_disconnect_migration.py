@@ -77,6 +77,47 @@ def main() -> None:
         print(
             "PASS: migration chain, active/revoked backfill, replay and constraints; no fabricated disconnect receipt"
         )
+        migrate("b9c1d3e5f7a9")
+        with psycopg.connect(admin_url, dbname=name) as db:
+            assert db.execute("SELECT count(*) FROM whoop_history_dispatch").fetchone() == (0,)
+            active_connection = db.execute("SELECT user_id,id FROM user_connection WHERE status='active'").fetchone()
+            assert active_connection is not None
+            owner, connection = active_connection
+            dispatch, task = uuid4(), uuid4()
+            insert = (
+                "INSERT INTO whoop_history_dispatch "
+                "(id,user_id,connection_id,authorization_generation,health_evidence_generation,task_id,"
+                "requested_start_at,requested_end_at,status) "
+                "VALUES (%s,%s,%s,1,0,%s,'2000-01-01Z','2026-01-01Z','queued')"
+            )
+            db.execute(insert, (dispatch, owner, connection, task))
+            for statement in [
+                "UPDATE whoop_history_dispatch SET authorization_generation=0",
+                "UPDATE whoop_history_dispatch SET requested_end_at=requested_start_at",
+                "UPDATE whoop_history_dispatch SET status='succeeded'",
+                "UPDATE whoop_history_dispatch SET status='running'",
+            ]:
+                try:
+                    with db.transaction():
+                        db.execute(statement)
+                except psycopg.errors.CheckViolation:
+                    pass
+                else:
+                    raise AssertionError("Invalid history receipt accepted")
+            try:
+                with db.transaction():
+                    db.execute(insert, (uuid4(), owner, connection, uuid4()))
+            except psycopg.errors.UniqueViolation:
+                pass
+            else:
+                raise AssertionError("Concurrent active histories accepted for one user")
+        migrate("b9c1d3e5f7a9")
+        with psycopg.connect(admin_url, dbname=name) as db:
+            assert db.execute("SELECT id,task_id,status FROM whoop_history_dispatch").fetchall() == [
+                (dispatch, task, "queued")
+            ]
+            assert db.execute("SELECT version_num FROM alembic_version").fetchone() == ("b9c1d3e5f7a9",)
+        print("PASS: additive history receipt table, replay preservation, state/window/uniqueness constraints")
     finally:
         with psycopg.connect(admin_url, autocommit=True) as admin:
             admin.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(name)))

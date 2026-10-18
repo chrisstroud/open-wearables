@@ -453,6 +453,7 @@ class Whoop247Data(Base247DataTemplate):
         end_time: datetime | str | None = None,
         is_first_sync: bool = False,
         user_connection_id: UUID | None = None,
+        include_body_measurement: bool = True,
     ) -> dict[str, int]:
         """Load and save all 247 data types (sleep, recovery, activity).
 
@@ -487,9 +488,11 @@ class Whoop247Data(Base247DataTemplate):
         results["recovery_samples_synced"] = self.load_and_save_recovery(
             db, user_id, start_time, end_time, user_connection_id
         )
-        results["body_measurement_samples_synced"] = self.load_and_save_body_measurement(
-            db, user_id, user_connection_id
-        )
+        if include_body_measurement:
+            # Current measurements have no historical range at WHOOP.
+            results["body_measurement_samples_synced"] = self.load_and_save_body_measurement(
+                db, user_id, user_connection_id
+            )
 
         if user_connection_id is not None:
             data_source = self._ensure_whoop_data_source(db, user_id, user_connection_id)
