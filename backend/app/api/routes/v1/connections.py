@@ -1,7 +1,8 @@
 import contextlib
+from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Response, status
+from fastapi import APIRouter, HTTPException, Path, Response, status
 
 from app.database import DbSession
 from app.models import ProviderSetting
@@ -93,4 +94,36 @@ def delete_provider_data_endpoint(
     """Delete all of a user's data for a provider and revoke the connection."""
     strategy = ProviderFactory().get_provider(provider.value)
     user_connection_service.purge_provider_data(db, user_id, provider.value, oauth=strategy.oauth)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.delete(
+    "/users/{user_id}/connections/{provider}/{connection_id}/authorizations/{authorization_generation}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={
+        400: {"description": "Invalid target UUID or positive authorization generation."},
+        401: {"description": "API key authentication required."},
+        403: {"description": "API key authentication denied."},
+        404: {"description": "connection_not_found or provider_not_supported."},
+        409: {"description": "authorization_changed or source_write_unavailable."},
+        503: {"description": "deregistration_unverified; no local success inferred."},
+        # The app's validation handler normalizes RequestValidationError to 400.
+        "4XX": {"description": "Invalid request under the application's validation/authentication policy."},
+    },
+)
+def disconnect_exact_provider_endpoint(
+    user_id: UUID,
+    provider: ProviderName,
+    connection_id: UUID,
+    authorization_generation: Annotated[int, Path(ge=1, le=9223372036854775807)],
+    db: DbSession,
+    _api_key: ApiKeyDep,
+) -> Response:
+    """Revoke one reviewed WHOOP authorization, retaining imported evidence."""
+    if provider != ProviderName.WHOOP:
+        raise HTTPException(404, "provider_not_supported")
+    strategy = ProviderFactory().get_provider(provider.value)
+    user_connection_service.disconnect_exact(
+        db, user_id, provider.value, connection_id, authorization_generation, strategy.oauth
+    )
     return Response(status_code=status.HTTP_204_NO_CONTENT)

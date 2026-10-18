@@ -12,6 +12,11 @@ from fastapi import HTTPException, status
 from app.database import DbSession
 from app.integrations.redis_client import get_redis_client
 from app.repositories import UserConnectionRepository
+from app.repositories.health_write_authority import (
+    HealthWriteAuthorityError,
+    check_history_provider_request,
+    require_health_write_authority,
+)
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.utils.structured_logging import log_structured
 
@@ -33,6 +38,10 @@ def _get_valid_token(
 
     Private function used internally by make_authenticated_request.
     """
+    if "whoop_history_authority" in db.info:
+        # Hold the account/connection locks while choosing and, if needed,
+        # refreshing this exact grant. The request guard releases them before GET.
+        require_health_write_authority(db, user_id=user_id, provider=provider_name)
     connection = connection_repo.get_by_user_and_provider(db, user_id, provider_name)
     if not connection:
         raise HTTPException(
@@ -137,6 +146,7 @@ def make_authenticated_request(
     Raises:
         HTTPException: If API request fails
     """
+    check_history_provider_request(db, user_id, provider_name)
     # Get valid token (will auto-refresh if needed)
     access_token = _get_valid_token(db, user_id, provider_name, connection_repo, oauth)
 
@@ -152,6 +162,7 @@ def make_authenticated_request(
     url = f"{api_base_url}{endpoint}"
 
     for attempt in range(MAX_RETRIES + 1):
+        check_history_provider_request(db, user_id, provider_name)
         try:
             with httpx.Client(http2=http2) as client:
                 response = client.request(
@@ -162,6 +173,8 @@ def make_authenticated_request(
                     json=json_data,
                     timeout=30.0,
                 )
+
+            check_history_provider_request(db, user_id, provider_name)
 
             # Handle 429 rate limiting with retry
             if response.status_code == 429:
@@ -259,7 +272,7 @@ def make_authenticated_request(
                 status_code=e.response.status_code,
                 detail=f"{provider_name.capitalize()} API error: {e.response.text}",
             )
-        except HTTPException:
+        except (HTTPException, HealthWriteAuthorityError):
             # Re-raise HTTPExceptions as-is
             raise
         except Exception as e:

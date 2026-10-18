@@ -1,0 +1,113 @@
+---
+title: "Disconnect an exact provider authorization"
+description: "WHOOP disconnect with a reviewed connection generation, acknowledged recovery, and retained evidence."
+---
+
+## Contract
+
+The Dashboard fork adds an opt-in endpoint for service clients:
+
+```text
+DELETE /api/v1/users/{user_id}/connections/whoop/{connection_id}/authorizations/{authorization_generation}
+```
+
+Authenticate with `X-Open-Wearables-API-Key`, using a server credential. This is
+an upstream service endpoint, not a customer bearer-token API. Dashboard must
+independently verify the active owner, a dedicated disconnect permission, and
+explicit confirmation of the reviewed authorization before calling it.
+
+Read `GET /api/v1/users/{user_id}/connections` first. Each record now includes
+`authorization_generation`, a positive integer. The exact request binds the
+user ID, WHOOP provider, connection UUID and generation. Successful new OAuth
+consent advances the generation; token refresh retains it. An old request never
+selects the newest authorization. Other providers return `404` on this endpoint.
+
+| Response | Meaning |
+| --- | --- |
+| `204`, empty body | WHOOP deregistration was acknowledged and the exact local credentials were cleared, or that same confirmed result was already committed. |
+| `400` | Invalid UUID or generation; generations must be positive integers. |
+| `401` / `403` | API-key authentication failed under the existing authentication policy. |
+| `404` | Target user/connection/provider binding is absent or provider unsupported. |
+| `409 authorization_changed` | New consent replaced the reviewed generation. Review the new binding; never silently target it. |
+| `409 source_write_unavailable` | Account/reset write authority is fenced. |
+| `503 deregistration_unverified` | Provider outcome is unverified, credentials are unavailable without an exact receipt, or deregistration failed. No local success is inferred. |
+
+This endpoint adds no automatic retries, queue, cancellation facility, or separate
+rate limit. Existing infrastructure and provider rate limits still apply; do not
+poll or retry in an unbounded loop. The WHOOP adapter retains its existing
+30-second HTTP timeout. An upstream request can finish after its caller times out.
+
+## Recovery and retention
+
+After acknowledged deregistration, the transaction clears access/refresh tokens,
+marks the connection revoked, and stores its confirmed generation. Imported
+observations, data sources and provenance remain. The existing connection-revoked
+webhook helper is invoked after commit; its delivery remains best effort and is
+not the disconnect receipt. The legacy broad disconnect and data-purge contracts
+remain separate and are never fallback targets for this endpoint.
+
+If the API response is lost after commit, explicitly repeat the **same tuple**.
+The confirmed-generation receipt returns `204` without another provider call.
+If new consent has intervened, the old tuple returns `409`. If WHOOP's own response
+was lost before a receipt could be committed, the outcome remains unverified.
+A timeout, expired token, generic `401`, absent connection or legacy revoked status
+does not prove deregistration. Do not report success or discard credentials based
+on those signals. Further recovery may need provider verification or new user
+consent; this change does not manufacture a remote receipt.
+
+Connection identity, account write-authority and connection row locks remain held
+through the provider acknowledgement and commit. Concurrent consent uses the same
+lock order. Refresh success and refresh rejection retain the generation captured
+before network I/O, so neither can overwrite or revoke a newer grant.
+
+## Upgrade and rollback
+
+1. Apply Alembic migration `a8b0c2d4e6f8` after `f7a9b1c3d5e7`.
+2. Drain old OAuth/refresh writers and deploy the matching backend and workers
+   together. Do not enable the exact endpoint while old writers can replace
+   credentials without advancing generations.
+3. Verify real connection reads, new consent, same-generation refresh, exact
+   disconnect, stale-revision rejection and same-tuple recovery before updating
+   Dashboard's runtime pin. Reconcile its existing local bindings explicitly;
+   never invent a mapping between unrelated generation numbers.
+4. Enable the customer-facing adapter only after its scoped owner and confirmation
+   checks and the complete provider contract are verified.
+
+Existing rows start at generation `1`; no verified disconnect is backfilled.
+New fields are additive and existing credentials/statuses are unchanged. Rollback
+must disable exact disconnect and drain new requests before restoring old writers.
+Retain both generation columns and receipts. The migration deliberately refuses a
+destructive downgrade that would erase that recovery state.
+
+The same branch now also implements the [exact WHOOP history contract](exact-whoop-history).
+Both protocols remain absent from Dashboard's previously pinned fork. Local
+client/backend parity does not authorize a pin update or production rollout.
+
+## Local verification receipt
+
+Runtime `447fa3207ec55e9c9fbfdfe1a3501e3f38e56195` retains the existing provider
+branch's sleep-sync fix at `eb0a4209f24442aba7a15c584d74fa5819e713b6`. Full backend
+verification on Python 3.13.16 with the locked dependencies, UTC PostgreSQL and
+isolated Redis: **2,351 passed, 2 skipped**, with two existing SQLAlchemy duplicate
+fixture warnings. Ruff check/format across 672 files and full ty checks pass.
+The sixteen behavioral exact-disconnect cases include a real two-transaction lock wait and
+both success/rejection of a stale refresh after new consent. Provider calls use
+synthetic fixtures; no external WHOOP authorization or user data was mutated.
+
+Run the repeatable migration rehearsal from `backend/`:
+
+```sh
+uv run python scripts/certify_exact_disconnect_migration.py
+```
+
+Set `OW_LIFECYCLE_TEST_ADMIN_URL` through your local environment to an isolated
+loopback PostgreSQL `/postgres` admin database. The script rejects a nonlocal
+target and refuses to replace an existing test database. Full chain, old active/
+revoked rows, additive backfill, replay and constraints passed; the owned database
+was removed. This is local source evidence, not a deployment or recovery rehearsal
+against a real provider account. Dashboard's runtime pin remains unchanged.
+
+OpenAPI acknowledgement/status documentation was corrected in runtime
+`952bb55cfcdd82cf87250d594a8119a0ca4ba57a`; all **17 endpoint cases** pass after
+that change, including the generated empty 204 response and normalized validation
+errors. Full Ruff/format/ty checks pass on that final runtime as well.

@@ -115,6 +115,8 @@
             "pages": [
               "dev-guides/integration-guide",
               "dev-guides/how-to-add-new-provider",
+              "dev-guides/exact-provider-disconnect",
+              "dev-guides/exact-whoop-history",
               "dev-guides/ngrok-setup",
               "dev-guides/seed-data-generator"
             ]
@@ -197,6 +199,7 @@
             "pages": [
               "GET /api/v1/users/{user_id}/connections",
               "DELETE /api/v1/users/{user_id}/connections/{provider}",
+              "DELETE /api/v1/users/{user_id}/connections/{provider}/{connection_id}/authorizations/{authorization_generation}",
               "DELETE /api/v1/users/{user_id}/connections/{provider}/data"
             ]
           },
@@ -214,7 +217,9 @@
               "GET /api/v1/providers/garmin/users/{user_id}/backfill/status",
               "POST /api/v1/providers/garmin/users/{user_id}/backfill/cancel",
               "POST /api/v1/providers/garmin/users/{user_id}/backfill/{type_name}/retry",
-              "POST /api/v1/providers/{provider}/users/{user_id}/sync/historical"
+              "POST /api/v1/providers/{provider}/users/{user_id}/sync/historical",
+              "POST /api/v1/providers/whoop/users/{user_id}/connections/{connection_id}/sync/full-history",
+              "GET /api/v1/providers/whoop/users/{user_id}/sync/full-history/{dispatch_id}"
             ]
           },
           {

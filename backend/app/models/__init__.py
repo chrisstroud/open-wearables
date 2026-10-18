@@ -27,6 +27,7 @@ from .user import User
 from .user_connection import UserConnection
 from .user_invitation_code import UserInvitationCode
 from .workout_details import WorkoutDetails
+from .whoop_history_dispatch import WhoopHistoryDispatch
 
 # Single source of truth mapping detail_type -> concrete model, derived from the
 # EventRecordDetail subclasses defined above. Adding a new detail model (and
@@ -36,6 +37,7 @@ DETAIL_MODELS: dict[DetailType, type[EventRecordDetail]] = {
 }
 
 __all__ = [
+    "WhoopHistoryDispatch",
     "ApiKey",
     "Application",
     "ArchivalSetting",

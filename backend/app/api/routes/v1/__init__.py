@@ -34,6 +34,7 @@ from .user_invitation_code import router as user_invitation_code_router
 from .users import router as users_router
 from .vendor_workouts import router as vendor_workouts_router
 from .webhooks import router as providers_webhooks_router
+from .whoop_history import router as whoop_history_router
 
 v1_router = APIRouter()
 
@@ -47,6 +48,7 @@ v1_router.include_router(events_router, tags=["External: Events"])
 v1_router.include_router(health_scores_router, tags=["External: Health Scores"])
 v1_router.include_router(oauth_router, prefix="/oauth")
 v1_router.include_router(sync_data_router, prefix="/providers", tags=["External: Data Sync"])
+v1_router.include_router(whoop_history_router, prefix="/providers", tags=["External: Data Sync"])
 v1_router.include_router(sync_status_router, tags=["External: Sync Status"])
 v1_router.include_router(vendor_workouts_router, prefix="/providers", tags=["System: Vendor Workouts"])
 v1_router.include_router(import_xml_router, tags=["External: Apple Health Import"])

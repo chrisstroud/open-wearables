@@ -48,8 +48,11 @@ from .seed_data_task import generate_seed_data
 from .send_email_task import send_invitation_email_task
 from .sync_vendor_data_task import sync_vendor_data
 from .webhook_push_task import process_webhook_push
+from .whoop_history_task import recover_whoop_history, sync_whoop_history
 
 __all__ = [
+    "recover_whoop_history",
+    "sync_whoop_history",
     # Garmin backfill (30-day webhook-based sync)
     "GARMIN_BACKFILL_DATA_TYPES",
     "check_garmin_triggered_timeout",

@@ -1,0 +1,110 @@
+---
+title: "Exact WHOOP history imports"
+description: "Durable, idempotent history imports bound to one authorization and account generation."
+---
+
+This fork adds a WHOOP-only history contract for Dashboard Fitness. The existing
+generic sync and historical endpoints retain their behavior. This contract uses
+the existing PostgreSQL database, Celery workers and Beat scheduler.
+
+## Admit and inspect
+
+Use the service API key for both endpoints. Product users must go through
+Dashboard's scoped public interfaces; never distribute the provider service key.
+
+`POST /api/v1/providers/whoop/users/{user_id}/connections/{connection_id}/sync/full-history`
+
+```json
+{
+  "idempotency_key": "e09a1e5c-963a-49b3-81f9-3f49378b8521",
+  "authorization_generation": 1,
+  "requested_start_at": "2000-01-01T00:00:00.000Z",
+  "requested_end_at": "2026-01-01T00:00:00.000Z"
+}
+```
+
+The start is fixed; the end must be later and no more than five minutes ahead of
+server time. Naive timestamps, unknown fields and invalid generations fail with
+400. The connection must belong to this user, be WHOOP, have credentials and
+still match the reviewed authorization. Reset/write fences and replacements
+return 409. Capture the current generation from the connection read endpoint.
+
+202 acknowledges a **committed admission**, not completed import. The response
+contains `success: true`, `async: true`, `provider: "whoop"`,
+`scope: "full-available"`, `method: "pull_api"`, the exact `dispatch_id`,
+`user_id`, `connection_id`, `authorization_generation`, stable `task_id`,
+`requested_start_at`, `requested_end_at`, `status`, `completed_at` and `error_code`.
+
+Read `GET /api/v1/providers/whoop/users/{user_id}/sync/full-history/{dispatch_id}`.
+Unknown/other-user receipts return 404. Receipts survive disconnect and connection
+deletion; deleting the owning account removes them. They contain no provider
+tokens or imported health observations.
+
+## Retries and completion
+
+- The idempotency key is the dispatch UUID. Same key and exact request returns
+  the same durable receipt. Changed binding/window returns 409. Another active
+  import for the same current user/authorization also returns 409.
+- Only one worker can claim a queued dispatch, including duplicate broker delivery.
+  `queued` becomes `running`, then `succeeded`, `failed` or `superseded`.
+- The database is the outbox. If enqueue or its acknowledgement fails after commit,
+  admission still returns 202. Beat republishes up to 100 queued receipts every
+  minute. Monitor a growing queued backlog; a functioning worker and Beat are
+  required for progress.
+- A worker has a 14-minute soft limit and 15-minute hard/deadline limit. Beat marks
+  an expired running receipt `failed` with `worker_timeout`. Dead workers are not
+  silently restarted under the same receipt. Re-read the terminal receipt before
+  explicitly requesting a new dispatch. No cancellation operation is exposed.
+- Provider/persistence exceptions produce `provider_sync_failed`, without provider
+  response text. A failed run can have committed partial evidence; it never claims
+  all-or-nothing import. Repeated imports reuse existing upserts and provenance.
+
+The worker fetches workouts, sleep and recovery with one exact finite range.
+It excludes current body measurements, which have no historical range at WHOOP,
+and never advances the live-sync cursor or fans out to another account. Available
+history still depends on WHOOP consent, retention and responses. Provider-origin
+scores are imported; existing asynchronous derived-score hooks retain their behavior.
+
+## Authorization races
+
+Admission captures the account health generation and provider authorization.
+Every provider request/retry and normalized database write rechecks that tuple.
+Account, connection and receipt locks protect writes; they are released before
+paginated provider GETs. A response already in flight can arrive after revocation,
+but cannot authorize a later write or use a replacement grant. Token refresh
+selection is guarded too. Reconnect, reset, deletion, terminal receipt or expired
+worker authority stops further writes. A new authorized dispatch may supersede
+an older authorization's active receipt without rebinding the old receipt.
+
+## Rollout and verification
+
+Apply `a8b0c2d4e6f8`, then additive receipt migration `b9c1d3e5f7a9`. Coordinate
+backend, OAuth/refresh writers, workers and Beat before exposing these commands.
+Do not equate existing Dashboard generation numbers with backfilled provider 1
+without reconciliation. Disable admission, drain workers and preserve receipts
+before application rollback; destructive schema downgrade deliberately refuses.
+
+From `backend/`, run the endpoint and worker tests with your isolated test
+PostgreSQL/Redis configuration:
+
+```sh
+uv run pytest -q tests/api/v1/test_whoop_history.py
+uv run python scripts/certify_exact_disconnect_migration.py
+```
+
+The migration command requires `OW_LIFECYCLE_TEST_ADMIN_URL` identifying a local
+loopback `/postgres` database. It refuses existing test databases and removes only
+the database it created.
+
+For actual Dashboard-client parity, set `DASHBOARD_HISTORY_CLIENT_CHECKOUT` to its
+checkout with dependencies installed and put Node 22 on PATH, then run:
+
+```sh
+uv run pytest -q tests/api/v1/test_dashboard_history_client.py
+```
+
+That test runs Dashboard's actual TypeScript client over loopback HTTP against
+FastAPI and PostgreSQL. It checks admission, completed receipt, replay, missing
+receipt, stale generation, exact disconnect and acknowledged replay. WHOOP and
+Celery delivery are synthetic. These tests do not prove live WHOOP access,
+deployment readiness, queue delivery on the host or the full customer workflow.
