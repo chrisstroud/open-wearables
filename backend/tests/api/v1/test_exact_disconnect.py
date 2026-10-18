@@ -133,6 +133,16 @@ def test_authentication_is_required(client: TestClient, db: Session) -> None:
         deregister.assert_not_called()
 
 
+def test_openapi_describes_empty_acknowledgement_and_normalized_validation(client: TestClient) -> None:
+    path = "/api/v1/users/{user_id}/connections/{provider}/{connection_id}/authorizations/{authorization_generation}"
+    operation = client.get("/openapi.json").json()["paths"][path]["delete"]
+    assert "204" in operation["responses"]
+    assert "content" not in operation["responses"]["204"]
+    assert "200" not in operation["responses"]
+    assert "422" not in operation["responses"]
+    assert {"400", "401", "403", "404", "409", "503"}.issubset(operation["responses"])
+
+
 def test_refresh_preserves_generation_and_cannot_restore_disconnected_credentials(
     client: TestClient, db: Session
 ) -> None:
