@@ -90,7 +90,7 @@ branch's sleep-sync fix at `eb0a4209f24442aba7a15c584d74fa5819e713b6`. Full back
 verification on Python 3.13.16 with the locked dependencies, UTC PostgreSQL and
 isolated Redis: **2,351 passed, 2 skipped**, with two existing SQLAlchemy duplicate
 fixture warnings. Ruff check/format across 672 files and full ty checks pass.
-The sixteen exact-disconnect cases include a real two-transaction lock wait and
+The sixteen behavioral exact-disconnect cases include a real two-transaction lock wait and
 both success/rejection of a stale refresh after new consent. Provider calls use
 synthetic fixtures; no external WHOOP authorization or user data was mutated.
 
@@ -106,3 +106,8 @@ target and refuses to replace an existing test database. Full chain, old active/
 revoked rows, additive backfill, replay and constraints passed; the owned database
 was removed. This is local source evidence, not a deployment or recovery rehearsal
 against a real provider account. Dashboard's runtime pin remains unchanged.
+
+OpenAPI acknowledgement/status documentation was corrected in runtime
+`952bb55cfcdd82cf87250d594a8119a0ca4ba57a`; all **17 endpoint cases** pass after
+that change, including the generated empty 204 response and normalized validation
+errors. Full Ruff/format/ty checks pass on that final runtime as well.
