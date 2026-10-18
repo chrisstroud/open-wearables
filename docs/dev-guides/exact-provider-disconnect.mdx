@@ -82,3 +82,27 @@ destructive downgrade that would erase that recovery state.
 This change does not implement Dashboard's full-history dispatch/receipt protocol,
 which is also absent from the previously pinned fork. Do not claim complete source
 API compatibility or deploy a new pin on the strength of disconnect tests alone.
+
+## Local verification receipt
+
+Runtime `447fa3207ec55e9c9fbfdfe1a3501e3f38e56195` retains the existing provider
+branch's sleep-sync fix at `eb0a4209f24442aba7a15c584d74fa5819e713b6`. Full backend
+verification on Python 3.13.16 with the locked dependencies, UTC PostgreSQL and
+isolated Redis: **2,351 passed, 2 skipped**, with two existing SQLAlchemy duplicate
+fixture warnings. Ruff check/format across 672 files and full ty checks pass.
+The sixteen exact-disconnect cases include a real two-transaction lock wait and
+both success/rejection of a stale refresh after new consent. Provider calls use
+synthetic fixtures; no external WHOOP authorization or user data was mutated.
+
+Run the repeatable migration rehearsal from `backend/`:
+
+```sh
+uv run python scripts/certify_exact_disconnect_migration.py
+```
+
+Set `OW_LIFECYCLE_TEST_ADMIN_URL` through your local environment to an isolated
+loopback PostgreSQL `/postgres` admin database. The script rejects a nonlocal
+target and refuses to replace an existing test database. Full chain, old active/
+revoked rows, additive backfill, replay and constraints passed; the owned database
+was removed. This is local source evidence, not a deployment or recovery rehearsal
+against a real provider account. Dashboard's runtime pin remains unchanged.
