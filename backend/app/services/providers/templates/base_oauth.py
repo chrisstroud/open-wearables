@@ -15,6 +15,7 @@ from starlette.status import HTTP_400_BAD_REQUEST, HTTP_401_UNAUTHORIZED, HTTP_5
 
 from app.database import DbSession
 from app.integrations.redis_client import get_redis_client
+from app.repositories.health_write_authority import HealthWriteAuthorityError
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.auth import AuthenticationMethod, ConnectionStatus
@@ -135,6 +136,17 @@ class BaseOAuthTemplate(ABC):
 
     def refresh_access_token(self, db: DbSession, user_id: UUID, refresh_token: str) -> OAuthTokenResponse:
         """Refreshes the access token using the refresh token."""
+        connection = self.connection_repo.get_by_user_and_provider(db, user_id, self.provider_name)
+        if (
+            not connection
+            or connection.status not in {ConnectionStatus.ACTIVE, ConnectionStatus.EXPIRED}
+            or connection.refresh_token != refresh_token
+        ):
+            raise HTTPException(status_code=409, detail="Provider authorization changed before refresh")
+        # Capture scalars before remote I/O: another consent can update the same
+        # ORM identity. Both success and failure must remain bound to this grant.
+        expected_generation = connection.authorization_generation
+        expected_connection_id = connection.id
         data, headers = self._prepare_refresh_request(refresh_token)
 
         try:
@@ -147,15 +159,14 @@ class BaseOAuthTemplate(ABC):
             response.raise_for_status()
             token_response = OAuthTokenResponse.model_validate(response.json())
 
-            connection = self.connection_repo.get_by_user_and_provider(db, user_id, self.provider_name)
-            if connection:
-                self.connection_repo.update_tokens(
-                    db,
-                    connection,
-                    token_response.access_token,
-                    token_response.refresh_token or refresh_token,  # Use old refresh token if new one not provided
-                    token_response.expires_in,
-                )
+            self.connection_repo.update_tokens(
+                db,
+                connection,
+                token_response.access_token,
+                token_response.refresh_token or refresh_token,
+                token_response.expires_in,
+                expected_authorization_generation=expected_generation,
+            )
 
             log_structured(
                 logger,
@@ -180,12 +191,20 @@ class BaseOAuthTemplate(ABC):
             )
             # 400/401 = refresh token is dead so revoke + notify
             if e.response.status_code in (HTTP_400_BAD_REQUEST, HTTP_401_UNAUTHORIZED):
-                self._revoke_connection(db, user_id, reason="refresh_failed")
+                self._revoke_connection(
+                    db,
+                    user_id,
+                    reason="refresh_failed",
+                    expected_connection_id=expected_connection_id,
+                    expected_authorization_generation=expected_generation,
+                )
                 raise HTTPException(
                     status_code=HTTP_401_UNAUTHORIZED,
                     detail=f"Refresh token rejected for {self.provider_name}; reconnection required",
                 )
             raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail=f"Failed to refresh token: {e.response.text}")
+        except HealthWriteAuthorityError:
+            raise HTTPException(status_code=409, detail="Provider authorization changed during refresh") from None
         except Exception as e:
             log_structured(
                 logger,
@@ -197,12 +216,25 @@ class BaseOAuthTemplate(ABC):
             )
             raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Token refresh failed: {str(e)}")
 
-    def _revoke_connection(self, db: DbSession, user_id: UUID, *, reason: str) -> None:
+    def _revoke_connection(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        *,
+        reason: str,
+        expected_connection_id: UUID,
+        expected_authorization_generation: int,
+    ) -> None:
         """Mark the connection revoked and emit a connection.revoked webhook."""
         connection = self.connection_repo.get_by_user_and_provider(db, user_id, self.provider_name)
-        if not connection or connection.status == ConnectionStatus.REVOKED:
+        if not connection or connection.id != expected_connection_id or connection.status == ConnectionStatus.REVOKED:
             return
-        self.connection_repo.mark_as_revoked(db, connection)
+        try:
+            self.connection_repo.mark_as_revoked(
+                db, connection, expected_authorization_generation=expected_authorization_generation
+            )
+        except HealthWriteAuthorityError:
+            raise HTTPException(status_code=409, detail="Provider authorization changed during refresh") from None
         on_connection_revoked(
             user_id=user_id,
             provider=self.provider_name,

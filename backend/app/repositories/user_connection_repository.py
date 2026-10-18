@@ -157,7 +157,41 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
             change_provider_username="provider_username" in changes,
             provider_username=changes.get("provider_username"),
         )
+        identity_fields = {"access_token", "refresh_token", "provider_user_id", "provider_username", "scope"}
+        if identity_fields.intersection(changes) or (
+            changes.get("status") == ConnectionStatus.ACTIVE and current.status != ConnectionStatus.ACTIVE
+        ):
+            current.authorization_generation += 1
         return super().update(db_session, current, updater)
+
+    def lock_disconnect_target(
+        self, db_session: DbSession, user_id: UUID, provider: str, connection_id: UUID
+    ) -> UserConnection | None:
+        """Use the same identity/account/row lock order as consent writers."""
+        observed = self.get_by_user_and_provider(db_session, user_id, provider)
+        if observed is None or observed.id != connection_id:
+            return None
+        return self._lock_identity_update(
+            db_session,
+            connection_id=connection_id,
+            expected_user_id=user_id,
+            expected_provider=provider,
+            change_provider_user_id=False,
+            provider_user_id=None,
+            change_provider_username=False,
+            provider_username=None,
+        )
+
+    def confirm_exact_disconnect(self, db_session: DbSession, connection: UserConnection) -> None:
+        """Caller retains the target lock through the provider acknowledgement."""
+        connection.status = ConnectionStatus.REVOKED
+        connection.access_token = None
+        connection.refresh_token = None
+        connection.token_expires_at = None
+        connection.disconnect_confirmed_generation = connection.authorization_generation
+        connection.updated_at = datetime.now(timezone.utc)
+        db_session.add(connection)
+        db_session.commit()
 
     def delete(self, db_session: DbSession, originator: UserConnection) -> UserConnection:
         current = require_user_connection_authority(
@@ -455,14 +489,23 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         db_session.commit()
         return result.rowcount
 
-    def mark_as_revoked(self, db_session: DbSession, connection: UserConnection) -> UserConnection:
+    def mark_as_revoked(
+        self, db_session: DbSession, connection: UserConnection, *, expected_authorization_generation: int | None = None
+    ) -> UserConnection:
         """Mark connection as revoked (when refresh token fails)."""
+        expected_generation = (
+            connection.authorization_generation
+            if expected_authorization_generation is None
+            else expected_authorization_generation
+        )
         connection = require_user_connection_authority(
             db_session,
             connection_id=connection.id,
             expected_user_id=connection.user_id,
             expected_provider=connection.provider,
         )
+        if connection.authorization_generation != expected_generation:
+            raise HealthWriteAuthorityError("Provider authorization changed before revocation")
         connection.status = ConnectionStatus.REVOKED
         connection.updated_at = datetime.now(timezone.utc)
         db_session.add(connection)
@@ -492,15 +535,28 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         access_token: str,
         refresh_token: str | None,
         expires_in: int,
+        *,
+        expected_authorization_generation: int | None = None,
     ) -> UserConnection:
         """Update connection with new tokens after refresh."""
 
+        expected_generation = (
+            connection.authorization_generation
+            if expected_authorization_generation is None
+            else expected_authorization_generation
+        )
         connection = require_user_connection_authority(
             db_session,
             connection_id=connection.id,
             expected_user_id=connection.user_id,
             expected_provider=connection.provider,
         )
+
+        if connection.authorization_generation != expected_generation or connection.status not in {
+            ConnectionStatus.ACTIVE,
+            ConnectionStatus.EXPIRED,
+        }:
+            raise HealthWriteAuthorityError("Provider authorization changed before token refresh")
 
         connection.access_token = access_token
         if refresh_token:
@@ -534,6 +590,7 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
             change_provider_username=bool(provider_username and not connection.provider_username),
             provider_username=provider_username,
         )
+        connection.authorization_generation += 1
         connection.access_token = access_token
         if refresh_token:
             connection.refresh_token = refresh_token

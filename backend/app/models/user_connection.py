@@ -1,8 +1,8 @@
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import Index
-from sqlalchemy.orm import Mapped
+from sqlalchemy import BigInteger, CheckConstraint, Index
+from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import BaseDbModel
 from app.mappings import FKUser, PrimaryKey, str_64
@@ -13,6 +13,12 @@ class UserConnection(BaseDbModel):
     """OAuth connections to external cloud providers (Suunto, Garmin, Polar, Coros)"""
 
     __table_args__ = (
+        CheckConstraint("authorization_generation > 0", name="ck_connection_authorization_generation"),
+        CheckConstraint(
+            "disconnect_confirmed_generation IS NULL OR "
+            "(disconnect_confirmed_generation > 0 AND disconnect_confirmed_generation <= authorization_generation)",
+            name="ck_connection_disconnect_generation",
+        ),
         Index(
             "ix_user_connection_token_expiry",
             "token_expires_at",
@@ -32,6 +38,10 @@ class UserConnection(BaseDbModel):
     id: Mapped[PrimaryKey[UUID]]
     user_id: Mapped[FKUser]
     provider: Mapped[str_64]  # 'suunto', 'garmin', 'polar', 'coros'
+    # New consent increments this; refreshing the same authorization does not.
+    authorization_generation: Mapped[int] = mapped_column(BigInteger, default=1, server_default="1")
+    # Written only after an exact disconnect has verified provider deregistration.
+    disconnect_confirmed_generation: Mapped[int | None] = mapped_column(BigInteger)
 
     # Provider user data
     provider_user_id: Mapped[str | None]

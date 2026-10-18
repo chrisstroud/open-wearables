@@ -115,6 +115,7 @@
             "pages": [
               "dev-guides/integration-guide",
               "dev-guides/how-to-add-new-provider",
+              "dev-guides/exact-provider-disconnect",
               "dev-guides/ngrok-setup",
               "dev-guides/seed-data-generator"
             ]
@@ -197,6 +198,7 @@
             "pages": [
               "GET /api/v1/users/{user_id}/connections",
               "DELETE /api/v1/users/{user_id}/connections/{provider}",
+              "DELETE /api/v1/users/{user_id}/connections/{provider}/{connection_id}/authorizations/{authorization_generation}",
               "DELETE /api/v1/users/{user_id}/connections/{provider}/data"
             ]
           },

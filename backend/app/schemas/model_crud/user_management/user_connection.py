@@ -52,6 +52,7 @@ class UserConnectionRead(UserConnectionBase):
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
     id: UUID
+    authorization_generation: int = Field(ge=1)
     status: ConnectionStatus
     last_synced_at: datetime | None
     created_at: datetime

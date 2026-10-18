@@ -2,10 +2,14 @@ from datetime import datetime
 from logging import Logger, getLogger
 from uuid import UUID
 
+from fastapi import HTTPException
+
 from app.database import DbSession
 from app.models import UserConnection
 from app.repositories.data_source_repository import DataSourceRepository
+from app.repositories.health_write_authority import HealthWriteAuthorityError
 from app.repositories.user_connection_repository import UserConnectionRepository
+from app.schemas.auth import ConnectionStatus
 from app.schemas.enums import ProviderName
 from app.schemas.model_crud.user_management import UserConnectionCreate, UserConnectionUpdate
 from app.schemas.responses.upload import ConnectionsCoverage, ProviderConnectionCount
@@ -88,6 +92,56 @@ class UserConnectionService(
         connection = self.crud.get_by_user_and_provider(db_session, user_id, provider)
         if not connection:
             raise ResourceNotFoundError("connection", user_id)
+
+    @handle_exceptions
+    def disconnect_exact(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        provider: str,
+        connection_id: UUID,
+        authorization_generation: int,
+        oauth: BaseOAuthTemplate | None,
+    ) -> None:
+        """Disconnect only the reviewed authorization; never purge evidence.
+
+        Keep identity/account/connection locks through deregistration and receipt
+        commit. An uncertain provider response is not an acknowledgement. A retry
+        after a committed response loss returns the same terminal result without
+        calling the provider again. The broad legacy endpoint remains separate.
+        """
+        try:
+            connection = self.crud.lock_disconnect_target(db_session, user_id, provider, connection_id)
+        except HealthWriteAuthorityError:
+            raise HTTPException(409, "source_write_unavailable") from None
+        if connection is None:
+            raise HTTPException(404, "connection_not_found")
+        if connection.authorization_generation != authorization_generation:
+            raise HTTPException(409, "authorization_changed")
+        if (
+            connection.disconnect_confirmed_generation == authorization_generation
+            and connection.status == ConnectionStatus.REVOKED
+            and connection.access_token is None
+            and connection.refresh_token is None
+        ):
+            return
+        # A legacy revocation/expired token is not proof of provider deregistration.
+        # Initially WHOOP only: the base implementation for other providers is a no-op.
+        if provider != ProviderName.WHOOP.value or oauth is None or not connection.access_token:
+            raise HTTPException(503, "deregistration_unverified")
+        try:
+            oauth.deregister_user(connection.access_token, provider_user_id=connection.provider_user_id)
+        except Exception:
+            # Never include provider responses, tokens or external identities in errors.
+            raise HTTPException(503, "deregistration_unverified") from None
+        self.crud.confirm_exact_disconnect(db_session, connection)
+        on_connection_revoked(
+            user_id=user_id,
+            provider=provider,
+            connection_id=connection.id,
+            reason="user_disconnected",
+            revoked_at=connection.updated_at.isoformat(),
+        )
 
     @handle_exceptions
     def purge_provider_data(
